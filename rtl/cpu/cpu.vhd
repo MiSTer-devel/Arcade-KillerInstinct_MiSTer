@@ -1,0 +1,5074 @@
+library IEEE;
+use IEEE.std_logic_1164.all;  
+use IEEE.numeric_std.all;   
+
+library mem;
+use work.pFunctions.all;
+use work.pexport.all;
+
+entity cpu is
+   generic
+   (
+      LITTLE_ENDIAN         : boolean := false;
+      FRAMEBUFFER_UNCACHED  : boolean := false;
+      -- Narrow the COP0 exception-address capture to the 32-bit KI contract.
+      ADDR32_ONLY           : boolean := false;
+      -- Drop trap instructions from the exception logic while retaining the
+      -- comparator used by SLT/SLTU.
+      NO_TRAP_INSTR         : boolean := false;
+      -- KI instruction fetches use the unmapped KSEG0/KSEG1 path. The data TLB
+      -- remains enabled for mapped data accesses.
+      INSTR_KSEG_ONLY       : boolean := false;
+      -- How long the CPU must go without executing any boot ROM before the
+      -- restart detectors arm, in decodes. It has to be long enough that no
+      -- excursion into RAM during boot can satisfy it, and short enough to arm
+      -- before the first restart: the game reaches FMV about 4 to 5 s after
+      -- reset and can restart within a second of playback starting.
+      --
+      -- 2^24 is about 0.4 s at the measured 42 MIPS - two orders of magnitude
+      -- longer than a boot trampoline, and comfortably inside that window. G
+      -- on the trace page reports whether it actually armed, so a wrong choice
+      -- is visible rather than silent. Simulation overrides it so a dozen
+      -- instructions can still exercise the triggers.
+      BOOT_QUIET_BITS       : integer := 24
+   );
+   port 
+   (
+      clk1x                 : in  std_logic;
+      clk93                 : in  std_logic;
+      clk2x                 : in  std_logic;
+      ce_1x                 : in  std_logic;
+      ce_93                 : in  std_logic;
+      reset_1x              : in  std_logic;
+      reset_93              : in  std_logic;
+      preNMI                : in  std_logic;
+      
+      INSTRCACHEON          : in  std_logic;
+      DATACACHEON           : in  std_logic;
+      DATACACHESLOW         : in  std_logic_vector(3 downto 0); 
+      DATACACHEFORCEWEB     : in  std_logic;
+      DATACACHEWRITETHROUGH : in  std_logic := '0';
+      DATACACHETLBON        : in  std_logic;
+      RANDOMMISS            : in  unsigned(3 downto 0);
+      DISABLE_BOOTCOUNT     : in  std_logic;
+      DISABLE_DTLBMINI      : in  std_logic;
+      ALECK64               : in  std_logic;
+
+      irqRequest            : in  std_logic_vector(1 downto 0);
+      cpuPaused             : in  std_logic;
+      
+      error_instr           : out std_logic := '0';
+      error_stall           : out std_logic := '0';
+      error_FPU             : out std_logic := '0';
+      error_exception       : out std_logic := '0';
+      error_fifo            : out std_logic := '0';
+      error_TLB             : out std_logic := '0';
+      debug_fetch_pc        : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_retired         : out std_logic_vector(31 downto 0) := (others => '0');
+      -- Bitstream reader source pointer used by the frozen fault trace.
+      debug_gpr_s1          : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_irq_count       : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_t2_reload_count : out std_logic_vector(31 downto 0) := (others => '0');
+      -- Departure opcode, exception state, and restart counters retained by
+      -- the current fault-capture contract.
+      debug_h1_op           : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_exc_cause       : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_ret_count       : out std_logic_vector(31 downto 0) := (others => '0');
+      -- The stage-4 data address at the moment the stall watchdog trips.
+      -- debug_stall_pc says where the pipeline was; this says what it was
+      -- reaching for, which is what identifies an unanswered access.
+      -- Everything the stage-4 stall RELEASE depends on, captured at the same
+      -- instant. ST says stall4 is set with nothing outstanding; this says
+      -- which release condition is not being met.
+      debug_retire_pc       : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_retire_opcode   : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_trace_bus         : out std_logic_vector(895 downto 0) := (others => '0');
+      -- Live COP0 Cause and EPC, not the frozen copies in the trace bus.
+      -- sim/tb_ki_cpu_delayslot_irq.sv needs to read EPC the cycle after an
+      -- interrupt is taken, which is long before any trace trigger fires.
+      debug_cop0_cause_live   : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_cop0_epc_live     : out std_logic_vector(31 downto 0) := (others => '0');
+      -- State at the LAST ERET BEFORE THE FREEZE. cpu_cop0 captures each eret;
+      -- this holds the copy from the moment the trace freezes, so the values
+      -- describe the eret that preceded the fault rather than whichever one
+      -- happened most recently before the screen was photographed.
+      debug_eret_epc          : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_eret_target       : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_eret_flags        : out std_logic_vector(31 downto 0) := (others => '0');
+      -- Suppression census; see cpu_cop0.vhd. Live, not frozen: a freeze or a
+      -- reset may fire no trace trigger at all, and these must still be
+      -- readable off the screen at any moment.
+      debug_ds_count          : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_ds_first          : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_trace_frozen      : out std_logic := '0';
+      debug_trace_trigger     : in  std_logic := '0';
+
+      mem_request           : out std_logic := '0';
+      mem_rnw               : out std_logic := '0'; 
+      mem_address           : buffer unsigned(31 downto 0) := (others => '0'); 
+      mem_req64             : out std_logic := '0'; 
+      mem_size              : out unsigned(2 downto 0) := (others => '0');
+      mem_writeMask         : out std_logic_vector(7 downto 0) := (others => '0'); 
+      mem_dataWrite         : out std_logic_vector(63 downto 0) := (others => '0');
+      mem_dataRead          : in  std_logic_vector(63 downto 0); 
+      mem_done              : in  std_logic;
+      rdram_granted2x       : in  std_logic;
+      rdram_done            : in  std_logic;
+      ddr3_DOUT             : in  std_logic_vector(63 downto 0);
+      ddr3_DOUT_READY       : in  std_logic;
+      
+      ram_done              : in  std_logic;
+      ram_rnw               : in  std_logic;
+      ram_dataRead          : in  std_logic_vector(31 downto 0); 
+      
+-- synthesis translate_off
+      cpu_done              : out std_logic := '0'; 
+      cpu_export            : out cpu_export_type := export_init;
+-- synthesis translate_on
+      
+      SS_reset              : in  std_logic;
+      loading_savestate     : in  std_logic;
+      SS_DataWrite          : in  std_logic_vector(63 downto 0);
+      SS_Adr                : in  unsigned(11 downto 0);
+      SS_wren_CPU           : in  std_logic;
+      SS_rden_CPU           : in  std_logic;
+      SS_DataRead_CPU       : out std_logic_vector(63 downto 0);
+      SS_idle               : out std_logic
+   );
+end entity;
+
+architecture arch of cpu is
+
+   constant FB0_LOW  : unsigned(31 downto 0) := x"00030000";
+   constant FB0_HIGH : unsigned(31 downto 0) := x"00055800";
+   constant FB1_LOW  : unsigned(31 downto 0) := x"00058000";
+   constant FB1_HIGH : unsigned(31 downto 0) := x"0007D800";
+
+   function bus_to_cpu16(inval : std_logic_vector(15 downto 0)) return unsigned is
+   begin
+      if LITTLE_ENDIAN then return unsigned(inval); end if;
+      return byteswap16(unsigned(inval));
+   end function;
+
+   function bus_to_cpu32(inval : std_logic_vector(31 downto 0)) return unsigned is
+   begin
+      if LITTLE_ENDIAN then return unsigned(inval); end if;
+      return byteswap32(unsigned(inval));
+   end function;
+
+   function bus_to_cpu64(inval : std_logic_vector(63 downto 0)) return unsigned is
+      variable result : unsigned(63 downto 0);
+   begin
+      if LITTLE_ENDIAN then return unsigned(inval); end if;
+      result(63 downto 32) := unsigned(byteswap32(inval(31 downto 0)));
+      result(31 downto 0)  := unsigned(byteswap32(inval(63 downto 32)));
+      return result;
+   end function;
+
+   function cpu_to_bus16(inval : unsigned(15 downto 0)) return unsigned is
+   begin
+      if LITTLE_ENDIAN then return inval; end if;
+      return byteswap16(inval);
+   end function;
+
+   function cpu_to_bus32(inval : unsigned(31 downto 0)) return unsigned is
+   begin
+      if LITTLE_ENDIAN then return inval; end if;
+      return byteswap32(inval);
+   end function;
+
+   function cpu_to_bus64(inval : unsigned(63 downto 0)) return unsigned is
+      variable result : unsigned(63 downto 0);
+   begin
+      if LITTLE_ENDIAN then return inval; end if;
+      result(63 downto 32) := byteswap32(inval(63 downto 32));
+      result(31 downto 0)  := byteswap32(inval(31 downto 0));
+      return result;
+   end function;
+
+   function merge_left32(data : unsigned(31 downto 0); olddata : unsigned(31 downto 0);
+                         offset : unsigned(1 downto 0)) return unsigned is
+      variable result : unsigned(31 downto 0) := olddata;
+      variable index  : integer := to_integer(offset);
+   begin
+      if LITTLE_ENDIAN then index := 3 - index; end if;
+      case index is
+         when 3 => result(31 downto 24) := data(7 downto 0);
+         when 2 => result(31 downto 16) := data(15 downto 0);
+         when 1 => result(31 downto 8)  := data(23 downto 0);
+         when 0 => result := data;
+         when others => null;
+      end case;
+      return result;
+   end function;
+
+   function merge_right32(data : unsigned(31 downto 0); olddata : unsigned(31 downto 0);
+                          offset : unsigned(1 downto 0)) return unsigned is
+      variable result : unsigned(31 downto 0) := olddata;
+      variable index  : integer := to_integer(offset);
+   begin
+      if LITTLE_ENDIAN then index := 3 - index; end if;
+      case index is
+         when 3 => result := data;
+         when 2 => result(23 downto 0) := data(31 downto 8);
+         when 1 => result(15 downto 0) := data(31 downto 16);
+         when 0 => result(7 downto 0)  := data(31 downto 24);
+         when others => null;
+      end case;
+      return result;
+   end function;
+
+   function merge_left64(data : unsigned(63 downto 0); olddata : unsigned(63 downto 0);
+                         offset : unsigned(2 downto 0)) return unsigned is
+      variable result : unsigned(63 downto 0) := olddata;
+      variable index  : integer := to_integer(offset);
+   begin
+      if LITTLE_ENDIAN then index := 7 - index; end if;
+      case index is
+         when 7 => result(63 downto 56) := data(7 downto 0);
+         when 6 => result(63 downto 48) := data(15 downto 0);
+         when 5 => result(63 downto 40) := data(23 downto 0);
+         when 4 => result(63 downto 32) := data(31 downto 0);
+         when 3 => result(63 downto 24) := data(39 downto 0);
+         when 2 => result(63 downto 16) := data(47 downto 0);
+         when 1 => result(63 downto 8)  := data(55 downto 0);
+         when 0 => result := data;
+         when others => null;
+      end case;
+      return result;
+   end function;
+
+   function merge_right64(data : unsigned(63 downto 0); olddata : unsigned(63 downto 0);
+                          offset : unsigned(2 downto 0)) return unsigned is
+      variable result : unsigned(63 downto 0) := olddata;
+      variable index  : integer := to_integer(offset);
+   begin
+      if LITTLE_ENDIAN then index := 7 - index; end if;
+      case index is
+         when 7 => result := data;
+         when 6 => result(55 downto 0) := data(63 downto 8);
+         when 5 => result(47 downto 0) := data(63 downto 16);
+         when 4 => result(39 downto 0) := data(63 downto 24);
+         when 3 => result(31 downto 0) := data(63 downto 32);
+         when 2 => result(23 downto 0) := data(63 downto 40);
+         when 1 => result(15 downto 0) := data(63 downto 48);
+         when 0 => result(7 downto 0)  := data(63 downto 56);
+         when others => null;
+      end case;
+      return result;
+   end function;
+     
+   -- register file
+   signal regs_address_a               : std_logic_vector(4 downto 0);
+   signal regs_data_a                  : std_logic_vector(63 downto 0);
+   signal regs_wren_a                  : std_logic;
+   signal regs1_address_b              : std_logic_vector(4 downto 0);
+   signal regs1_q_b                    : std_logic_vector(63 downto 0);
+   signal regs2_address_b              : std_logic_vector(4 downto 0);
+   signal regs2_q_b                    : std_logic_vector(63 downto 0);  
+
+   -- FPU register file
+   signal FPUregs_address_a            : std_logic_vector(4 downto 0);
+   signal FPUregs_data_a               : std_logic_vector(63 downto 0);
+   signal FPUregs_wren_a               : std_logic_vector(1 downto 0);
+   signal FPUregs1_address_b           : std_logic_vector(4 downto 0);
+   signal FPUregs1_q_b                 : std_logic_vector(63 downto 0);
+   signal FPUregs2_address_b           : std_logic_vector(4 downto 0);
+   signal FPUregs2_q_b                 : std_logic_vector(63 downto 0);  
+
+   signal FPUWriteTarget               : unsigned(4 downto 0) := (others => '0');
+   signal FPUWriteData                 : unsigned(63 downto 0) := (others => '0');
+   signal FPUWriteEnable               : std_logic := '0';   
+   signal FPUWriteMask                 : std_logic_vector(1 downto 0) := (others => '0');
+   
+   -- other register
+   signal PC                           : unsigned(63 downto 0) := (others => '0');
+   signal debug_fetch_pc_register      : std_logic_vector(31 downto 0) := (others => '0');
+   signal debug_retired_count          : unsigned(31 downto 0) := (others => '0');
+   signal debug_gpr_s1_register        : std_logic_vector(31 downto 0) := (others => '0');
+   signal debug_gpr_s2_register        : std_logic_vector(31 downto 0) := (others => '0');
+   signal debug_retire_pc_register     : std_logic_vector(31 downto 0) := (others => '0');
+   signal debug_retire_opcode_register : std_logic_vector(31 downto 0) := (others => '0');
+   signal debug_irq_count_register     : unsigned(31 downto 0) := (others => '0');
+   signal debug_t2_reload_register     : unsigned(31 downto 0) := (others => '0');
+   signal debug_ret_count_register     : unsigned(31 downto 0) := (others => '0');
+   signal debug_entry_count_register   : unsigned(15 downto 0) := (others => '0');
+   signal ram_reentry                  : std_logic;
+   signal boot_quiet_count             : unsigned(BOOT_QUIET_BITS - 1 downto 0) := (others => '0');
+   signal game_running                 : std_logic := '0';
+   signal trace_trigger_id             : std_logic_vector(2 downto 0) := (others => '0');
+
+   -- Two-stage synchronizer for the board-side freeze request.
+   signal trace_trigger_meta           : std_logic := '0';
+   signal trace_trigger_sync           : std_logic := '0';
+   signal dep_pc_now                   : std_logic_vector(31 downto 0) := (others => '0');
+   -- How many decodes have happened since reset, saturating at 2. One is not
+   -- enough: the pc reported by the FIRST post-reset decode comes from a
+   -- register the reset does not own, so the comparison must not run until two
+   -- genuine decodes are in hand. Stage 1 and stage 2 now clear those registers
+   -- as well; this is the independent guard, because the failure it prevents
+   -- cost several hardware builds and must not depend on one assignment.
+   signal dep_valid                    : unsigned(1 downto 0) := (others => '0');
+   signal hist_op1                     : std_logic_vector(31 downto 0) := (others => '0');
+   signal debug_h1_op_r                : std_logic_vector(31 downto 0) := (others => '0');
+   signal debug_prev_op_live           : std_logic_vector(31 downto 0) := (others => '0');
+   signal debug_exc_cause_register     : std_logic_vector(31 downto 0) := (others => '0');
+   signal cop0_debug_cause             : unsigned(31 downto 0);
+   signal cop0_debug_epc               : unsigned(31 downto 0);
+   signal cop0_debug_badvaddr          : unsigned(31 downto 0);
+   signal cop0_debug_tlb_census        : unsigned(31 downto 0);
+   signal cop0_debug_tlb_exc_stb       : std_logic;
+   signal cop0_debug_eret_epc          : unsigned(31 downto 0);
+   signal cop0_debug_eret_target       : unsigned(31 downto 0);
+   signal cop0_debug_eret_flags        : unsigned(31 downto 0);
+   signal cop0_debug_ds_count          : unsigned(31 downto 0);
+   signal cop0_debug_ds_first          : unsigned(31 downto 0);
+   -- Owned solely by eret_freeze_proc.
+   signal eret_held                    : std_logic := '0';
+   signal eret_epc_held                : std_logic_vector(31 downto 0) := (others => '0');
+   signal eret_target_held             : std_logic_vector(31 downto 0) := (others => '0');
+   signal eret_flags_held              : std_logic_vector(31 downto 0) := (others => '0');
+   -- The fault strobe delayed two cycles. BadVAddr, Cause and EPC are all
+   -- written by cop0's exception process on the strobe cycle itself, so
+   -- freezing there would capture the PREVIOUS exception's values.
+   signal tlb_exc_stb_d1               : std_logic := '0';
+   signal tlb_exc_stb_d2               : std_logic := '0';
+   -- Owned solely by tlb_fault_proc. Sticky, because the trace freeze can only
+   -- act on a decode boundary and the fault does not land on one.
+   signal tlb_fault_req                : std_logic := '0';
+   signal fault_badvaddr               : std_logic_vector(31 downto 0) := (others => '0');
+   signal fault_s1                     : std_logic_vector(31 downto 0) := (others => '0');
+   signal fault_s2                     : std_logic_vector(31 downto 0) := (others => '0');
+   signal fault_census                 : std_logic_vector(31 downto 0) := (others => '0');
+   signal fault_cause                  : std_logic_vector(31 downto 0) := (others => '0');
+   signal fault_epc                    : std_logic_vector(31 downto 0) := (others => '0');
+
+   -- ---------------------------------------------------------------------
+   -- Pre-event execution trace (see the debug_trace_bus port comment).
+   --
+   -- decodeNewPulse is what makes this trustworthy. decodeNew is only WRITTEN
+   -- when stall = 0, so it stays asserted for the whole of a stall and a
+   -- capture gated on it re-samples one decode many times. The trace needs one
+   -- entry per instruction, so stage 2 raises this for exactly the cycle in
+   -- which pcOld1/opcode1 hold a newly decoded pair.
+   --
+   -- The trace is a shift register rather than a ring: no write-pointer decode,
+   -- and the export order is fixed, so a photograph cannot be misread by
+   -- getting the wrap point wrong. Index 0 is the newest decode.
+   -- ---------------------------------------------------------------------
+   constant TRACE_DEPTH : integer := 8;
+   type t_trace_word is array (0 to TRACE_DEPTH - 1) of std_logic_vector(31 downto 0);
+   type t_trace_src  is array (0 to TRACE_DEPTH - 1) of std_logic_vector(3 downto 0);
+   signal decodeNewPulse               : std_logic := '0';
+   -- A genuine delay slot SEQUENTIALLY FOLLOWS its branch. A branch target
+   -- does not. That one test separates them, and it needs no opcode decoding.
+   --
+   -- When a branch sits in another branch's delay slot the hardware marks the
+   -- first branch's TARGET as a delay slot too, and cop0 records
+   -- EPC = target - 4. Measured directly: the interrupt is recognised with
+   -- PCold1 = the target and executeBranchdelaySlot = 1. eret then resumes at
+   -- target - 4 and falls THROUGH the target instead of entering it via the
+   -- branch. That is the KI FMV restart - KI1 880322D4/880322D8,
+   -- KI2 8802F074/8802F078, both recording EPC = target - 4 on hardware.
+   --
+   -- ds_prev_pc advances on decodeNewPulse, one pulse per genuinely new
+   -- decode, so it is aligned with PCold1 - which is exactly what cop0 pairs
+   -- with isDelaySlot when it computes nextEPC.
+   signal ds_prev_pc                   : unsigned(31 downto 0) := (others => '0');
+   signal ds_prev_isbranch             : std_logic := '0';
+
+   -- Does this opcode have a delay slot?
+   function opcodeIsBranch(op : unsigned(31 downto 0)) return std_logic is
+      variable o : unsigned(5 downto 0);
+      variable f : unsigned(5 downto 0);
+   begin
+      o := op(31 downto 26);
+      f := op(5 downto 0);
+      if (o = 6x"01") then return '1'; end if;                  -- REGIMM
+      if (o = 6x"02" or o = 6x"03") then return '1'; end if;    -- j, jal
+      if (o >= 6x"04" and o <= 6x"07") then return '1'; end if; -- beq..bgtz
+      if (o >= 6x"14" and o <= 6x"17") then return '1'; end if; -- the l variants
+      if (o = 6x"00" and (f = 6x"08" or f = 6x"09")) then return '1'; end if; -- jr, jalr
+      if ((o = 6x"10" or o = 6x"11" or o = 6x"12") and op(25 downto 21) = 5x"08") then
+         return '1';                                            -- BC0/1/2
+      end if;
+      return '0';
+   end function;
+   signal chainedDelaySlot             : std_logic := '0';
+   signal fetch_src                    : std_logic_vector(3 downto 0);
+   signal src0                         : std_logic_vector(3 downto 0) := (others => '0');
+   signal src1                         : std_logic_vector(3 downto 0) := (others => '0');
+   signal trace_pc                     : t_trace_word := (others => (others => '0'));
+   signal trace_op                     : t_trace_word := (others => (others => '0'));
+   signal trace_src                    : t_trace_src := (others => (others => '0'));
+   signal trace_frozen                 : std_logic := '0';
+   signal trace_cause                  : std_logic_vector(31 downto 0) := (others => '0');
+   signal trace_epc                    : std_logic_vector(31 downto 0) := (others => '0');
+   signal trace_badvaddr               : std_logic_vector(31 downto 0) := (others => '0');
+   signal trace_s1                     : std_logic_vector(31 downto 0) := (others => '0');
+   signal trace_s2                     : std_logic_vector(31 downto 0) := (others => '0');
+   signal trace_tlb_census             : std_logic_vector(31 downto 0) := (others => '0');
+   signal store_addr_0                 : std_logic_vector(31 downto 0) := (others => '0');
+   signal store_data_0                 : std_logic_vector(31 downto 0) := (others => '0');
+   signal store_pc_0                   : std_logic_vector(31 downto 0) := (others => '0');
+   signal store_addr_1                 : std_logic_vector(31 downto 0) := (others => '0');
+   signal store_hold                   : unsigned(4 downto 0) := (others => '0');
+   signal store_frozen                 : std_logic := '0';
+   signal hi                           : unsigned(63 downto 0) := (others => '0');
+   signal lo                           : unsigned(63 downto 0) := (others => '0');
+          
+   -- memory interface
+   signal memoryMuxStage4              : std_logic := '0';
+   signal mem1_request_latched         : std_logic := '0';
+   signal mem1_cache_latched           : std_logic := '0';
+   signal mem1_address_latched         : unsigned(31 downto 0) := (others => '0');
+   signal datacache_request_latched    : std_logic := '0';
+   signal datacache_address_latched    : unsigned(31 downto 0) := (others => '0');
+   
+   signal mem_finished_instr           : std_logic := '0';
+   signal mem_finished_read            : std_logic := '0';
+   signal mem_finished_dataRead        : std_logic_vector(63 downto 0);
+          
+   signal writefifo_Din                : std_logic_vector(115 downto 0) := (others => '0');
+   signal writefifo_wr                 : std_logic := '0';
+   signal writefifo_Dout               : std_logic_vector(115 downto 0);
+   signal writefifo_Rd                 : std_logic := '0';
+   signal writefifo_Empty              : std_logic;
+   signal writefifo_Full               : std_logic;
+   signal writefifo_wr_accept          : std_logic;
+   signal writefifo_rd_accept          : std_logic;
+   signal writefifo_schedule_ready     : std_logic;
+   signal writefifo_block              : std_logic;
+   signal writefifo_mem4_ready         : std_logic;
+   signal writefifo_cnt                : integer range 0 to 7;
+   type t_datacache_wb_fifo is array (0 to 3) of std_logic_vector(95 downto 0);
+   signal datacache_wb_fifo            : t_datacache_wb_fifo :=
+                                           (others => (others => '0'));
+   signal datacache_wb_fifo_wrptr      : unsigned(1 downto 0) := (others => '0');
+   signal datacache_wb_fifo_rdptr      : unsigned(1 downto 0) := (others => '0');
+   signal datacache_wb_fifo_count      : integer range 0 to 4 := 0;
+   signal datacache_wb_fifo_pop        : std_logic;
+   signal writefifo_issue_pending      : std_logic := '0';
+   signal writefifo_issue_wb           : std_logic := '0';
+   signal datacache_wb_busy            : std_logic;
+   signal datacache_debug_state        : std_logic_vector(3 downto 0);
+          
+   -- The transaction FIFO belongs entirely to clk93.  Transfer its wide
+   -- payload to clk1x through a bundled-data request/acknowledge mailbox so
+   -- address, data and control bits can never be sampled from different FIFO
+   -- entries while the clocks drift relative to one another.
+   signal write_cdc_data_93            : std_logic_vector(115 downto 0) := (others => '0');
+   signal write_cdc_req_93             : std_logic := '0';
+   signal write_cdc_busy_93            : std_logic := '0';
+   signal write_cdc_ack_1x             : std_logic := '0';
+   signal write_cdc_ack_meta_93        : std_logic := '0';
+   signal write_cdc_ack_sync_93        : std_logic := '0';
+   signal write_cdc_req_meta_1x        : std_logic := '0';
+   signal write_cdc_req_sync_1x        : std_logic := '0';
+   signal write_cdc_req_seen_1x        : std_logic := '0';
+
+   -- Read-response mailbox from the memory clock domain to the CPU clock
+   -- domain. The payload remains stable until the CPU acknowledges it.
+   signal response_cdc_data_1x         : std_logic_vector(104 downto 0) := (others => '0');
+   signal response_cdc_req_1x          : std_logic := '0';
+   signal response_cdc_busy_1x         : std_logic := '0';
+   signal response_cdc_ack_93          : std_logic := '0';
+   signal response_cdc_ack_meta_1x     : std_logic := '0';
+   signal response_cdc_ack_sync_1x     : std_logic := '0';
+   signal response_cdc_req_meta_93     : std_logic := '0';
+   signal response_cdc_req_sync_93     : std_logic := '0';
+   signal response_cdc_req_seen_93     : std_logic := '0';
+   signal response_cdc_pending_93      : std_logic := '0';
+   signal response_cdc_deliver_93      : std_logic := '0';
+   signal response_cdc_class_93        : std_logic := '0';
+
+   -- Independent clk93-domain ownership scoreboard. The main transaction
+   -- FIFO carries a sequence tag to clk1x and back; this queue records what
+   -- was accepted before that CDC path, so a lost, duplicated, reordered or
+   -- misclassified response cannot validate itself with its own metadata.
+   type t_read_meta_tag is array (0 to 15) of std_logic_vector(7 downto 0);
+   type t_read_meta_class is array (0 to 15) of std_logic;
+   type t_read_meta_address is array (0 to 15) of std_logic_vector(31 downto 0);
+   signal read_meta_tag               : t_read_meta_tag := (others => (others => '0'));
+   signal read_meta_class             : t_read_meta_class := (others => '0');
+   signal read_meta_address           : t_read_meta_address := (others => (others => '0'));
+   signal read_meta_wrptr             : unsigned(3 downto 0) := (others => '0');
+   signal read_meta_rdptr             : unsigned(3 downto 0) := (others => '0');
+   signal read_meta_count             : integer range 0 to 16 := 0;
+   signal read_sequence_93            : unsigned(7 downto 0) := (others => '0');
+   signal read_meta_push              : std_logic;
+   signal read_meta_pop               : std_logic;
+   signal read_meta_tag_mismatch      : std_logic;
+   signal read_meta_class_mismatch    : std_logic;
+   signal read_meta_address_mismatch  : std_logic;
+   signal debug_response_status_reg   : std_logic_vector(31 downto 0) := (others => '0');
+
+   -- Active clk1x transaction metadata is registered with the bus command,
+   -- then held until mem_done builds the response mailbox payload.
+   signal memory_read_tag_1x          : std_logic_vector(7 downto 0) := (others => '0');
+   signal memory_read_address_1x      : std_logic_vector(31 downto 0) := (others => '0');
+          
+   -- common   
+   type t_memstate is
+   (
+      MEMSTATE_IDLE,
+      MEMSTATE_BUSY
+   );
+   signal memstate : t_memstate := MEMSTATE_IDLE;                 
+   
+   signal stallNew4                    : std_logic := '0';
+               
+   signal stall1                       : std_logic := '0';
+   signal stall2                       : std_logic := '0';
+   signal stall3                       : std_logic := '0';
+   signal stall4                       : std_logic := '0';
+   signal stall                        : unsigned(4 downto 0) := (others => '0');
+   signal stall4Masked                 : unsigned(4 downto 0) := (others => '0');
+                     
+   signal exception                    : std_logic;
+   signal exceptionStage1              : std_logic;
+   signal exceptionNew3                : std_logic := '0';
+   signal exceptionNewPC               : std_logic;
+   signal exceptionFPU                 : std_logic;
+   signal exception_COP                : unsigned(1 downto 0);
+   
+   signal exception_SR                 : unsigned(31 downto 0) := (others => '0');
+   signal exception_CAUSE              : unsigned(31 downto 0) := (others => '0');
+   signal exception_EPC                : unsigned(31 downto 0) := (others => '0');
+   signal exception_JMP                : unsigned(31 downto 0) := (others => '0');
+   
+   signal exceptionCode                : unsigned(3 downto 0);
+   signal exceptionCode_3              : unsigned(3 downto 0);   
+   signal exceptionInstr               : unsigned(1 downto 0);
+   signal exception_PC                 : unsigned(31 downto 0);
+   signal exception_branch             : std_logic;
+   signal exception_brslot             : std_logic;
+   signal exception_JMPnext            : unsigned(31 downto 0);     
+               
+   signal opcode0                      : unsigned(31 downto 0) := (others => '0');
+   signal opcode1                      : unsigned(31 downto 0) := (others => '0');
+-- synthesis translate_off
+   signal opcode2                      : unsigned(31 downto 0) := (others => '0');
+   signal opcode3                      : unsigned(31 downto 0) := (others => '0');
+   signal opcode4                      : unsigned(31 downto 0) := (others => '0');
+-- synthesis translate_on  
+  
+   signal PCold0                       : unsigned(63 downto 0) := (others => '0');
+   signal PCold1                       : unsigned(63 downto 0) := (others => '0');
+   
+-- synthesis translate_off
+   signal PCold2                       : unsigned(63 downto 0) := (others => '0');
+   signal PCold3                       : unsigned(63 downto 0) := (others => '0');
+   signal PCold4                       : unsigned(63 downto 0) := (others => '0');
+   
+   signal hi_1                         : unsigned(63 downto 0) := (others => '0');
+   signal lo_1                         : unsigned(63 downto 0) := (others => '0');
+   signal hi_2                         : unsigned(63 downto 0) := (others => '0');
+   signal lo_2                         : unsigned(63 downto 0) := (others => '0');
+-- synthesis translate_on
+   
+   signal value1                       : unsigned(63 downto 0) := (others => '0');
+   signal value2                       : unsigned(63 downto 0) := (others => '0');
+   signal executeForwardValue1         : std_logic := '0';
+   signal executeForwardValue2         : std_logic := '0';
+   signal writebackForwardValue1       : std_logic := '0';
+   signal writebackForwardValue2       : std_logic := '0';
+               
+   -- stage 1          
+   -- cache
+   signal FetchAddr                    : unsigned(63 downto 0) := (others => '0'); 
+   signal FetchAddr1                   : unsigned(63 downto 0) := (others => '0'); 
+   signal FetchAddr2                   : unsigned(63 downto 0) := (others => '0'); 
+   signal FetchAddrTLBMuxed1           : unsigned(31 downto 0) := (others => '0'); 
+   signal FetchAddrTLBMuxed2           : unsigned(31 downto 0) := (others => '0'); 
+   signal FetchAddrSelect              : std_logic;
+   signal fetchCache1                  : std_logic;
+   signal fetchCache2                  : std_logic;
+   signal fetchCache                   : std_logic;
+   signal useCached_data               : std_logic := '0';
+   
+   signal fill_addrTag                 : unsigned(31 downto 0) := (others => '0'); 
+   signal instrcache_request           : std_logic;
+   signal instrcache_active            : std_logic := '0';
+   signal instrcache_hit               : std_logic;
+   signal instrcache_data              : std_logic_vector(31 downto 0);
+   signal instrcache_fill              : std_logic := '0';
+   signal instrcache_fill_done         : std_logic;
+   signal cache_commandEnableI         : std_logic;
+   signal cache_commandEnableD         : std_logic;
+   
+   signal cacheHitLast                 : std_logic := '0';
+   
+   -- regs           
+   signal fetchReady                   : std_logic := '0';
+   
+   -- wires   
+   signal mem1_request                 : std_logic := '0';
+   signal mem1_cacherequest            : std_logic := '0';
+   signal mem1_address                 : unsigned(31 downto 0) := (others => '0'); 
+            
+   -- stage 2           
+   --regs      
+   signal decodeNew                    : std_logic := '0';
+   signal decodeResultWriteEnable      : std_logic := '0';
+   signal decode_irq                   : std_logic := '0';
+   signal blockIRQ                     : std_logic := '0';
+   signal decodeImmData                : unsigned(15 downto 0) := (others => '0');
+   signal decodeSource1                : unsigned(4 downto 0) := (others => '0');
+   signal decodeSource2                : unsigned(4 downto 0) := (others => '0');
+   signal decodeValue1                 : unsigned(63 downto 0) := (others => '0');
+   signal decodeValue2                 : unsigned(63 downto 0) := (others => '0');
+   signal decodeShamt                  : unsigned(5 downto 0) := (others => '0');
+   signal decodeRD                     : unsigned(4 downto 0) := (others => '0');
+   signal decodeTarget                 : unsigned(4 downto 0) := (others => '0');
+   signal decodeJumpTarget             : unsigned(25 downto 0) := (others => '0');
+   signal decodeUseImmidateValue2      : std_logic := '0';
+   signal decodeShiftSigned            : std_logic := '0';
+   signal decodeShift32                : std_logic := '0';
+   signal decodeShiftAmountType        : std_logic_vector(1 downto 0) := "00";
+   signal decodeFPUSource1             : unsigned(4 downto 0) := (others => '0');
+   signal decodeFPUSource2             : unsigned(4 downto 0) := (others => '0');
+   signal decodeFPUValue1              : unsigned(63 downto 0) := (others => '0');
+   signal decodeFPUValue2              : unsigned(63 downto 0) := (others => '0');
+   signal decodeFPUForwardUse          : std_logic := '0';
+   signal decodeFPUTarget              : unsigned(4 downto 0) := (others => '0');
+   signal decodeFPUCommandEnable       : std_logic := '0';
+   signal decodeFPUTransferEnable      : std_logic := '0';
+   signal decodeFPUMULS                : std_logic := '0';
+   signal decodeFPUMULD                : std_logic := '0';
+   signal decodeExcCode                : unsigned(3 downto 0); 
+   signal decodeExcCOP                 : unsigned(1 downto 0); 
+   signal decodecalcMULT               : std_logic := '0';
+   signal decodecalcMULTU              : std_logic := '0';
+   signal decodecalcDMULT              : std_logic := '0';
+   signal decodecalcDMULTU             : std_logic := '0';
+   signal decodecalcDIV                : std_logic := '0';
+   signal decodecalcDIVU               : std_logic := '0';
+   signal decodecalcDDIV               : std_logic := '0';
+   signal decodecalcDDIVU              : std_logic := '0';
+   signal decodehiUpdate               : std_logic := '0';
+   signal decodeloUpdate               : std_logic := '0';
+   signal decodeMemWriteEnable         : std_logic := '0';
+   signal decodeMemWriteLL             : std_logic := '0';
+   signal decodeMemReadEnable          : std_logic := '0';
+   signal decodeMem64Bit               : std_logic := '0';
+   signal decodeCacheEnable            : std_logic := '0';
+   signal decodeCacheTLBTranslate      : std_logic := '0';
+   signal decodeSetLL                  : std_logic := '0';
+   signal decodeResetLL                : std_logic := '0';
+   signal decodeERET                   : std_logic := '0';
+   signal decodeCOP0ReadEnable         : std_logic := '0';
+   signal decodeCOP0WriteEnable        : std_logic := '0';
+   signal decodeCOP0Register           : unsigned(4 downto 0);
+   signal decodeCOP1ReadEnable         : std_logic := '0';
+   signal decodeCOP2ReadEnable         : std_logic := '0';
+   signal decodeCOP2WriteEnable        : std_logic := '0';
+   signal decodeCOP64                  : std_logic := '0';
+   signal decodeTLBR                   : std_logic := '0';
+   signal decodeTLBWI                  : std_logic := '0';
+   signal decodeTLBWR                  : std_logic := '0';
+   signal decodeTLBP                   : std_logic := '0';
+   
+   type t_decodeBitFuncType is
+   (
+      BITFUNC_SIGNED,
+      BITFUNC_UNSIGNED,
+      BITFUNC_IMM_SIGNED,
+      BITFUNC_IMM_UNSIGNED,
+      BITFUNC_SC
+   );
+   signal decodeBitFuncType : t_decodeBitFuncType;    
+
+   type t_decodeBranchType is
+   (
+      BRANCH_OFF,
+      BRANCH_ALWAYS_REG,
+      BRANCH_JUMPIMM,
+      BRANCH_BRANCH_BLTZ,
+      BRANCH_BRANCH_BGEZ, 
+      BRANCH_BRANCH_BEQ,
+      BRANCH_BRANCH_BNE,
+      BRANCH_BRANCH_BLEZ,
+      BRANCH_BRANCH_BGTZ,
+      BRANCH_BC1,
+      BRANCH_ERET
+   );
+   signal decodeBranchType    : t_decodeBranchType;   
+   signal decodeBranchLikely  : std_logic;
+
+   type t_decodeResultMux is
+   (
+      RESULTMUX_SHIFTLEFT, 
+      RESULTMUX_SHIFTRIGHT,
+      RESULTMUX_ADD,       
+      RESULTMUX_PC,        
+      RESULTMUX_HI,        
+      RESULTMUX_LO,        
+      RESULTMUX_SUB,       
+      RESULTMUX_AND,       
+      RESULTMUX_OR,        
+      RESULTMUX_XOR,       
+      RESULTMUX_NOR,       
+      RESULTMUX_BIT,
+      RESULTMUX_FPU,      
+      RESULTMUX_LUI
+   );
+   signal decodeResultMux : t_decodeResultMux;   
+   signal decodeResult32               : std_logic := '0';
+   
+   type t_decodeExcType is
+   (
+      EXCTYPE_NONE,
+      EXCTYPE_DECODE, 
+      EXCTYPE_PC,
+      EXCTYPE_ADDRH,
+      EXCTYPE_ADDRW,
+      EXCTYPE_ADDRD,
+      EXCTYPE_ADD,
+      EXCTYPE_DADD,
+      EXCTYPE_ADDI,
+      EXCTYPE_DADDI,
+      EXCTYPE_SUB,
+      EXCTYPE_DSUB,
+      EXCTYPE_TRAPU0, 
+      EXCTYPE_TRAPU1, 
+      EXCTYPE_TRAPS0, 
+      EXCTYPE_TRAPS1, 
+      EXCTYPE_TRAPE0, 
+      EXCTYPE_TRAPE1, 
+      EXCTYPE_TRAPIU0,
+      EXCTYPE_TRAPIU1,
+      EXCTYPE_TRAPIS0,
+      EXCTYPE_TRAPIS1,
+      EXCTYPE_TRAPIE0,
+      EXCTYPE_TRAPIE1
+   );
+   signal decodeExcType : t_decodeExcType := EXCTYPE_NONE;    
+   
+   type t_decodeMemWriteType is
+   (
+      MEMWRITETYPE_BYTE,
+      MEMWRITETYPE_HALF,
+      MEMWRITETYPE_WORD,
+      MEMWRITETYPE_SWL,
+      MEMWRITETYPE_SWR,
+      MEMWRITETYPE_DWORD,
+      MEMWRITETYPE_SDL,
+      MEMWRITETYPE_SDR,
+      MEMWRITETYPE_COP1L,
+      MEMWRITETYPE_COP1H,
+      MEMWRITETYPE_COP1D
+   );
+   signal decodeMemWriteType : t_decodeMemWriteType := MEMWRITETYPE_BYTE;    
+   
+   type CPU_LOADTYPE is
+   (
+      LOADTYPE_SBYTE,
+      LOADTYPE_SWORD,
+      LOADTYPE_LEFT,
+      LOADTYPE_DWORD,
+      LOADTYPE_DWORDU,
+      LOADTYPE_BYTE,
+      LOADTYPE_WORD,
+      LOADTYPE_RIGHT,
+      LOADTYPE_QWORD,
+      LOADTYPE_LEFT64,
+      LOADTYPE_RIGHT64
+   );
+   signal decodeLoadType               : CPU_LOADTYPE;
+   
+   -- wires
+   signal opcodeCacheMuxed             : unsigned(31 downto 0) := (others => '0');
+   
+   signal decImmData                   : unsigned(15 downto 0);
+   signal decSource1                   : unsigned(4 downto 0);
+   signal decSource2                   : unsigned(4 downto 0);
+   signal decOP                        : unsigned(5 downto 0);
+   signal decFunct                     : unsigned(5 downto 0);
+   signal decShamt                     : unsigned(4 downto 0);
+   signal decRD                        : unsigned(4 downto 0);
+   signal decTarget                    : unsigned(4 downto 0);
+   signal decJumpTarget                : unsigned(25 downto 0);
+   signal decFPUSource1                : unsigned(4 downto 0);
+   signal decFPUSource2                : unsigned(4 downto 0);
+   signal decRequiresFPUreg1           : std_logic; 
+   signal decRequiresFPUreg2           : std_logic;
+   signal decFPUForwardUse             : std_logic;
+            
+   -- stage 3   
+   signal value2_muxedSigned           : unsigned(63 downto 0);
+   signal value2_muxedLogical          : unsigned(63 downto 0);
+   signal calcResult_add               : unsigned(63 downto 0);
+   signal calcResult_sub               : unsigned(63 downto 0);
+   signal calcResult_and               : unsigned(63 downto 0);
+   signal calcResult_or                : unsigned(63 downto 0);
+   signal calcResult_xor               : unsigned(63 downto 0);
+   signal calcResult_nor               : unsigned(63 downto 0);
+   signal calcMemAddr                  : unsigned(63 downto 0);
+   
+   signal calcResult_lesserSigned      : std_logic;
+   signal calcResult_lesserUnSigned    : std_logic;
+   signal calcResult_lesserIMMSigned   : std_logic;
+   signal calcResult_lesserIMMUnsigned : std_logic;
+   signal calcResult_equal             : std_logic;
+   signal calcResult_bit               : unsigned(63 downto 0);
+   
+   signal executeShamt                 : unsigned(5 downto 0);
+   signal shiftValue                   : signed(64 downto 0);
+   signal calcResult_shiftL            : unsigned(63 downto 0);
+   signal calcResult_shiftR            : unsigned(63 downto 0);
+   
+   signal cmpEqual                     : std_logic;
+   signal cmpNegative                  : std_logic;
+   signal cmpZero                      : std_logic;
+   signal PCnext                       : unsigned(63 downto 0) := (others => '0');
+   signal PCnextBranch                 : unsigned(63 downto 0) := (others => '0');
+   
+   signal resultDataMuxed              : unsigned(63 downto 0);
+   signal resultDataMuxed64            : unsigned(63 downto 0);
+   
+   --regs         
+   signal executeNew                   : std_logic := '0';
+   signal executeIgnoreNext            : std_logic := '0';
+   signal executeStallFromMEM          : std_logic := '0';
+   signal resultWriteEnable            : std_logic := '0';
+   signal executeBranchdelaySlot       : std_logic := '0';
+   signal resultTarget                 : unsigned(4 downto 0) := (others => '0');
+   signal resultData                   : unsigned(63 downto 0) := (others => '0');
+   signal executeMem64Bit              : std_logic := '0';
+   signal executeMemWriteEnable        : std_logic := '0';
+   signal executeMemUseCache           : std_logic := '0';
+   signal executeMemUseCacheEffective  : std_logic := '0';
+   signal executeMemWriteData          : unsigned(63 downto 0) := (others => '0');
+   signal executeMemWriteMask          : std_logic_vector(7 downto 0) := (others => '0');
+   signal executeMemAddress            : unsigned(31 downto 0) := (others => '0');
+   signal executeMemReadEnable         : std_logic := '0';
+   signal executeMemReadLastData       : unsigned(63 downto 0) := (others => '0');
+   signal executeCOP0WriteEnable       : std_logic := '0';
+   signal executeCOP0ReadEnable        : std_logic := '0';
+   signal executeCOP0Register          : unsigned(4 downto 0) := (others => '0');
+   signal executeCOP0WriteValue        : unsigned(63 downto 0) := (others => '0');
+   signal executeCOP2WriteEnable       : std_logic := '0';
+   signal executeCOP2ReadEnable        : std_logic := '0';
+   signal executeCOP64                 : std_logic := '0';
+   signal executeSetLL                 : std_logic := '0';
+   signal executeLLfromTLB             : std_logic := '0';
+   signal executeLoadType              : CPU_LOADTYPE;
+   signal executeICacheEnable          : std_logic := '0';
+   signal executeDCacheEnable          : std_logic := '0';
+   signal executeCacheCommand          : unsigned(4 downto 0) := (others => '0');
+   signal executeCOP1Target            : unsigned(4 downto 0) := (others => '0');
+   signal executeCOP1ReadEnable        : std_logic := '0';
+   signal execute_unstallFPUForward    : std_logic := '0';
+   signal execute_ERET                 : std_logic := '0';
+   signal execute_TLBR                 : std_logic := '0';
+   signal execute_TLBWI                : std_logic := '0';
+   signal execute_TLBWR                : std_logic := '0';
+   signal execute_TLBP                 : std_logic := '0';
+   signal exceptionAllowDelay          : std_logic := '0';
+
+   signal hiloWait                     : integer range 0 to 69;
+   
+   signal llBit                        : std_logic := '0';
+
+   --wires
+   signal EXEIgnoreNext                : std_logic := '0';
+   signal EXEBranchdelaySlot           : std_logic := '0';
+   signal EXECOPBranchDelaySlot        : std_logic := '0';
+   signal EXEBranchTaken               : std_logic := '0';
+   signal EXEMemWriteData              : unsigned(63 downto 0) := (others => '0');
+   signal EXEMemWriteMask              : std_logic_vector(7 downto 0) := (others => '0');
+   signal EXECOP0WriteValue            : unsigned(63 downto 0) := (others => '0');
+   signal EXECacheAddr                 : unsigned(31 downto 0);
+   signal EXEExceptionMem              : std_logic;
+   signal EXETLBMapped                 : std_logic;
+   signal EXETLBDataAccess             : std_logic;
+   
+   --MULT/DIV
+   type CPU_HILOCALC is
+   (
+      HILOCALC_MULT, 
+      HILOCALC_MULTU,
+      HILOCALC_DMULT,
+      HILOCALC_DMULTU,
+      HILOCALC_DIV,  
+      HILOCALC_DIVU,
+      HILOCALC_DDIV,  
+      HILOCALC_DDIVU
+   );
+   signal hilocalc                     : CPU_HILOCALC;
+   
+   signal mulsign                      : std_logic;
+   signal mul1                         : std_logic_vector(63 downto 0);
+   signal mul2                         : std_logic_vector(63 downto 0);
+   signal mulResult                    : std_logic_vector(127 downto 0);
+   
+   signal DIVstart                     : std_logic;
+   signal DIVis32                      : std_logic;
+   signal DIVdividend                  : signed(64 downto 0);
+   signal DIVdivisor                   : signed(64 downto 0);
+   signal DIVquotient                  : signed(64 downto 0);
+   signal DIVremainder                 : signed(64 downto 0);     
+         
+   -- COP0
+   signal eretPC                       : unsigned(63 downto 0) := (others => '0');
+   signal exceptionPC                  : unsigned(63 downto 0) := (others => '0');
+   signal COP0ReadValue                : unsigned(63 downto 0) := (others => '0');
+   
+   signal COP1_enable                  : std_logic;
+   signal COP2_enable                  : std_logic;
+   signal fpuRegMode                   : std_logic;
+   signal privilegeMode                : unsigned(1 downto 0);
+   signal kusegUnmapped                : std_logic;
+   signal bit64region                  : std_logic;
+   -- Region decode width. bit64region is Status.KX/SX/UX via cpu_cop0; with
+   -- ADDR32_ONLY it is forced to '0' at elaboration so the 64-bit branch is
+   -- never built.
+   --
+   -- That branch is a cascade of roughly 26 chained 64-bit magnitude compares
+   -- on value1 - the forwarded register at the head of the critical path - and
+   -- it feeds BOTH dominant path clusters: the region decode below
+   -- (executeMemAddress, 59% of the 300 worst endpoints) and TLB_instrMapped
+   -- above (stall1, 17%). The 32-bit branch it is replaced by is three compares
+   -- on calcMemAddr(31 downto 29).
+   --
+   -- The KI wrapper enables ADDR32_ONLY because both supported games execute
+   -- with 32-bit virtual addresses and keep Status.KX/SX/UX clear.
+   signal region64                     : std_logic;
+   signal irqTrigger                   : std_logic;
+   signal TLBDone                      : std_logic;
+   
+   signal region_TLBmapped             : std_logic;
+   signal region_cached                : std_logic;
+   signal region_full32                : std_logic;
+   signal region_unused                : std_logic;
+   
+   signal TLB_ss_load                  : std_logic;
+   signal TLB_instrMapped              : std_logic;
+   signal TLB_instrMapped1             : std_logic;
+   signal TLB_instrMapped2             : std_logic;
+   signal TLB_instrReq                 : std_logic;
+   signal TLB_instrUseCache            : std_logic;
+   signal TLB_instrStall               : std_logic;
+   signal TLB_instrUnStall             : std_logic;
+   signal TLB_instrAddrOutFound        : unsigned(31 downto 0);   
+   signal TLB_instrAddrOutLookup       : unsigned(31 downto 0);   
+   signal TLB_dataUseCacheFound        : std_logic;
+   signal TLB_dataUseCacheLookup       : std_logic;
+   signal TLB_dataStall                : std_logic;
+   signal TLB_dataUnStall              : std_logic;
+   signal TLB_dataAddrOutFound         : unsigned(31 downto 0);
+   signal TLB_dataAddrOutLookup        : unsigned(31 downto 0);
+   
+   signal TagLo_Valid                  : std_logic;
+   signal TagLo_Dirty                  : std_logic;
+   signal TagLo_Addr                   : unsigned(19 downto 0);
+   
+   signal writeDatacacheTagEna         : std_logic;
+   signal writeDatacacheTagValue       : unsigned(21 downto 0);
+
+   -- COP1
+   signal cop1_stage4_writeEnable      : std_logic := '0';
+   signal cop1_stage4_writeMask        : std_logic_vector(1 downto 0) := (others => '0');
+   signal cop1_stage4_data             : unsigned(63 downto 0) := (others => '0');
+   signal cop1_stage4_target           : unsigned(4 downto 0) := (others => '0');
+
+   signal FPU_CF                       : std_logic;
+   signal FPU_command_ena              : std_logic := '0';
+   signal FPU_command_done             : std_logic := '0';
+   signal FPU_TransferEna              : std_logic := '0';
+   signal FPU_TransferData             : unsigned(63 downto 0);
+
+   -- COP2
+   signal COP2Latch                    : unsigned(63 downto 0) := (others => '0');
+
+   -- stage 4 
+   -- reg      
+   signal writebackNew                 : std_logic := '0';
+   signal writebackStallFromMEM        : std_logic := '0';
+   signal writebackTarget              : unsigned(4 downto 0) := (others => '0');
+   signal writebackData                : unsigned(63 downto 0) := (others => '0');
+   signal writebackWriteEnable         : std_logic := '0';
+   signal writeback_UseCache           : std_logic := '0';
+   signal writebackMemWrite             : std_logic := '0';
+   signal writebackLoadType            : CPU_LOADTYPE;
+   signal writebackReadAddress         : unsigned(31 downto 0) := (others => '0');
+   signal writebackReadLastData        : unsigned(63 downto 0) := (others => '0');
+   signal writeback_COP1_ReadEnable    : std_logic := '0'; 
+   signal writeback_fifoStall          : std_logic := '0'; 
+   signal read_fifoStall               : std_logic := '0';
+   -- The replayed request has to carry the address, data and mask of the
+   -- instruction that was BLOCKED, not whatever stage 3 has moved on to.
+   -- Stage 3 keeps advancing while stage 4 is stalled, so executeMemAddress
+   -- and friends belong to a later instruction by the time the FIFO frees up.
+   -- The other FIFO sources already latch for exactly this reason - see
+   -- datacache_address_latched and mem1_address_latched above.
+   signal fifoStall_address            : unsigned(31 downto 0) := (others => '0');
+   signal fifoStall_dataWrite          : std_logic_vector(63 downto 0) := (others => '0');
+   signal fifoStall_writeMask          : std_logic_vector(7 downto 0) := (others => '0');
+   signal fifoStall_req64              : std_logic := '0';
+   signal fifoStall_useCache           : std_logic := '0';
+   signal read_fifoStall_address       : unsigned(31 downto 0) := (others => '0');
+   signal read_fifoStall_req64         : std_logic := '0';
+         
+   -- wire     
+   signal mem4_request                 : std_logic := '0';
+   signal mem4_address                 : unsigned(31 downto 0) := (others => '0');
+   signal mem4_req64                   : std_logic := '0';
+   signal mem4_rnw                     : std_logic := '0';
+   signal mem4_dataWrite               : std_logic_vector(63 downto 0) := (others => '0');    
+   signal mem4_writeMask               : std_logic_vector(7 downto 0) := (others => '0');    
+   
+   signal read4_dataReadData           : unsigned(63 downto 0);
+   signal read4_uncachedRot            : unsigned(1 downto 0);
+   signal read4_uncachedData           : unsigned(63 downto 0);
+   signal mem_finished_dataRot         : std_logic_vector(63 downto 0);
+   signal read4_dataReadRot64          : unsigned(63 downto 0);
+   signal read4_dataReadRot32          : unsigned(31 downto 0);
+   signal read4_Addr                   : unsigned(31 downto 0);
+   signal read4_oldData                : unsigned(63 downto 0);
+   signal read4_cop1_readEna           : std_logic;
+   signal read4_cop1_target            : unsigned(4 downto 0);
+   signal read4_useLoadType            : CPU_LOADTYPE;
+   signal read4_useTarget              : unsigned(4 downto 0);
+   
+   -- Cache
+   signal DATACACHEON_intern           : std_logic := '0';
+   signal DATACACHETLBON_intern        : std_logic := '0';
+   signal datacache_request            : std_logic;
+   signal datacache_active             : std_logic := '0';
+   signal datacache_reqAddr            : unsigned(31 downto 0);
+   signal datacache_readena            : std_logic;
+   signal datacache_readbusy           : std_logic;
+   signal datacache_readdone           : std_logic;
+   signal datacache_addr               : unsigned(31 downto 0);   
+   signal datacache_data_out           : std_logic_vector(63 downto 0);   
+   signal datacache_writeena           : std_logic;
+   signal datacache_writedone          : std_logic;
+   signal datacache_CmdStall           : std_logic;
+   signal datacache_CmdDone            : std_logic;
+   
+   signal datacache_wb_ena             : std_logic;
+   signal datacache_wb_addr            : unsigned(31 downto 0);
+   signal datacache_wb_data            : std_logic_vector(63 downto 0);
+   
+   -- savestates
+   type t_ssarray is array(0 to 31) of std_logic_vector(63 downto 0);
+   signal ss_in  : t_ssarray := (others => (others => '0'));  
+   signal ss_out : t_ssarray := (others => (others => '0'));  
+
+   signal regsSS_address_b             : std_logic_vector(4 downto 0) := (others => '0');
+   signal regsSS_q_b                   : std_logic_vector(63 downto 0);
+   signal regsSS_rden                  : std_logic := '0';
+   
+   signal ss_regs_loading              : std_logic := '0';
+   signal ss_regs_load                 : std_logic := '0';
+   signal ss_regs_addr                 : unsigned(4 downto 0);
+   signal ss_regs_data                 : std_logic_vector(63 downto 0);   
+   
+   signal ss_FPUregs_load              : std_logic := '0';
+   signal ss_FPUregs_addr              : unsigned(4 downto 0);
+   signal ss_FPUregs_data              : std_logic_vector(63 downto 0);   
+   
+   -- debug
+   --signal debugCnt                     : unsigned(31 downto 0);
+   --signal debugSum                     : unsigned(31 downto 0);
+   --signal debugTmr                     : unsigned(31 downto 0);
+   --signal debugwrite                   : std_logic := '0';
+   
+-- synthesis translate_off
+   signal stallcountNo                 : integer;
+   signal stallcount1                  : integer;
+   signal stallcount3                  : integer;
+   signal stallcount4                  : integer;
+   signal stallcountDMA                : integer;
+-- synthesis translate_on
+   
+   signal debugStallcounter            : unsigned(12 downto 0);
+   
+   -- export
+-- synthesis translate_off
+   type tRegs is array(0 to 31) of unsigned(63 downto 0);
+   signal regs                         : tRegs := (others => (others => '0'));
+   signal FPUregs                      : tRegs := (others => (others => '0'));
+   
+   signal cop0_export                  : tExportRegs := (others => (others => '0'));
+   signal cop0_export_1                : tExportRegs := (others => (others => '0'));
+   signal csr_export                   : unsigned(24 downto 0) := (others => '0');
+   signal csr_export_1                 : unsigned(24 downto 0) := (others => '0');
+   signal csr_export_2                 : unsigned(24 downto 0) := (others => '0');
+-- synthesis translate_on
+   
+begin
+
+   debug_fetch_pc <= debug_fetch_pc_register;
+   debug_retired  <= std_logic_vector(debug_retired_count);
+   debug_gpr_s1       <= debug_gpr_s1_register;
+   debug_retire_pc <= debug_retire_pc_register;
+   debug_retire_opcode <= debug_retire_opcode_register;
+   debug_irq_count <= std_logic_vector(debug_irq_count_register);
+   debug_t2_reload_count <= std_logic_vector(debug_t2_reload_register);
+   -- RC carries BOTH restart shapes: entries to the game's own entry point in
+   -- the high half, RAM -> boot ROM transitions in the low half. They are
+   -- mutually exclusive explanations of the same visible symptom and reading
+   -- them side by side is what separates them.
+   debug_ret_count <= std_logic_vector(debug_entry_count_register) &
+                      std_logic_vector(debug_ret_count_register(15 downto 0));
+   debug_h1_op <= debug_h1_op_r;
+   -- The opcode AT the departure pc, captured in the same statement as it.
+   debug_exc_cause <= debug_exc_cause_register;
+
+   process (clk93)
+   begin
+      if rising_edge(clk93) then
+         if (reset_93 = '1') then
+            dep_pc_now  <= (others => '0');
+            dep_valid   <= (others => '0');
+            debug_entry_count_register <= (others => '0');
+            trace_pc     <= (others => (others => '0'));
+            trace_op     <= (others => (others => '0'));
+            trace_src    <= (others => (others => '0'));
+            trace_frozen <= '0';
+            trace_cause  <= (others => '0');
+            trace_epc    <= (others => '0');
+            trace_trigger_id <= (others => '0');
+            trace_badvaddr   <= (others => '0');
+            trace_s1         <= (others => '0');
+            trace_s2         <= (others => '0');
+            trace_tlb_census <= (others => '0');
+            debug_ret_count_register <= (others => '0');
+            boot_quiet_count <= (others => '0');
+            game_running     <= '0';
+            trace_trigger_meta <= '0';
+            trace_trigger_sync <= '0';
+         else
+            trace_trigger_meta <= debug_trace_trigger;
+            trace_trigger_sync <= trace_trigger_meta;
+         end if;
+
+         if (reset_93 = '1') then
+            null;
+         elsif (ce_93 = '1' and decodeNewPulse = '1') then
+            dep_pc_now  <= std_logic_vector(PCold1(31 downto 0));
+            if (dep_valid < 2) then
+               dep_valid <= dep_valid + 1;
+            end if;
+
+            -- Every execution of the entry point, counted on the same pulse as
+            -- everything else so it cannot double-count under a stall, and
+            -- saturating so the displayed value is always true. Boot is 1.
+            if (PCold1(31 downto 0) = x"88000000" and
+                debug_entry_count_register < x"FFFF") then
+               debug_entry_count_register <= debug_entry_count_register + 1;
+            end if;
+
+            -- Shift the decode in. Index 0 is the newest, so the landing
+            -- instruction ends up at index 0 and the departure at index 1.
+            -- Stopping on trace_frozen keeps the CAUSAL window: the boot ROM
+            -- runs thousands of instructions after the restart and would
+            -- otherwise overwrite the evidence before anyone can read it.
+            if (trace_frozen = '0') then
+               trace_pc(0)  <= std_logic_vector(PCold1(31 downto 0));
+               trace_op(0)  <= std_logic_vector(opcode1);
+               trace_src(0) <= src1;
+               for i in 1 to TRACE_DEPTH - 1 loop
+                  trace_pc(i)  <= trace_pc(i - 1);
+                  trace_op(i)  <= trace_op(i - 1);
+                  trace_src(i) <= trace_src(i - 1);
+               end loop;
+            end if;
+
+            if (dep_valid = 2 and debug_entry_count_register >= 1 and
+                (PCold1(31 downto 20) = x"9FC" or
+                 PCold1(31 downto 20) = x"BFC") and
+                dep_pc_now(31 downto 20) /= x"9FC" and
+                dep_pc_now(31 downto 20) /= x"BFC") then
+               if (debug_ret_count_register < x"FFFFFFFF") then
+                  debug_ret_count_register <= debug_ret_count_register + 1;
+               end if;
+            end if;
+
+            if (PCold1(31 downto 20) = x"9FC" or
+                PCold1(31 downto 20) = x"BFC") then
+               boot_quiet_count <= (others => '0');
+            elsif (game_running = '0') then
+               if (boot_quiet_count = 2 ** BOOT_QUIET_BITS - 1) then
+                  game_running <= '1';
+               else
+                  boot_quiet_count <= boot_quiet_count + 1;
+               end if;
+            end if;
+
+            if (trace_frozen = '0') then
+               if (tlb_fault_req = '1' and game_running = '1') then
+                  trace_frozen     <= '1';
+                  trace_trigger_id <= "100";
+                  trace_cause      <= fault_cause;
+                  trace_epc        <= fault_epc;
+                  trace_badvaddr   <= fault_badvaddr;
+                  trace_s1         <= fault_s1;
+                  trace_s2         <= fault_s2;
+                  trace_tlb_census <= fault_census;
+               -- Same widened test as the counter above. This fires BEFORE
+               -- the handoff to 0x88000000, so rows 1-7 hold the game code
+               -- that jumped into the ROM - the departure this investigation
+               -- has been trying to name.
+               elsif (dep_valid = 2 and debug_entry_count_register >= 1 and
+                   (PCold1(31 downto 20) = x"9FC" or
+                    PCold1(31 downto 20) = x"BFC") and
+                   dep_pc_now(31 downto 20) /= x"9FC" and
+                   dep_pc_now(31 downto 20) /= x"BFC") then
+                  trace_frozen     <= '1';
+                  trace_trigger_id <= "001";
+                  trace_cause      <= std_logic_vector(cop0_debug_cause);
+                  trace_epc        <= std_logic_vector(cop0_debug_epc);
+                  trace_badvaddr   <= std_logic_vector(cop0_debug_badvaddr);
+                  trace_s1         <= debug_gpr_s1_register;
+                  trace_s2         <= debug_gpr_s2_register;
+                  trace_tlb_census <= std_logic_vector(cop0_debug_tlb_census);
+               elsif (ram_reentry = '1') then
+                  trace_frozen     <= '1';
+                  trace_trigger_id <= "010";
+                  trace_cause      <= std_logic_vector(cop0_debug_cause);
+                  trace_epc        <= std_logic_vector(cop0_debug_epc);
+                  trace_badvaddr   <= std_logic_vector(cop0_debug_badvaddr);
+                  trace_s1         <= debug_gpr_s1_register;
+                  trace_s2         <= debug_gpr_s2_register;
+                  trace_tlb_census <= std_logic_vector(cop0_debug_tlb_census);
+               -- Also counted rather than gated - see ram_reentry. The board
+               -- side now fires on the THIRD disk init: exactly two per startup
+               -- in both games, so the third is the restart's first.
+               elsif (trace_trigger_sync = '1') then
+                  trace_frozen     <= '1';
+                  trace_trigger_id <= "011";
+                  trace_cause      <= std_logic_vector(cop0_debug_cause);
+                  trace_epc        <= std_logic_vector(cop0_debug_epc);
+                  trace_badvaddr   <= std_logic_vector(cop0_debug_badvaddr);
+                  trace_s1         <= debug_gpr_s1_register;
+                  trace_s2         <= debug_gpr_s2_register;
+                  trace_tlb_census <= std_logic_vector(cop0_debug_tlb_census);
+               end if;
+            end if;
+         end if;
+      end if;
+   end process;
+
+   debug_ds_count      <= std_logic_vector(cop0_debug_ds_count);
+   debug_ds_first      <= std_logic_vector(cop0_debug_ds_first);
+   debug_eret_epc      <= eret_epc_held;
+   debug_eret_target   <= eret_target_held;
+   debug_eret_flags    <= eret_flags_held;
+
+   -- Track cop0's per-eret capture until the trace freezes, then hold.
+   --
+   -- The fault is three instructions after the eret being asked about, so
+   -- "the last eret before the freeze" IS that eret. Holding matters because
+   -- the boot ROM the restart lands in takes interrupts of its own, and
+   -- without this the page would show one of those by the time it is read.
+   --
+   -- Every signal here is written by this process and no other.
+   eret_freeze_proc : process (clk93)
+   begin
+      if rising_edge(clk93) then
+         if (reset_93 = '1') then
+            eret_held         <= '0';
+            eret_epc_held     <= (others => '0');
+            eret_target_held  <= (others => '0');
+            eret_flags_held   <= (others => '0');
+         elsif (ce_93 = '1' and eret_held = '0') then
+            eret_epc_held      <= std_logic_vector(cop0_debug_eret_epc);
+            eret_target_held   <= std_logic_vector(cop0_debug_eret_target);
+            eret_flags_held    <= std_logic_vector(cop0_debug_eret_flags);
+            if (trace_frozen = '1') then
+               eret_held <= '1';
+            end if;
+         end if;
+      end if;
+   end process;
+
+   ds_chain_proc : process (clk93)
+   begin
+      if rising_edge(clk93) then
+         if (reset_93 = '1') then
+            ds_prev_pc       <= (others => '0');
+            ds_prev_isbranch <= '0';
+         elsif (ce_93 = '1' and decodeNewPulse = '1') then
+            ds_prev_pc       <= PCold1(31 downto 0);
+            ds_prev_isbranch <= opcodeIsBranch(opcode1);
+         end if;
+      end if;
+   end process;
+
+   -- A chained delay slot requires BOTH: the previous decode was a branch, AND
+   -- this decode is not sequentially after it.
+   --
+   -- On a re-decode the previous decode is the slot itself, which is not a
+   -- branch, so the EPC back-up remains enabled. In the chained case the
+   -- previous decode is the second branch and suppression applies.
+   --
+   -- DS on the status page counts every firing. In normal gameplay it should
+   -- now stay at or near zero; only the FMV decompressor's
+   -- branch-in-branch-delay-slot idiom should move it.
+   chainedDelaySlot <= ds_prev_isbranch when (PCold1(31 downto 0) /= (ds_prev_pc + 4)) else '0';
+
+   -- The fault latch.
+   --
+   -- Runs every clk93 cycle, unlike the trace process above which is gated on
+   -- decodeNewPulse. cpu_cop0 writes BadVAddr, Cause and EPC in the same cycle
+   -- as the strobe, so the capture is two cycles behind it; nothing else writes
+   -- them in between, and the faulting load never reaches writeback, so $s1 and
+   -- $s2 still hold their pre-fault values.
+   --
+   -- Every signal here is written by this process and no other.
+   tlb_fault_proc : process (clk93)
+   begin
+      if rising_edge(clk93) then
+         if (reset_93 = '1') then
+            tlb_exc_stb_d1 <= '0';
+            tlb_exc_stb_d2 <= '0';
+            tlb_fault_req  <= '0';
+            fault_badvaddr <= (others => '0');
+            fault_s1       <= (others => '0');
+            fault_s2       <= (others => '0');
+            fault_census   <= (others => '0');
+            fault_cause    <= (others => '0');
+            fault_epc      <= (others => '0');
+         elsif (ce_93 = '1') then
+            tlb_exc_stb_d1 <= cop0_debug_tlb_exc_stb;
+            tlb_exc_stb_d2 <= tlb_exc_stb_d1;
+
+            -- First fault only. A restart takes the boot ROM through code that
+            -- may fault again, and the first one is the one being asked about.
+            if (tlb_exc_stb_d2 = '1' and tlb_fault_req = '0') then
+               tlb_fault_req  <= '1';
+               fault_badvaddr <= std_logic_vector(cop0_debug_badvaddr);
+               fault_s1       <= debug_gpr_s1_register;
+               fault_s2       <= debug_gpr_s2_register;
+               fault_census   <= std_logic_vector(cop0_debug_tlb_census);
+               fault_cause    <= std_logic_vector(cop0_debug_cause);
+               fault_epc      <= std_logic_vector(cop0_debug_epc);
+            end if;
+         end if;
+      end if;
+   end process;
+
+   process (clk93)
+   begin
+      if rising_edge(clk93) then
+         if (reset_93 = '1') then
+            store_addr_0 <= (others => '0');
+            store_data_0 <= (others => '0');
+            store_pc_0   <= (others => '0');
+            store_addr_1 <= (others => '0');
+            store_hold   <= (others => '0');
+            store_frozen <= '0';
+         elsif (ce_93 = '1') then
+            if (trace_frozen = '1' and store_frozen = '0') then
+               if (store_hold = 16) then
+                  store_frozen <= '1';
+               else
+                  store_hold <= store_hold + 1;
+               end if;
+            end if;
+
+            if (store_frozen = '0' and stall4Masked = 0 and executeNew = '1'
+                and executeMemWriteEnable = '1') then
+               store_addr_1 <= store_addr_0;
+               store_addr_0 <= std_logic_vector(executeMemAddress(31 downto 0));
+               store_data_0 <= std_logic_vector(executeMemWriteData(31 downto 0));
+               store_pc_0   <= debug_fetch_pc_register;
+            end if;
+         end if;
+      end if;
+   end process;
+
+   ram_reentry <= '1' when (dep_valid = 2 and
+                            PCold1(31 downto 0) = x"88000000" and
+                            debug_entry_count_register >= 1)
+                      else '0';
+
+   debug_trace_frozen <= trace_frozen;
+
+   -- Export oldest first, so the debug page renders top to bottom in program
+   -- order and entry 7 is always the landing decode.
+   trace_export : for i in 0 to TRACE_DEPTH - 1 generate
+      debug_trace_bus(i * 64 + 63 downto i * 64 + 32) <=
+         trace_pc(TRACE_DEPTH - 1 - i);
+      debug_trace_bus(i * 64 + 31 downto i * 64) <=
+         trace_op(TRACE_DEPTH - 1 - i);
+      debug_trace_bus(512 + i * 4 + 3 downto 512 + i * 4) <=
+         trace_src(TRACE_DEPTH - 1 - i);
+   end generate;
+
+   debug_trace_bus(575 downto 544) <= trace_cause;
+   debug_trace_bus(607 downto 576) <= trace_epc;
+   debug_trace_bus(639 downto 608) <= store_addr_0;
+   debug_trace_bus(671 downto 640) <= store_data_0;
+   debug_trace_bus(703 downto 672) <= store_pc_0;
+   debug_trace_bus(735 downto 704) <= store_addr_1;
+   -- The capture's own provenance, in its own word rather than stolen bits.
+   --   [2:0]  which trigger froze the trace
+   --   [3]    end-of-boot gate, so an unarmed detector is visible as such
+   debug_cop0_cause_live <= std_logic_vector(cop0_debug_cause);
+   debug_cop0_epc_live   <= std_logic_vector(cop0_debug_epc);
+   debug_trace_bus(738 downto 736) <= trace_trigger_id;
+   debug_trace_bus(739)            <= game_running;
+   debug_trace_bus(799 downto 768) <= trace_badvaddr;
+   debug_trace_bus(831 downto 800) <= trace_s1;
+   debug_trace_bus(863 downto 832) <= trace_s2;
+   debug_trace_bus(895 downto 864) <= trace_tlb_census;
+   -- Fill starts at 740, not 739: widening trace_trigger_id to three bits
+   -- pushed game_running up one, and leaving the fill where it was gave bit
+   -- 739 two drivers. ModelSim resolved that silently; only the Quartus
+   -- analysis pass rejects it, which is why BRINGUP makes that pass mandatory
+   -- after any change that moves bits between fields.
+   debug_trace_bus(767 downto 740) <= (others => '0');
+
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+         if (reset_93 = '1') then
+            debug_fetch_pc_register <= (others => '0');
+            debug_t2_reload_register <= (others => '0');
+            -- debug_ret_count_register is NOT cleared here. It is written by
+            -- the decodeNewPulse process now, and a register driven from two
+            -- processes is illegal for synthesis - Quartus rejects it outright
+            -- while ModelSim resolves it silently, which is why the suite
+            -- passed and the build did not.
+         elsif (ce_93 = '1' and stall = 0 and decodeNew = '1') then
+            debug_fetch_pc_register <= std_logic_vector(PCold1(31 downto 0));
+            debug_prev_op_live      <= std_logic_vector(opcode1);
+            -- One deeper, so two consecutive fetches can be compared.
+            hist_op1 <= debug_prev_op_live;
+            -- EVERY transition out of the decompressed program back into
+            -- the boot ROM, with the address it landed on, the address it left
+            -- from, and a running count. The existing capture above is
+            -- first-only, which was right while the question was "does the
+            -- handoff happen at all" and is useless now that the game boots,
+            -- runs, and restarts itself on a cycle.
+            --
+            -- Read the landing address: BFC00000 is the reset vector,
+            -- BFC00380 the general exception vector for Status.BEV = 1, and
+            -- anything else is an ordinary call into ROM code.
+            if (debug_fetch_pc_register(31 downto 24) = x"88" and
+                (PCold1(31 downto 20) = x"9FC" or
+                 PCold1(31 downto 20) = x"BFC")) then
+               debug_h1_op_r <= hist_op1;
+               debug_exc_cause_register <= std_logic_vector(cop0_debug_cause);
+            end if;
+
+            -- The store is in the branch DELAY SLOT, so "the loop ran 256
+            -- times" and "the CPU issued 256 stores" are not the same claim.
+            -- Counted at decode, gated by stall = 0 and decodeNew, so each
+            -- pass counts once whether or not it goes on to drive the bus.
+
+
+            if PCold1(31 downto 0) = x"9FC00728" then
+               debug_t2_reload_register <= debug_t2_reload_register + 1;
+            end if;
+
+         end if;
+      end if;
+   end process;
+
+   -- common
+   -- Scanout reads these pages directly from the framebuffer RAM, outside the
+   -- CPU data-cache coherence domain. Keep only those exact pages uncached.
+   executeMemUseCacheEffective <= '0' when
+      FRAMEBUFFER_UNCACHED and
+      (((executeMemAddress >= FB0_LOW) and (executeMemAddress < FB0_HIGH)) or
+       ((executeMemAddress >= FB1_LOW) and (executeMemAddress < FB1_HIGH)))
+      else executeMemUseCache;
+
+   stall        <= '0' & stall4 & stall3 & stall2 & stall1;
+   read_meta_push <= writefifo_wr_accept and writefifo_Din(105);
+   read_meta_pop <= '1' when
+      (response_cdc_pending_93 = '0' and
+       response_cdc_deliver_93 = '0' and
+       response_cdc_req_sync_93 /= response_cdc_req_seen_93) else '0';
+   read_meta_tag_mismatch <= '1' when
+      response_cdc_data_1x(72 downto 65) /=
+        read_meta_tag(to_integer(read_meta_rdptr)) else '0';
+   read_meta_class_mismatch <= '1' when
+      response_cdc_data_1x(64) /=
+        read_meta_class(to_integer(read_meta_rdptr)) else '0';
+   read_meta_address_mismatch <= '1' when
+      response_cdc_data_1x(104 downto 73) /=
+        read_meta_address(to_integer(read_meta_rdptr)) else '0';
+   
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+      
+         writefifo_Rd          <= '0';
+         write_cdc_ack_meta_93 <= write_cdc_ack_1x;
+         write_cdc_ack_sync_93 <= write_cdc_ack_meta_93;
+         response_cdc_req_meta_93 <= response_cdc_req_1x;
+         response_cdc_req_sync_93 <= response_cdc_req_meta_93;
+         mem_finished_instr       <= '0';
+         mem_finished_read        <= '0';
+         
+         if (reset_93 = '1') then
+         
+            mem1_request_latched      <= '0';
+            datacache_request_latched <= '0';
+            writefifo_cnt             <= 0;
+            datacache_wb_fifo_wrptr   <= (others => '0');
+            datacache_wb_fifo_rdptr   <= (others => '0');
+            datacache_wb_fifo_count   <= 0;
+            writefifo_issue_pending <= '0';
+            writefifo_issue_wb      <= '0';
+            write_cdc_data_93         <= (others => '0');
+            write_cdc_req_93          <= '0';
+            write_cdc_busy_93         <= '0';
+            write_cdc_ack_meta_93     <= '0';
+            write_cdc_ack_sync_93     <= '0';
+            response_cdc_req_meta_93  <= '0';
+            response_cdc_req_sync_93  <= '0';
+            response_cdc_req_seen_93  <= '0';
+            response_cdc_pending_93   <= '0';
+            response_cdc_deliver_93   <= '0';
+             response_cdc_class_93     <= '0';
+             response_cdc_ack_93       <= '0';
+             mem_finished_dataRead     <= (others => '0');
+             mem_finished_dataRot      <= (others => '0');
+             read_meta_wrptr           <= (others => '0');
+             read_meta_rdptr           <= (others => '0');
+             read_meta_count           <= 0;
+             read_sequence_93          <= (others => '0');
+             debug_response_status_reg   <= (others => '0');
+
+          else
+
+             -- Record every accepted read independently of the request CDC.
+             -- A depth of 16 covers the seven-entry transaction FIFO plus
+             -- both CDC mailboxes and the active memory transaction.
+             if (read_meta_push = '1') then
+                if (read_meta_count < 16 or read_meta_pop = '1') then
+                   read_meta_tag(to_integer(read_meta_wrptr)) <=
+                      writefifo_Din(115 downto 108);
+                   read_meta_class(to_integer(read_meta_wrptr)) <=
+                      writefifo_Din(104);
+                   read_meta_address(to_integer(read_meta_wrptr)) <=
+                      writefifo_Din(95 downto 64);
+                   read_meta_wrptr <= read_meta_wrptr + 1;
+                elsif (debug_response_status_reg(31) = '0') then
+                   debug_response_status_reg <=
+                      '1' & '0' & '1' & "000" &
+                      '0' & '0' & x"00" & writefifo_Din(115 downto 108) &
+                      "10000" & "000";
+                end if;
+                read_sequence_93 <= read_sequence_93 + 1;
+             end if;
+
+             if (read_meta_pop = '1') then
+                if (read_meta_count > 0) then
+                   read_meta_rdptr <= read_meta_rdptr + 1;
+                   if (debug_response_status_reg(31) = '0' and
+                       (read_meta_tag_mismatch = '1' or
+                        read_meta_class_mismatch = '1' or
+                        read_meta_address_mismatch = '1')) then
+                      debug_response_status_reg <=
+                         '1' & '0' & '0' &
+                         read_meta_address_mismatch &
+                         read_meta_class_mismatch &
+                         read_meta_tag_mismatch &
+                         read_meta_class(to_integer(read_meta_rdptr)) &
+                         response_cdc_data_1x(64) &
+                         read_meta_tag(to_integer(read_meta_rdptr)) &
+                         response_cdc_data_1x(72 downto 65) &
+                         std_logic_vector(to_unsigned(read_meta_count, 5)) &
+                         "000";
+                   end if;
+                elsif (debug_response_status_reg(31) = '0') then
+                   debug_response_status_reg <=
+                      '1' & '1' & '0' & "000" &
+                      '0' & response_cdc_data_1x(64) &
+                      x"00" & response_cdc_data_1x(72 downto 65) &
+                      "00000" & "000";
+                end if;
+             end if;
+
+             if (read_meta_push = '1' and read_meta_pop = '0' and
+                 read_meta_count < 16) then
+                read_meta_count <= read_meta_count + 1;
+             elsif (read_meta_push = '0' and read_meta_pop = '1' and
+                    read_meta_count > 0) then
+                read_meta_count <= read_meta_count - 1;
+             end if;
+         
+            if (write_cdc_busy_93 = '1') then
+               if (write_cdc_ack_sync_93 = write_cdc_req_93) then
+                  write_cdc_busy_93 <= '0';
+               end if;
+            elsif (writefifo_Empty = '0') then
+               write_cdc_data_93 <= writefifo_Dout;
+               write_cdc_req_93  <= not write_cdc_req_93;
+               write_cdc_busy_93 <= '1';
+               writefifo_Rd <= '1';
+            end if;
+         
+            if (writefifo_wr_accept = '1' and writefifo_rd_accept = '0') then
+               writefifo_cnt <= writefifo_cnt + 1;
+            end if;
+            if (writefifo_rd_accept = '1' and writefifo_wr_accept = '0') then
+               writefifo_cnt <= writefifo_cnt - 1;
+            end if;
+
+            -- The data cache emits a dirty line as four consecutive beats
+            -- without a ready input. Capture the complete burst here before
+            -- allowing downstream FIFO pressure to affect the cache. This
+            -- queue is empty before a writeback starts and is exactly large
+            -- enough for one complete cache line.
+            if (datacache_wb_ena = '1' and
+                (datacache_wb_fifo_count < 4 or
+                 datacache_wb_fifo_pop = '1')) then
+               datacache_wb_fifo(to_integer(datacache_wb_fifo_wrptr)) <=
+                  std_logic_vector(datacache_wb_addr) & datacache_wb_data;
+               datacache_wb_fifo_wrptr <= datacache_wb_fifo_wrptr + 1;
+            end if;
+
+            if (datacache_wb_fifo_pop = '1') then
+               datacache_wb_fifo_rdptr <= datacache_wb_fifo_rdptr + 1;
+            end if;
+
+            if (datacache_wb_ena = '1' and datacache_wb_fifo_pop = '0') then
+               if (datacache_wb_fifo_count < 4) then
+                  datacache_wb_fifo_count <= datacache_wb_fifo_count + 1;
+               end if;
+            elsif (datacache_wb_ena = '0' and datacache_wb_fifo_pop = '1') then
+               datacache_wb_fifo_count <= datacache_wb_fifo_count - 1;
+            end if;
+            
+            -- Cache refill requests are one-cycle pulses. Preserve them when
+            -- a higher-priority stage-4 transaction owns this FIFO cycle.
+            if (datacache_request = '1' and
+                (datacache_wb_busy = '1' or
+                 datacache_request_latched = '1' or
+                 mem1_request_latched = '1' or
+                 mem4_request = '1' or
+                 writefifo_schedule_ready = '0')) then
+               datacache_request_latched <= '1';
+               datacache_address_latched <=
+                  datacache_reqAddr(31 downto 5) & "00000";
+            end if;
+
+            if (datacache_wb_busy = '1' or
+                datacache_request_latched = '1' or
+                mem1_request_latched = '1' or
+                mem4_request = '1' or
+                datacache_request = '1' or
+                writefifo_schedule_ready = '0') then
+               if (mem1_request = '1' or instrcache_request = '1') then
+                  mem1_request_latched <= '1';
+                  mem1_cache_latched   <= instrcache_request;
+                  if (instrcache_request = '1') then
+                     mem1_address_latched <=
+                        "000" & mem1_address(28 downto 5) & "00000";
+                  else
+                     mem1_address_latched <=
+                        "000" & mem1_address(28 downto 0);
+                  end if;
+               end if;            
+            end if;
+
+            -- A retained request is already backpressuring stage 4, so it must
+            -- run before the request that is being held by that backpressure.
+            if (writefifo_issue_pending = '1') then
+               if (writefifo_wr_accept = '1') then
+                  writefifo_issue_pending <= '0';
+                  writefifo_issue_wb      <= '0';
+               end if;
+            elsif (datacache_wb_fifo_count > 0) then
+               if (writefifo_schedule_ready = '1') then
+                  writefifo_issue_pending      <= '1';
+                  writefifo_issue_wb           <= '1';
+                  writefifo_Din( 63 downto  0) <=
+                     datacache_wb_fifo(to_integer(datacache_wb_fifo_rdptr))(63 downto 0);
+                  writefifo_Din( 95 downto 64) <=
+                     datacache_wb_fifo(to_integer(datacache_wb_fifo_rdptr))(95 downto 64);
+                  writefifo_Din(103 downto 96) <= x"FF";
+                  writefifo_Din(104)           <= '1';
+                   writefifo_Din(105)           <= '0';
+                   writefifo_Din(106)           <= '1';
+                   writefifo_Din(107)           <= '0';
+                   writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
+               end if;
+            elsif (datacache_wb_ena = '1') then
+               -- Reserve this scheduler cycle while the first unacknowledged
+               -- writeback beat is captured into the staging queue.
+               null;
+             elsif (datacache_request_latched = '1') then
+                if (writefifo_schedule_ready = '1') then
+                   writefifo_issue_pending      <= '1';
+                   writefifo_issue_wb           <= '0';
+                   writefifo_Din( 95 downto 64) <= std_logic_vector(datacache_address_latched);
+                  writefifo_Din(104)           <= '1';
+                  writefifo_Din(105)           <= '1';
+                  writefifo_Din(106)           <= '1';
+                  writefifo_Din(107)           <= '1';
+                  writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
+
+                  -- A cache cannot normally issue a second miss while its
+                  -- first is outstanding, but retaining a simultaneous pulse
+                  -- here makes that interface lossless as well.
+                  if (datacache_request = '1') then
+                     datacache_request_latched <= '1';
+                     datacache_address_latched <=
+                        datacache_reqAddr(31 downto 5) & "00000";
+                  else
+                     datacache_request_latched <= '0';
+                  end if;
+               end if;
+             elsif (mem1_request_latched = '1') then
+                if (writefifo_schedule_ready = '1') then
+                   writefifo_issue_pending      <= '1';
+                   writefifo_issue_wb           <= '0';
+                   writefifo_Din( 95 downto 64) <= std_logic_vector(mem1_address_latched);
+                  writefifo_Din(104)           <= '0';
+                  writefifo_Din(105)           <= '1';
+                  writefifo_Din(106)           <= mem1_cache_latched;
+                  writefifo_Din(107)           <= mem1_cache_latched;
+                  writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
+
+                  if (mem1_request = '1' or instrcache_request = '1') then
+                     mem1_request_latched <= '1';
+                     mem1_cache_latched   <= instrcache_request;
+                     if (instrcache_request = '1') then
+                        mem1_address_latched <=
+                           "000" & mem1_address(28 downto 5) & "00000";
+                     else
+                        mem1_address_latched <=
+                           "000" & mem1_address(28 downto 0);
+                     end if;
+                  else
+                     mem1_request_latched <= '0';
+                  end if;
+               end if;
+             elsif (mem4_request = '1' and mem4_rnw = '0' and
+                    writefifo_mem4_ready = '1') then
+                writefifo_issue_pending      <= '1';
+                writefifo_issue_wb           <= '0';
+               writefifo_Din( 63 downto  0) <= mem4_dataWrite;
+               writefifo_Din( 95 downto 64) <= std_logic_vector(mem4_address);
+               writefifo_Din(103 downto 96) <= mem4_writeMask;
+               writefifo_Din(104)           <= '1';
+                writefifo_Din(105)           <= '0';
+                writefifo_Din(106)           <= mem4_req64;
+                writefifo_Din(107)           <= '0';
+                writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
+             elsif (mem4_request = '1' and writefifo_mem4_ready = '1') then
+                writefifo_issue_pending      <= '1';
+                writefifo_issue_wb           <= '0';
+                writefifo_Din( 95 downto 64) <= std_logic_vector(mem4_address);
+               writefifo_Din(104)           <= '1';
+               writefifo_Din(105)           <= '1';
+               writefifo_Din(106)           <= mem4_req64;
+               writefifo_Din(107)           <= '0';
+               writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
+             elsif (datacache_request = '1' and
+                    writefifo_schedule_ready = '1') then
+                writefifo_issue_pending      <= '1';
+                writefifo_issue_wb           <= '0';
+                writefifo_Din( 95 downto 64) <=
+                  std_logic_vector(datacache_reqAddr(31 downto 5)) & "00000";
+               writefifo_Din(104)           <= '1';
+               writefifo_Din(105)           <= '1';
+               writefifo_Din(106)           <= '1';
+               writefifo_Din(107)           <= '1';
+               writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
+             elsif ((mem1_request = '1' or instrcache_request = '1') and
+                    writefifo_schedule_ready = '1') then
+                writefifo_issue_pending      <= '1';
+                writefifo_issue_wb           <= '0';
+                writefifo_Din( 95 downto 64) <=
+                  "000" & std_logic_vector(mem1_address(28 downto 0));
+               writefifo_Din(104)           <= '0';
+               writefifo_Din(105)           <= '1';
+               writefifo_Din(106)           <= instrcache_request;
+               writefifo_Din(107)           <= instrcache_request;
+               writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
+               if (instrcache_request = '1') then
+                  writefifo_Din( 95 downto 64) <=
+                     "000" & std_logic_vector(mem1_address(28 downto 5)) & "00000";
+               end if;
+            end if;
+            
+            -- The memory-domain source holds this mailbox payload until the
+            -- acknowledgement returns. Capture the raw word first, register
+            -- the load-aligned copy on the next cycle, and only then pulse the
+            -- appropriate completion. This keeps completion, transaction type
+            -- and data atomic across the clk1x-to-clk93 boundary.
+            if (response_cdc_deliver_93 = '1') then
+               if (response_cdc_class_93 = '1') then
+                  mem_finished_read <= '1';
+               else
+                  mem_finished_instr <= '1';
+               end if;
+               response_cdc_ack_93     <= response_cdc_req_seen_93;
+               response_cdc_deliver_93 <= '0';
+            elsif (response_cdc_pending_93 = '1') then
+               mem_finished_dataRot    <= std_logic_vector(read4_uncachedData);
+               response_cdc_pending_93 <= '0';
+               response_cdc_deliver_93 <= '1';
+            elsif (response_cdc_req_sync_93 /= response_cdc_req_seen_93) then
+               mem_finished_dataRead    <= response_cdc_data_1x(63 downto 0);
+               response_cdc_class_93    <= response_cdc_data_1x(64);
+               response_cdc_req_seen_93 <= response_cdc_req_sync_93;
+               response_cdc_pending_93  <= '1';
+            end if;
+            
+         end if;
+      end if;
+   end process;
+   
+   iSyncFifo: entity mem.SyncFifoFallThroughMLAB
+   generic map
+   (
+      SIZE              => 8,
+      DATAWIDTH         => 116, -- existing 108-bit transaction plus 8-bit read sequence tag
+      NEARFULLDISTANCE  => 4
+   )
+   port map
+   ( 
+      clk       => clk93,
+      reset     => reset_93,  
+      Din       => writefifo_Din,     
+      Wr        => writefifo_wr,      
+      Full      => writefifo_Full,
+      Dout      => writefifo_Dout,    
+      Rd        => writefifo_Rd,      
+      Empty     => writefifo_Empty
+   );
+
+   -- Keep the established full indication and make the first ownership
+   -- failure sticky through the existing protocol-error output.
+   error_fifo <= writefifo_Full or debug_response_status_reg(31);
+
+   -- Pending is the producer-valid bit. The payload is loaded once and held
+   -- unchanged until the FIFO acknowledges it.
+   writefifo_wr <= writefifo_issue_pending;
+
+   writefifo_rd_accept <= writefifo_Rd and not writefifo_Empty;
+   writefifo_wr_accept <= writefifo_wr and
+                          (not writefifo_Full or writefifo_rd_accept);
+   writefifo_schedule_ready <= '1' when
+      (writefifo_issue_pending = '0' and
+       (writefifo_Full = '0' or writefifo_rd_accept = '1')) else '0';
+
+   datacache_wb_fifo_pop <= writefifo_wr_accept and
+                            writefifo_issue_pending and
+                            writefifo_issue_wb;
+   datacache_wb_busy <= '1' when
+      (datacache_wb_fifo_count > 0 or
+       (writefifo_issue_pending = '1' and writefifo_issue_wb = '1') or
+       datacache_wb_ena = '1') else '0';
+
+   -- synthesis translate_off
+   assert not (datacache_wb_ena = '1' and
+               datacache_wb_fifo_count = 4 and
+               datacache_wb_fifo_pop = '0')
+      report "datacache writeback staging overflow"
+      severity failure;
+
+   process(clk93)
+      variable held_valid : boolean := false;
+      variable held_data  : std_logic_vector(115 downto 0) := (others => '0');
+   begin
+      if rising_edge(clk93) then
+         if reset_93 = '1' then
+            held_valid := false;
+         elsif writefifo_issue_pending = '1' and
+               writefifo_wr_accept = '0' then
+            if held_valid then
+               assert writefifo_Din = held_data
+                  report "write FIFO request changed while backpressured"
+                  severity failure;
+            end if;
+            held_data := writefifo_Din;
+            held_valid := true;
+         else
+            held_valid := false;
+         end if;
+      end if;
+   end process;
+   -- synthesis translate_on
+   
+    writefifo_block <= '1' when
+      (writefifo_issue_pending = '1' or
+       writefifo_cnt >= 4 or
+       (writefifo_cnt = 3 and writefifo_wr = '1') or
+       datacache_wb_busy = '1' or
+       datacache_request_latched = '1' or
+       mem1_request_latched = '1') else '0';
+
+   -- Stage 4 uses a real ready/valid handshake. Higher-priority writebacks
+   -- and retained refills must finish before its request may enter the FIFO.
+   writefifo_mem4_ready <= '1' when
+      (writefifo_block = '0' and datacache_wb_busy = '0' and
+       datacache_request_latched = '0' and
+       mem1_request_latched = '0' and
+       writefifo_schedule_ready = '1') else '0';
+   
+   process (clk1x)
+   begin
+      if (rising_edge(clk1x)) then
+      
+         write_cdc_req_meta_1x <= write_cdc_req_93;
+         write_cdc_req_sync_1x <= write_cdc_req_meta_1x;
+         response_cdc_ack_meta_1x <= response_cdc_ack_93;
+         response_cdc_ack_sync_1x <= response_cdc_ack_meta_1x;
+         mem_request           <= '0';
+      
+         if (reset_1x = '1') then
+         
+            memoryMuxStage4       <= '0'; 
+            memstate              <= MEMSTATE_IDLE;
+            write_cdc_req_meta_1x <= '0';
+            write_cdc_req_sync_1x <= '0';
+            write_cdc_req_seen_1x <= '0';
+            write_cdc_ack_1x      <= '0';
+            response_cdc_data_1x     <= (others => '0');
+            response_cdc_req_1x      <= '0';
+             response_cdc_busy_1x     <= '0';
+             response_cdc_ack_meta_1x <= '0';
+             response_cdc_ack_sync_1x <= '0';
+             memory_read_tag_1x       <= (others => '0');
+             memory_read_address_1x   <= (others => '0');
+         
+         else
+
+            if (response_cdc_busy_1x = '1' and
+                response_cdc_ack_sync_1x = response_cdc_req_1x) then
+               response_cdc_busy_1x <= '0';
+            end if;
+
+            case (memstate) is
+               when MEMSTATE_IDLE => 
+
+                  if (ce_1x = '1' and response_cdc_busy_1x = '0') then
+                  
+                     if (write_cdc_req_sync_1x /= write_cdc_req_seen_1x) then
+
+                        write_cdc_req_seen_1x <= write_cdc_req_sync_1x;
+                        write_cdc_ack_1x      <= write_cdc_req_sync_1x;
+                        memstate          <= MEMSTATE_BUSY;
+                        mem_request       <= '1';
+                        memoryMuxStage4   <= '1';
+                        mem_dataWrite     <= write_cdc_data_93(63 downto 0);
+                        mem_address       <= unsigned(write_cdc_data_93(95 downto 64));
+                        mem_writeMask     <= write_cdc_data_93(103 downto 96);
+                        memoryMuxStage4   <= write_cdc_data_93(104);
+                        mem_rnw           <= write_cdc_data_93(105);
+                        mem_req64         <= write_cdc_data_93(106);
+                        memory_read_tag_1x <= write_cdc_data_93(115 downto 108);
+                        memory_read_address_1x <= write_cdc_data_93(95 downto 64);
+                        
+                        mem_size          <= "001";
+                        
+                        if (write_cdc_data_93(104) = '1' and write_cdc_data_93(107) = '1') then
+                           -- The KI data cache fills a 32-byte line as four
+                           -- 64-bit DDR words (see cpu_datacache.vhd).
+                           mem_size          <= "100";
+                           datacache_active  <= '1';
+                        end if;
+                        
+                        if (write_cdc_data_93(104) = '0' and write_cdc_data_93(107) = '1') then
+                           mem_size          <= "100";
+                           instrcache_active  <= '1';
+                        end if;
+
+                     end if;
+
+                  end if;
+                  
+               when MEMSTATE_BUSY =>
+                  -- The FILL DATA the instruction cache is handed for that
+                  -- line - the last link before the opcode reaches decode.
+                  -- Captured in clk1x, the domain the bridge returns beats in
+                  -- (cpu_instrcache's fill path was rewritten to consume them
+                  -- here), so the first beat is unambiguous. Sampling a clk1x
+                  -- ready pulse from clk93 would land on beat 0 or beat 1
+                  -- depending on phase, and a probe that reports a different
+                  -- word run to run is worse than none.
+                  --
+                  if (mem_done = '1') then
+                      if (mem_rnw = '1') then
+                         response_cdc_data_1x <=
+                            memory_read_address_1x & memory_read_tag_1x &
+                            memoryMuxStage4 & mem_dataRead;
+                        response_cdc_req_1x  <= not response_cdc_req_1x;
+                        response_cdc_busy_1x <= '1';
+                     end if;
+                     memstate          <= MEMSTATE_IDLE;
+                     if (memoryMuxStage4 = '1') then
+                        datacache_active <= '0';
+                     else
+                        instrcache_active <= '0';
+                     end if;
+                  end if;               
+                  
+            end case;
+            
+         end if;
+      end if;
+   end process;
+   
+--##############################################################
+--############################### FPU register file
+--##############################################################
+   iregisterfileFPU1LO : entity mem.RamMLAB
+	GENERIC MAP 
+   (
+      width                               => 32,
+      widthad                             => 5
+	)
+	PORT MAP (
+      inclock    => clk93,
+      wren       => FPUregs_wren_a(0),
+      data       => FPUregs_data_a(31 downto 0),
+      wraddress  => FPUregs_address_a,
+      rdaddress  => FPUregs1_address_b,
+      q          => FPUregs1_q_b(31 downto 0)
+	);
+   iregisterfileFPU1HI : entity mem.RamMLAB
+	GENERIC MAP 
+   (
+      width                               => 32,
+      widthad                             => 5
+	)
+	PORT MAP (
+      inclock    => clk93,
+      wren       => FPUregs_wren_a(1),
+      data       => FPUregs_data_a(63 downto 32),
+      wraddress  => FPUregs_address_a,
+      rdaddress  => FPUregs1_address_b,
+      q          => FPUregs1_q_b(63 downto 32)
+	);
+   
+   FPUregs_wren_a    <= "11" when (ss_fpuregs_load = '1') else
+                        cop1_stage4_writeMask when (ce_93 = '1' and cop1_stage4_writeEnable = '1') else 
+                        FPUWriteMask          when (ce_93 = '1' and FPUWriteEnable = '1') else 
+                        "00";
+   
+   FPUregs_data_a    <= ss_FPUregs_data                    when (ss_FPUregs_load = '1') else 
+                        std_logic_vector(cop1_stage4_data) when (cop1_stage4_writeEnable = '1') else
+                        std_logic_vector(FPUWriteData);
+                     
+   FPUregs_address_a <= std_logic_vector(ss_FPUregs_addr)    when (ss_FPUregs_load = '1') else 
+                        std_logic_vector(cop1_stage4_target) when (cop1_stage4_writeEnable = '1') else
+                        std_logic_vector(FPUWriteTarget);
+   
+   FPUregs1_address_b <= std_logic_vector(decFPUSource1);
+   FPUregs2_address_b <= std_logic_vector(decFPUSource2);
+   
+   iregisterfileFPU2LO : entity mem.RamMLAB
+	GENERIC MAP 
+   (
+      width                               => 32,
+      widthad                             => 5
+	)
+	PORT MAP (
+      inclock    => clk93,
+      wren       => FPUregs_wren_a(0),
+      data       => FPUregs_data_a(31 downto 0),
+      wraddress  => FPUregs_address_a,
+      rdaddress  => FPUregs2_address_b,
+      q          => FPUregs2_q_b(31 downto 0)
+	);
+   iregisterfileFPU2HI : entity mem.RamMLAB
+	GENERIC MAP 
+   (
+      width                               => 32,
+      widthad                             => 5
+	)
+	PORT MAP (
+      inclock    => clk93,
+      wren       => FPUregs_wren_a(1),
+      data       => FPUregs_data_a(63 downto 32),
+      wraddress  => FPUregs_address_a,
+      rdaddress  => FPUregs2_address_b,
+      q          => FPUregs2_q_b(63 downto 32)
+	);
+   
+--##############################################################
+--############################### register file
+--##############################################################
+   iregisterfile1 : entity mem.RamMLAB
+	GENERIC MAP 
+   (
+      width                               => 64,
+      widthad                             => 5
+	)
+	PORT MAP (
+      inclock    => clk93,
+      wren       => regs_wren_a,
+      data       => regs_data_a,
+      wraddress  => regs_address_a,
+      rdaddress  => regs1_address_b,
+      q          => regs1_q_b
+	);
+   
+   regs_wren_a    <= '1' when (ss_regs_load = '1') else
+                     '1' when (ce_93 = '1' and writebackWriteEnable = '1') else 
+                     '0';
+   
+   regs_data_a    <= ss_regs_data when (ss_regs_load = '1') else 
+                     std_logic_vector(writebackData);
+                     
+   regs_address_a <= std_logic_vector(ss_regs_addr) when (ss_regs_load = '1') else 
+                     std_logic_vector(writebackTarget);
+   
+   regs1_address_b <= std_logic_vector(decSource1);
+   regs2_address_b <= std_logic_vector(decSource2);
+   
+   iregisterfile2 : entity mem.RamMLAB
+	GENERIC MAP 
+   (
+      width                               => 64,
+      widthad                             => 5
+	)
+	PORT MAP (
+      inclock    => clk93,
+      wren       => regs_wren_a,
+      data       => regs_data_a,
+      wraddress  => regs_address_a,
+      rdaddress  => regs2_address_b,
+      q          => regs2_q_b
+	);
+   
+   --iregisterfileSS : entity mem.RamMLAB
+	--GENERIC MAP 
+   --(
+   --   width                               => 64,
+   --   widthad                             => 5
+	--)
+	--PORT MAP (
+   --   inclock    => clk93,
+   --   wren       => regs_wren_a,
+   --   data       => regs_data_a,
+   --   wraddress  => regs_address_a,
+   --   rdaddress  => regsSS_address_b,
+   --   q          => regsSS_q_b
+	--);
+
+--##############################################################
+--############################### stage 1
+--##############################################################
+   
+   cache_commandEnableI <= executeICacheEnable when (stall = 0) else '0';
+   
+   icpu_instrcache : entity work.cpu_instrcache
+   generic map
+   (
+      LITTLE_ENDIAN => LITTLE_ENDIAN
+   )
+   port map
+   (
+      clk1x             => clk1x,
+      clk93             => clk93,
+      clk2x             => clk2x,
+      reset_1x          => reset_1x,
+      reset_93          => reset_93,
+      ce_93             => ce_93,
+      
+      ram_request       => instrcache_request,
+      ram_active        => instrcache_active,
+      ram_grant         => rdram_granted2X,
+      ram_done          => mem_finished_instr,
+      ddr3_DOUT         => ddr3_DOUT,      
+      ddr3_DOUT_READY   => ddr3_DOUT_READY,
+      
+      read_select       => FetchAddrSelect,
+      read_addr1        => FetchAddr1(31 downto 0),
+      read_addr2        => FetchAddr2(31 downto 0),
+      read_addrCompare1 => FetchAddrTLBMuxed1,
+      read_addrCompare2 => FetchAddrTLBMuxed2,
+      read_hit          => instrcache_hit,
+      read_data         => instrcache_data,
+      
+      fill_request      => instrcache_fill,
+      fill_addrData     => mem1_address(31 downto 0),
+      fill_addrTag      => fill_addrTag,
+      fill_done         => instrcache_fill_done,
+      
+      CacheCommandEna   => cache_commandEnableI,
+      CacheCommand      => executeCacheCommand,
+      CacheCommandAddr  => executeMemAddress,
+      
+      TagLo_Valid       => TagLo_Valid,
+      TagLo_Addr        => TagLo_Addr,
+                            
+      SS_reset          => SS_reset
+   );
+   
+   fetchCache1 <= '0' when (INSTRCACHEON = '0') else
+                  TLB_instrUseCache when (TLB_instrMapped1 = '1') else
+                  '1' when (FetchAddr1(31 downto 29) = "100") else  -- todo: only in kernelmode and only in 32bit mode
+                  '0';
+
+   fetchCache2 <= '0' when (INSTRCACHEON = '0') else
+                  TLB_instrUseCache when (TLB_instrMapped2 = '1') else
+                  '1' when (FetchAddr2(31 downto 29) = "100") else  -- todo: only in kernelmode and only in 32bit mode
+                  '0';
+
+   fetchCache <= fetchCache2 when (FetchAddrSelect = '1') else fetchCache1;
+   
+   FetchAddr <= FetchAddr2 when (FetchAddrSelect = '1') else FetchAddr1;
+   
+   FetchAddrTLBMuxed1 <= TLB_instrAddrOutFound when (TLB_instrMapped1 = '1') else FetchAddr1(31 downto 0);
+   FetchAddrTLBMuxed2 <= TLB_instrAddrOutFound when (TLB_instrMapped2 = '1') else FetchAddr2(31 downto 0);
+
+   -- running from 64 bit sections currently not fully supported to not screw up FPGA route timing
+   -- kusegUnmapped is Status.ERL: while it is set, region < 4 is unmapped and the
+   -- TLB must not be consulted for it. See the note in cpu_cop0.vhd.
+   TLB_instrMapped1 <= '0' when INSTR_KSEG_ONLY else
+                       '1' when (region64 = '1' and FetchAddr1(63 downto 60) < 8 and kusegUnmapped = '0') else
+                       '1' when (region64 = '0' and privilegeMode = "00" and ((FetchAddr1(31 downto 29) < 4 and kusegUnmapped = '0') or FetchAddr1(31 downto 29) = 6 or FetchAddr1(31 downto 29) = 7)) else
+                       '1' when (region64 = '0' and privilegeMode = "01" and ((FetchAddr1(31 downto 29) < 4 and kusegUnmapped = '0') or FetchAddr1(31 downto 29) = 6)) else
+                       '1' when (region64 = '0' and privilegeMode = "10" and (FetchAddr1(31 downto 29) < 4 and kusegUnmapped = '0')) else
+                       '0';
+
+   TLB_instrMapped2 <= '0' when INSTR_KSEG_ONLY else
+                       '1' when (region64 = '1' and FetchAddr2(63 downto 60) < 8 and kusegUnmapped = '0') else
+                       '1' when (region64 = '0' and privilegeMode = "00" and ((FetchAddr2(31 downto 29) < 4 and kusegUnmapped = '0') or FetchAddr2(31 downto 29) = 6 or FetchAddr2(31 downto 29) = 7)) else
+                       '1' when (region64 = '0' and privilegeMode = "01" and ((FetchAddr2(31 downto 29) < 4 and kusegUnmapped = '0') or FetchAddr2(31 downto 29) = 6)) else
+                       '1' when (region64 = '0' and privilegeMode = "10" and (FetchAddr2(31 downto 29) < 4 and kusegUnmapped = '0')) else
+                       '0';
+
+   TLB_instrMapped <= TLB_instrMapped2 when (FetchAddrSelect = '1') else TLB_instrMapped1;
+                      
+   TLB_instrReq <= '1' when (TLB_instrMapped = '1' and (stall = 0 or TLB_ss_load = '1')) else '0';
+   
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+      
+         instrcache_fill <= '0';
+         mem1_request    <= '0';
+         TLB_ss_load     <= '0';
+         
+         if (reset_93 = '1') then
+
+            PCold0         <= (others => '0');
+            mem1_request   <= not TLB_instrMapped;
+            TLB_ss_load    <= TLB_instrMapped;
+            if (ss_in(16)(3) = '1') then
+               mem1_address   <= unsigned(ss_in(5)(31 downto 0)); -- last was branch -> should be patched in the savestate already
+               fill_addrTag   <= unsigned(ss_in(5)(31 downto 0));
+               PC             <= unsigned(ss_in(5)); 
+            else
+               mem1_address   <= unsigned(ss_in(0)(31 downto 0)); -- x"FFFFFFFFBFC00000";    
+               fill_addrTag   <= unsigned(ss_in(0)(31 downto 0));
+               PC             <= unsigned(ss_in(0)); -- x"FFFFFFFFBFC00000";                    
+            end if;
+            stall1         <= '1';
+            fetchReady     <= '1';
+            useCached_data <= '0';
+            opcode0        <= (others => '0'); --unsigned(ss_in(14));
+         
+         elsif (ce_93 = '1') then
+
+            if (stall = 0) then
+               fetchReady <= '0';
+            end if;
+            
+            if (INSTRCACHEON = '1') then
+               cacheHitLast <= instrcache_hit;
+            else
+               cacheHitLast <= '0';
+            end if;
+            if (useCached_data = '1' and cacheHitLast = '1' and stall(4 downto 1) > 0 and stall1 = '0') then
+               useCached_data <= '0';
+               opcode0        <= unsigned(instrcache_data);
+            end if;
+         
+            if (stall1 = '1') then
+            
+               if (instrcache_fill_done = '1' and useCached_data = '1') then
+                  useCached_data <= '0';
+                  stall1         <= '0';
+                  opcode0        <= unsigned(instrcache_data);
+               elsif (mem_finished_instr = '1' and useCached_data = '0') then
+                  stall1         <= '0';
+                  opcode0        <= bus_to_cpu32(mem_finished_dataRead(31 downto 0));
+               end if;
+               
+               if (TLB_instrUnStall = '1') then
+                  if (exceptionStage1 = '1') then
+                     stall1         <= '0';
+                     opcode0        <= (others => '0');
+                     useCached_data <= '0';
+                  else
+                     mem1_address    <= TLB_instrAddrOutLookup;
+                     useCached_data  <= TLB_instrUseCache and INSTRCACHEON;
+                     if (TLB_instrUseCache = '1' and INSTRCACHEON = '1') then
+                        instrcache_fill <= '1';
+                     else
+                        mem1_request    <= '1';
+                     end if;
+                  end if;
+               end if;
+            
+            elsif (stall = 0 or fetchReady = '0') then
+            
+               PCold0             <= FetchAddr;
+               PC                 <= FetchAddr;
+               -- Tag the address with the mux arm that produced it, in the
+               -- same statement that latches it, so the pair cannot drift.
+               src0               <= fetch_src;
+               useCached_data     <= fetchCache;
+               fetchReady         <= '1';
+               
+               if (TLB_instrMapped = '1') then
+                  mem1_address <= TLB_instrAddrOutFound;
+                  fill_addrTag <= FetchAddr(31 downto 0);
+               else
+                  mem1_address <= FetchAddr(31 downto 0);
+                  fill_addrTag <= FetchAddr(31 downto 0);
+               end if;
+      
+               if (TLB_instrStall = '1') then
+                  stall1          <= '1'; 
+               elsif (fetchCache = '1') then
+                  if (instrcache_hit = '0') then
+                     instrcache_fill    <= '1';
+                     stall1             <= '1';
+                  end if;
+               else
+                  mem1_request    <= '1';
+                  stall1          <= '1';     
+               end  if;  
+               
+            end if;
+              
+         end if;
+      end if;
+     
+   end process;
+   
+   
+--##############################################################
+--############################### stage 2
+--##############################################################
+   
+   opcodeCacheMuxed <= unsigned(instrcache_data) when (useCached_data = '1') else 
+                       opcode0;     
+                       
+   decImmData    <= opcodeCacheMuxed(15 downto 0);
+   decJumpTarget <= opcodeCacheMuxed(25 downto 0);
+   decSource1    <= opcodeCacheMuxed(25 downto 21);
+   decSource2    <= opcodeCacheMuxed(20 downto 16);
+   decOP         <= opcodeCacheMuxed(31 downto 26);
+   decFunct      <= opcodeCacheMuxed(5 downto 0);
+   decShamt      <= opcodeCacheMuxed(10 downto 6);
+   decRD         <= opcodeCacheMuxed(15 downto 11);
+   decTarget     <= opcodeCacheMuxed(20 downto 16) when (opcodeCacheMuxed(31 downto 26) > 0) else opcodeCacheMuxed(15 downto 11);                  
+
+   process (opcodeCacheMuxed, fpuRegMode, decOP)
+   begin
+      decFPUSource1 <= opcodeCacheMuxed(15 downto 11);
+      decFPUSource2 <= opcodeCacheMuxed(20 downto 16);
+   
+      if (fpuRegMode = '0') then
+         decFPUSource1(0) <= '0';
+         if (decOP = 16#39# or decOP = 16#3D#) then -- SWC1 and SDC1
+            decFPUSource2(0) <= '0';
+         end if;
+      end if;
+  
+   end process;
+   
+   decRequiresFPUreg1 <= '1' when (decOP = 16#11# and (decSource1(4) = '1' or decSource1(3 downto 1) = 0)) else 
+                         '0';
+                         
+   -- can be optimized to only request opcodes that really need 2 ops
+   decRequiresFPUreg2 <= '1' when (decOP = 16#11# and (decSource1(4) = '1' or decSource1(3 downto 1) = 0)) else 
+                         '1' when (decOP = 16#39# or decOP = 16#3D#) else
+                         '0';
+   
+   decFPUForwardUse <= (decodeFPUCommandEnable or decodeFPUTransferEnable) when (decRequiresFPUreg1 = '1' and decodeFPUTarget(4 downto 1) = decFPUSource1(4 downto 1)) else
+                       (decodeFPUCommandEnable or decodeFPUTransferEnable) when (decRequiresFPUreg2 = '1' and decodeFPUTarget(4 downto 1) = decFPUSource2(4 downto 1)) else
+                       '0';
+
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+      
+         error_instr  <= '0';
+      
+         if (reset_93 = '1') then
+         
+            stall2           <= '0';
+            decodeNew        <= '0';
+            decodeNewPulse   <= '0';
+            src1             <= (others => '0');
+            -- Cleared for the same reason as pcOld0 in stage 1: a stale pc or
+            -- opcode surviving a reset is indistinguishable from a real decode
+            -- to anything watching this stage.
+            pcOld1           <= (others => '0');
+            opcode1          <= (others => '0');
+            decode_irq       <= '0';
+            decodeBranchType <= BRANCH_OFF;
+
+         elsif (ce_93 = '1') then
+
+            decodeNewPulse <= '0';
+
+            if (stall = 0) then
+
+               decodeNew <= '0';
+
+               if (exception = '1') then
+
+                  decode_irq <= '0';
+
+               elsif (fetchReady = '1') then
+
+                  decodeNew        <= '1';
+                  decodeNewPulse   <= '1';
+
+                  pcOld1           <= pcOld0;
+                  opcode1          <= opcodeCacheMuxed;
+                  src1             <= src0;
+
+                  decodeImmData    <= decImmData;   
+                  decodeJumpTarget <= decJumpTarget;
+                  decodeSource1    <= decSource1;
+                  decodeSource2    <= decSource2;
+                  decodeShamt      <= '0' & decShamt;     
+                  decodeRD         <= decRD;        
+                  decodeTarget     <= decTarget;    
+                  decodeFPUSource1 <= decFPUSource1;
+                  decodeFPUSource2 <= decFPUSource2;
+                  
+                  -- operand fetching
+                  decodeValue1     <= unsigned(regs1_q_b);
+                  if (decSource1 > 0 and writebackTarget = decSource1 and writebackWriteEnable = '1') then 
+                     decodeValue1 <= writebackData;
+                  end if;
+                  
+                  decodeValue2     <= unsigned(regs2_q_b);
+                  if (decSource2 > 0 and writebackTarget = decSource2 and writebackWriteEnable = '1') then 
+                     decodeValue2 <= writebackData;
+                  end if;
+                  
+                  executeForwardValue1 <= '0';
+                  executeForwardValue2 <= '0';
+                  if (decSource1 > 0 and decodeTarget = decSource1) then executeForwardValue1 <= '1'; end if;
+                  if (decSource2 > 0 and decodeTarget = decSource2) then executeForwardValue2 <= '1'; end if;
+
+                  -- FPU operand fetching
+                  decodeFPUValue1 <= unsigned(FPUregs1_q_b);
+                  decodeFPUValue2 <= unsigned(FPUregs2_q_b);
+                  decodeFPUTarget <= opcodeCacheMuxed(10 downto 6);
+                  
+                  if (unsigned(FPUregs_address_a) = decFPUSource1 and FPUregs_wren_a(1) = '1') then decodeFPUValue1(63 downto 32) <= unsigned(FPUregs_data_a(63 downto 32)); end if;
+                  if (unsigned(FPUregs_address_a) = decFPUSource1 and FPUregs_wren_a(0) = '1') then decodeFPUValue1(31 downto  0) <= unsigned(FPUregs_data_a(31 downto  0)); end if;
+                  if (unsigned(FPUregs_address_a) = decFPUSource2 and FPUregs_wren_a(1) = '1') then decodeFPUValue2(63 downto 32) <= unsigned(FPUregs_data_a(63 downto 32)); end if;
+                  if (unsigned(FPUregs_address_a) = decFPUSource2 and FPUregs_wren_a(0) = '1') then decodeFPUValue2(31 downto  0) <= unsigned(FPUregs_data_a(31 downto  0)); end if;
+
+                  decodeFPUForwardUse <= decFPUForwardUse;
+
+                  -- decoding default
+                  decodeResultWriteEnable <= '0';
+                  decodeUseImmidateValue2 <= '0';
+                  decodeShiftSigned       <= '0';
+                  decodeShift32           <= '0';
+                  decodeResult32          <= '0';
+                  decodeBranchType        <= BRANCH_OFF;
+                  decodeBranchLikely      <= '0';
+                  decodeFPUCommandEnable  <= '0';
+                  decodeFPUTransferEnable <= '0';
+                  decodeFPUMULS           <= '0';
+                  decodeFPUMULD           <= '0';
+                  blockIRQ                <= '0';
+                  decodeExcType           <= EXCTYPE_NONE;
+                  decodeExcCode           <= x"0";
+                  decodeExcCOP            <= "00";
+                  decodecalcMULT          <= '0';
+                  decodecalcMULTU         <= '0';
+                  decodecalcDMULT         <= '0';
+                  decodecalcDMULTU        <= '0';
+                  decodecalcDIV           <= '0';
+                  decodecalcDIVU          <= '0';
+                  decodecalcDDIV          <= '0';
+                  decodecalcDDIVU         <= '0';
+                  decodehiUpdate          <= '0';
+                  decodeloUpdate          <= '0';
+                  decodeMemWriteEnable    <= '0';
+                  decodeMemWriteLL        <= '0';
+                  decodeMemReadEnable     <= '0';
+                  decodeMem64Bit          <= '0';
+                  decodeCacheEnable       <= '0';
+                  decodeCacheTLBTranslate <= '0';
+                  decodeSetLL             <= '0';
+                  decodeResetLL           <= '0';
+                  decodeERET              <= '0';
+                  decodeCOP0ReadEnable    <= '0';
+                  decodeCOP0WriteEnable   <= '0';
+                  decodeCOP0Register      <= decRD;
+                  decodeCOP1ReadEnable    <= '0';
+                  decodeCOP2ReadEnable    <= '0';
+                  decodeCOP2WriteEnable   <= '0';
+                  decodeCOP64             <= '0';
+                  decodeTLBR              <= '0';
+                  decodeTLBWI             <= '0';
+                  decodeTLBWR             <= '0';
+                  decodeTLBP              <= '0';
+                  
+                  -- decoding opcode specific
+                  case (to_integer(decOP)) is
+         
+                     when 16#00# =>
+                        case (to_integer(decFunct)) is
+                        
+                           when 16#00# => -- SLL
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTLEFT;
+                              decodeShiftAmountType   <= "00";
+                              decodeResult32          <= '1';
+                              
+                           when 16#02# => -- SRL
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT;
+                              decodeShift32           <= '1';
+                              decodeShiftAmountType   <= "00";
+                              decodeResult32          <= '1';
+                           
+                           when 16#03# => -- SRA
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT; 
+                              decodeShiftSigned       <= '1';
+                              decodeShiftAmountType   <= "00";
+                              decodeResult32          <= '1';
+                              
+                           when 16#04# => -- SLLV
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTLEFT;
+                              decodeShiftAmountType   <= "01";
+                              decodeResult32          <= '1';
+                              
+                           when 16#06# => -- SRLV
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT;
+                              decodeShift32           <= '1';
+                              decodeShiftAmountType   <= "01";
+                              decodeResult32          <= '1';
+                           
+                           when 16#07# => -- SRAV
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT;
+                              decodeShiftSigned       <= '1';
+                              decodeShiftAmountType   <= "01";
+                              decodeResult32          <= '1';
+
+                           when 16#08# => -- JR
+                              decodeBranchType        <= BRANCH_ALWAYS_REG;
+                              decodeExcType           <= EXCTYPE_PC;
+                              decodeExcCode           <= x"4";
+                              
+                           when 16#09# => -- JALR
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_PC;
+                              decodeTarget            <= decRD;
+                              decodeBranchType        <= BRANCH_ALWAYS_REG;
+                              decodeExcType           <= EXCTYPE_PC;
+                              decodeExcCode           <= x"4";
+                              
+                           when 16#0C# => -- SYSCALL
+                              decodeExcType           <= EXCTYPE_DECODE;
+                              decodeExcCode           <= x"8";
+                     
+                           when 16#0D# => -- BREAK
+                              decodeExcType           <= EXCTYPE_DECODE;
+                              decodeExcCode           <= x"9";
+                              
+                           when 16#0F# => -- SYNC
+                              null;
+                              
+                           when 16#10# => -- MFHI
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_HI;
+                            
+                           when 16#11# => -- MTHI
+                              decodehiUpdate <= '1';
+                  
+                           when 16#12# => -- MFLO
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_LO;
+                              
+                           when 16#13# => -- MTLO
+                              decodeloUpdate <= '1';
+                              
+                           when 16#14# => -- DSLLV
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTLEFT;
+                              decodeShiftAmountType   <= "10";   
+                  
+                           when 16#16# => -- DSRLV
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT;
+                              decodeShiftAmountType   <= "10";   
+                              
+                           when 16#17# => -- DSRAV
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT;
+                              decodeShiftAmountType   <= "10";   
+                              decodeShiftSigned       <= '1';
+                              
+                           when 16#18# => -- MULT
+                              decodecalcMULT <= '1';
+                              
+                           when 16#19# => -- MULTU
+                              decodecalcMULTU <= '1';
+                              
+                           when 16#1A# => -- DIV
+                              decodecalcDIV <= '1';
+                              
+                           when 16#1B# => -- DIVU
+                              decodecalcDIVU <= '1';
+                              
+                           when 16#1C# => -- DMULT
+                              decodecalcDMULT <= '1';                
+                              
+                           when 16#1D# => -- DMULTU
+                              decodecalcDMULTU <= '1';                  
+                              
+                           when 16#1E# => -- DDIV
+                              decodecalcDDIV <= '1';             
+                              
+                           when 16#1F# => -- DDIVU
+                              decodecalcDDIVU <= '1';
+                              
+                           when 16#20# => -- ADD
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_ADD;
+                              decodeResult32          <= '1';
+                              decodeExcType           <= EXCTYPE_ADD;
+                              decodeExcCode           <= x"C";
+                  
+                           when 16#21# => -- ADDU
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_ADD;
+                              decodeResult32          <= '1';
+                              
+                           when 16#22# => -- SUB
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SUB;
+                              decodeResult32          <= '1';
+                              decodeExcType           <= EXCTYPE_SUB;
+                              decodeExcCode           <= x"C";
+                           
+                           when 16#23# => -- SUBU
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SUB;
+                              decodeResult32          <= '1';
+                           
+                           when 16#24# => -- AND
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_AND;
+                           
+                           when 16#25# => -- OR
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_OR;
+                              
+                           when 16#26# => -- XOR
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_XOR;
+                              
+                           when 16#27# => -- NOR
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_NOR;
+                              
+                           when 16#2A# => -- SLT
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_BIT;
+                              decodeBitFuncType       <= BITFUNC_SIGNED;
+                           
+                           when 16#2B# => -- SLTU
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_BIT;
+                              decodeBitFuncType       <= BITFUNC_UNSIGNED;
+                              
+                           when 16#2C# => -- DADD 
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_ADD;
+                              decodeExcType           <= EXCTYPE_DADD;
+                              decodeExcCode           <= x"C";
+                  
+                           when 16#2D# => -- DADDU
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_ADD;  
+                              
+                           when 16#2E# => -- DSUB
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SUB;
+                              decodeExcType           <= EXCTYPE_DSUB;
+                              decodeExcCode           <= x"C";
+                              
+                           when 16#2F# => -- DSUBU
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SUB;
+                  
+                           when 16#30# => -- TGE
+                              decodeExcType  <= EXCTYPE_TRAPS0;
+                              decodeExcCode  <= x"D";
+                              
+                           when 16#31# => -- TGEU
+                              decodeExcType  <= EXCTYPE_TRAPU0;
+                              decodeExcCode  <= x"D";
+                              
+                           when 16#32# => -- TLT
+                              decodeExcType  <= EXCTYPE_TRAPS1;
+                              decodeExcCode  <= x"D";
+                              
+                           when 16#33# => -- TLTU
+                              decodeExcType  <= EXCTYPE_TRAPU1;
+                              decodeExcCode  <= x"D";
+                              
+                           when 16#34# => -- TEQ
+                              decodeExcType  <= EXCTYPE_TRAPE1;
+                              decodeExcCode  <= x"D";
+                              
+                           when 16#36# => -- TNE
+                              decodeExcType  <= EXCTYPE_TRAPE0;
+                              decodeExcCode  <= x"D";
+                  
+                           when 16#38# => -- DSLL
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTLEFT;
+                              decodeShiftAmountType   <= "00"; 
+                  
+                           when 16#3A# => -- DSRL
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT;
+                              decodeShiftAmountType   <= "00"; 
+                              
+                           when 16#3B# => -- DSRA
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT;
+                              decodeShiftAmountType   <= "00"; 
+                              decodeShiftSigned       <= '1';
+                              
+                           when 16#3C# => -- DSLL + 32
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTLEFT;
+                              decodeShiftAmountType   <= "00"; 
+                              decodeShamt(5)          <= '1';
+                              
+                           when 16#3E# => -- DSRL + 32
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT;
+                              decodeShiftAmountType   <= "00"; 
+                              decodeShamt(5)          <= '1';
+                              
+                           when 16#3F# => -- DSRA + 32
+                              decodeResultWriteEnable <= '1';
+                              decodeResultMux         <= RESULTMUX_SHIFTRIGHT;
+                              decodeShiftAmountType   <= "00"; 
+                              decodeShamt(5)          <= '1';
+                              decodeShiftSigned       <= '1';
+
+                           when others =>
+                              decodeExcType  <= EXCTYPE_DECODE;
+                              decodeExcCode  <= x"A";
+                           
+                        end case;
+  
+                     when 16#01# => 
+                        decodeResultMux      <= RESULTMUX_PC;
+                        decodeTarget         <= to_unsigned(31, 5);
+                        if (decSource2(3) = '1') then -- Traps
+                           case (decSource2(2 downto 0)) is
+                              when 3x"0" => -- TGEI
+                                 decodeExcType  <= EXCTYPE_TRAPIS0;
+                                 decodeExcCode  <= x"D";
+                                 
+                              when 3x"1" => -- TGEIU
+                                 decodeExcType  <= EXCTYPE_TRAPIU0;
+                                 decodeExcCode  <= x"D";
+                                 
+                              when 3x"2" => -- TLTI
+                                 decodeExcType  <= EXCTYPE_TRAPIS1;
+                                 decodeExcCode  <= x"D";
+                                 
+                              when 3x"3" => -- TLTIU
+                                 decodeExcType  <= EXCTYPE_TRAPIU1;
+                                 decodeExcCode  <= x"D";
+                                 
+                              when 3x"4" => -- TEQI
+                                 decodeExcType  <= EXCTYPE_TRAPIE1;
+                                 decodeExcCode  <= x"D";
+                                 
+                              when 3x"6" => -- TNEI
+                                 decodeExcType  <= EXCTYPE_TRAPIE0;
+                                 decodeExcCode  <= x"D";
+                              
+                              when others =>
+                                 decodeExcType  <= EXCTYPE_DECODE;
+                                 decodeExcCode  <= x"A";
+                                 
+                           end case;
+                           
+                        else -- B: BLTZ, BGEZ, BLTZAL, BGEZAL
+                           if (decSource2(4) = '1') then
+                              decodeResultWriteEnable <= '1';
+                           end if;
+                           if (decSource2(0) = '1') then
+                              decodeBranchType     <= BRANCH_BRANCH_BGEZ;
+                           else
+                              decodeBranchType     <= BRANCH_BRANCH_BLTZ;
+                           end if;
+                           decodeBranchLikely      <= decSource2(1);
+                           if (decSource2(1) = '1') then blockIRQ <= '1'; end if;
+                        end if;
+                        
+                     when 16#02# => -- J
+                        decodeBranchType        <= BRANCH_JUMPIMM;
+               
+                     when 16#03# => -- JAL
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_PC;
+                        decodeTarget            <= to_unsigned(31, 5);
+                        decodeBranchType        <= BRANCH_JUMPIMM;
+                        
+                     when 16#04# => -- BEQ
+                        decodeBranchType        <= BRANCH_BRANCH_BEQ;
+                     
+                     when 16#05# => -- BNE
+                        decodeBranchType        <= BRANCH_BRANCH_BNE;
+                     
+                     when 16#06# => -- BLEZ
+                        decodeBranchType        <= BRANCH_BRANCH_BLEZ;
+                        
+                     when 16#07# => -- BGTZ
+                        decodeBranchType        <= BRANCH_BRANCH_BGTZ;
+                        
+                     when 16#08# => -- ADDI
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_ADD;
+                        decodeResult32          <= '1';
+                        decodeUseImmidateValue2 <= '1';
+                        decodeExcType           <= EXCTYPE_ADDI;
+                        decodeExcCode           <= x"C";
+            
+                     when 16#09# => -- ADDIU
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_ADD;
+                        decodeResult32          <= '1';
+                        decodeUseImmidateValue2 <= '1';
+                        
+                     when 16#0A# => -- SLTI
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_BIT;
+                        decodeBitFuncType       <= BITFUNC_IMM_SIGNED;   
+                        
+                     when 16#0B# => -- SLTIU
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_BIT;
+                        decodeBitFuncType       <= BITFUNC_IMM_UNSIGNED; 
+                        
+                     when 16#0C# => -- ANDI
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_AND;
+                        decodeUseImmidateValue2 <= '1';
+                        
+                     when 16#0D# => -- ORI
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_OR;
+                        decodeUseImmidateValue2 <= '1';
+                        
+                     when 16#0E# => -- XORI
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_XOR;
+                        decodeUseImmidateValue2 <= '1';
+                        
+                     when 16#0F# => -- LUI
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_LUI;
+                        
+                     when 16#10# => -- COP0
+                        blockIRQ <= '1';
+                        if (decSource1(4) = '1') then
+                           case (to_integer(decImmData(5 downto 0))) is
+                              when 1 => decodeTLBR  <= '1';                         
+                              when 2 => decodeTLBWI <= '1'; 
+                              when 6 => decodeTLBWR <= '1';
+                              when 8 => decodeTLBP  <= '1';
+                              when 16#18# => -- ERET
+                                 decodeBranchType <= BRANCH_ERET;
+                                 decodeERET       <= '1';
+                                 
+                              when others => null;
+                                 
+                           end case;
+                        else
+                           case (to_integer(decSource1(3 downto 0))) is
+                           
+                              when 0 => -- mfc0
+                                 decodeCOP0ReadEnable  <= '1';
+                                                   
+                              when 1 => -- dmfc0
+                                 decodeCOP0ReadEnable  <= '1';
+                                 decodeCOP64           <= '1';
+                           
+                              when 4 => -- mtc0
+                                 decodeCOP0WriteEnable <= '1';
+                                 
+                              when 5 => -- dmtc0
+                                 decodeCOP0WriteEnable <= '1';
+                                 decodeCOP64           <= '1';
+                              
+                              when others => null;
+                                 
+                           end case;
+                        end if;
+
+                     when 16#11# => -- COP1
+                        decodeResultMux         <= RESULTMUX_FPU;
+                        if (decSource1(4) = '1') then -- FPU execute
+                           decodeFPUCommandEnable  <= COP1_enable;
+                           if (decFunct = 2) then
+                              if (decSource1 = 16) then decodeFPUMULS <= '1'; end if;
+                              if (decSource1 = 17) then decodeFPUMULD <= '1'; end if;
+                           end if;
+                        else
+                           decodeFPUTarget         <= decRD;
+                           decodeFPUTransferEnable <= COP1_enable;
+                           if (decSource1(3 downto 0) < 3) then
+                              decodeResultWriteEnable <= '1';
+                           end if;
+                           if (decSource1(3 downto 0) = x"8") then
+                              decodeBranchType   <= BRANCH_BC1;
+                              decodeBranchLikely <= decSource2(1);
+                              if (decSource2(1) = '1') then blockIRQ <= '1'; end if;
+                           end if;
+                        end if;
+                        if (COP1_enable = '0' or (decSource1(4) = '0' and decSource1(3 downto 0) > 8)) then
+                           decodeExcType           <= EXCTYPE_DECODE;
+                           decodeExcCode           <= x"B";
+                           decodeExcCOP            <= "01";
+                        end if;
+                       
+                     when 16#12# => -- COP2
+                        if (COP2_enable = '0') then
+                           decodeExcType           <= EXCTYPE_DECODE;
+                           decodeExcCode           <= x"B";
+                           decodeExcCOP            <= "10";
+                        else
+                           case (to_integer(decSource1)) is
+                  
+                              when 0 | 2 =>
+                                 decodeCOP2ReadEnable <= '1';
+                              
+                              when 1 =>
+                                 decodeCOP2ReadEnable <= '1';
+                                 decodeCOP64 <= '1';
+                                 
+                              when 4 | 5 | 6 =>
+                                 decodeCOP2WriteEnable <= '1';
+                           
+                              when others => 
+                                 decodeExcType           <= EXCTYPE_DECODE;
+                                 decodeExcCode           <= x"A";
+                                 decodeExcCOP            <= "10";
+                                 
+                           end case;
+                        end if;
+
+                     when 16#13# => -- COP3 -> does not exist
+                        decodeExcType           <= EXCTYPE_DECODE;
+                        decodeExcCode           <= x"A";
+                        
+                     when 16#14# => -- BEQL
+                        decodeBranchType        <= BRANCH_BRANCH_BEQ;
+                        decodeBranchLikely      <= '1';
+                        blockIRQ                <= '1';
+                           
+                     when 16#15# => -- BNEL
+                        decodeBranchType        <= BRANCH_BRANCH_BNE;
+                        decodeBranchLikely      <= '1';
+                        blockIRQ                <= '1';
+                        
+                     when 16#16# => -- BLEZL
+                        decodeBranchType        <= BRANCH_BRANCH_BLEZ;
+                        decodeBranchLikely      <= '1';
+                        blockIRQ                <= '1';
+                        
+                     when 16#17# => -- BGTZL
+                        decodeBranchType        <= BRANCH_BRANCH_BGTZ;
+                        decodeBranchLikely      <= '1';
+                        blockIRQ                <= '1';
+                        
+                     when 16#18# => -- DADDI   
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_ADD;
+                        decodeUseImmidateValue2 <= '1';
+                        decodeExcType           <= EXCTYPE_DADDI;
+                        decodeExcCode           <= x"C";
+            
+                     when 16#19# => -- DADDIU 
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_ADD;
+                        decodeUseImmidateValue2 <= '1';
+                        
+                     when 16#1A# => -- LDL
+                        decodeMemReadEnable     <= '1';
+                        decodeMem64Bit          <= '1';
+                        decodeLoadType          <= LOADTYPE_LEFT64;
+               
+                     when 16#1B# => -- LDR
+                        decodeMemReadEnable     <= '1';
+                        decodeMem64Bit          <= '1';
+                        decodeLoadType          <= LOADTYPE_RIGHT64;
+         
+                     when 16#20# => -- LB
+                        decodeMemReadEnable     <= '1';
+                        decodeLoadType          <= LOADTYPE_SBYTE;
+                        
+                     when 16#21# => -- LH
+                        decodeMemReadEnable     <= '1';
+                        decodeLoadType          <= LOADTYPE_SWORD;
+                        decodeExcType           <= EXCTYPE_ADDRH;
+                        decodeExcCode           <= x"4";
+
+                     when 16#22# => -- LWL
+                        decodeMemReadEnable     <= '1';
+                        decodeLoadType          <= LOADTYPE_LEFT;
+
+                     when 16#23# => -- LW
+                        decodeMemReadEnable     <= '1';
+                        decodeLoadType          <= LOADTYPE_DWORD;
+                        decodeExcType           <= EXCTYPE_ADDRW;
+                        decodeExcCode           <= x"4";
+                        
+                     when 16#24# => -- LBU
+                        decodeMemReadEnable     <= '1';
+                        decodeLoadType          <= LOADTYPE_BYTE;
+               
+                     when 16#25# => -- LHU
+                        decodeMemReadEnable     <= '1';
+                        decodeLoadType          <= LOADTYPE_WORD;
+                        decodeExcType           <= EXCTYPE_ADDRH;
+                        decodeExcCode           <= x"4";
+                        
+                     when 16#26# => -- LWR
+                        decodeMemReadEnable     <= '1';
+                        decodeLoadType          <= LOADTYPE_RIGHT;
+               
+                     when 16#27# => -- LWU
+                        decodeMemReadEnable     <= '1';
+                        decodeLoadType          <= LOADTYPE_DWORDU;
+                        decodeExcType           <= EXCTYPE_ADDRW;
+                        decodeExcCode           <= x"4";
+                        
+                     when 16#28# => -- SB
+                        decodeMemWriteEnable    <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_BYTE;
+               
+                     when 16#29# => -- SH
+                        decodeMemWriteEnable    <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_HALF;
+                        decodeExcType           <= EXCTYPE_ADDRH;
+                        decodeExcCode           <= x"5";
+                        
+                     when 16#2A# => -- SWL
+                        decodeMemWriteEnable    <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_SWL;
+               
+                     when 16#2B# => -- SW
+                        decodeMemWriteEnable    <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_WORD;
+                        decodeExcType           <= EXCTYPE_ADDRW;
+                        decodeExcCode           <= x"5";
+
+                     when 16#2C# => -- SDL
+                        decodeMemWriteEnable    <= '1';
+                        decodeMem64Bit          <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_SDL;
+
+                     when 16#2D# => -- SDR
+                        decodeMemWriteEnable    <= '1';
+                        decodeMem64Bit          <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_SDR;
+                        
+                     when 16#2E# => -- SWR
+                        decodeMemWriteEnable    <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_SWR;
+                        
+                     when 16#2F# => -- Cache
+                        decodeCacheEnable       <= '1';
+                        decodeCacheTLBTranslate <= '1';
+                        
+                        case (to_integer(decSource2)) is
+                           when 16#00# | 16#08# | 16#10# => decodeCacheTLBTranslate <= '0';
+                           when others => null;
+                        end case;
+                        
+                        case (to_integer(decSource2)) is
+                           -- KI's R4600 boot ROM uses Fill I-cache (0x14). The
+                           -- uncached bring-up path treats it as a legal hint;
+                           -- explicit cache-fill handshaking is added with the
+                           -- cached execution milestone.
+                           when 16#00# | 16#01# | 16#05# | 16#08# | 16#09# | 16#0D# | 16#10# | 16#11# | 16#14# | 16#15# | 16#19# => null;
+                           when others => error_instr <= '1';
+                        end case;
+
+                     when 16#30# => -- LL
+                        decodeMemReadEnable     <= '1';
+                        decodeLoadType          <= LOADTYPE_DWORD;
+                        decodeSetLL             <= '1';
+                        decodeExcType           <= EXCTYPE_ADDRW;
+                        decodeExcCode           <= x"4";
+
+                     when 16#31# => -- LWC1
+                        decodeLoadType          <= LOADTYPE_DWORD;
+                        if (COP1_enable = '0') then
+                           decodeExcType           <= EXCTYPE_DECODE;
+                           decodeExcCode           <= x"B";
+                           decodeExcCOP            <= "01";
+                        else
+                           decodeMemReadEnable     <= '1';
+                           decodeCOP1ReadEnable    <= '1';
+                        end if;
+
+                     when 16#32# => -- LWC2 -> NOP
+                        null;
+                        
+                     when 16#33# => -- LWC3 -> NOP
+                        null;
+
+                     when 16#34# => -- LLD 
+                        decodeMemReadEnable     <= '1';
+                        decodeMem64Bit          <= '1';
+                        decodeLoadType          <= LOADTYPE_QWORD;
+                        decodeSetLL             <= '1';
+                        decodeExcType           <= EXCTYPE_ADDRD;
+                        decodeExcCode           <= x"4";
+
+                     when 16#35# => -- LDC1 
+                        decodeMem64Bit          <= '1';
+                        decodeLoadType          <= LOADTYPE_QWORD;
+                        if (COP1_enable = '0') then
+                           decodeExcType           <= EXCTYPE_DECODE;
+                           decodeExcCode           <= x"B";
+                           decodeExcCOP            <= "01";
+                        else
+                           decodeMemReadEnable     <= '1';
+                           decodeCOP1ReadEnable    <= '1';
+                        end if;
+
+                     when 16#37# => -- LD
+                        decodeMemReadEnable     <= '1';
+                        decodeMem64Bit          <= '1';
+                        decodeLoadType          <= LOADTYPE_QWORD;
+                        decodeExcType           <= EXCTYPE_ADDRD;
+                        decodeExcCode           <= x"4";              
+               
+                     when 16#38# => -- SC
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_BIT;
+                        decodeBitFuncType       <= BITFUNC_SC;
+                        decodeMemWriteLL        <= '1';
+                        decodeResetLL           <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_WORD;
+                        decodeExcType           <= EXCTYPE_ADDRW;
+                        decodeExcCode           <= x"5";
+               
+                     when 16#39# => -- SWC1 
+                        if (fpuRegMode = '0' and decSource2(0) = '1') then
+                           decodeMemWriteType <= MEMWRITETYPE_COP1H;
+                        else
+                           decodeMemWriteType <= MEMWRITETYPE_COP1L;
+                        end if;
+                        if (COP1_enable = '0') then
+                           decodeExcType           <= EXCTYPE_DECODE;
+                           decodeExcCode           <= x"B";
+                           decodeExcCOP            <= "01";
+                        else
+                           decodeMemWriteEnable    <= '1';
+                        end if;  
+                        
+                     when 16#3A# => -- SWC2 -> NOP
+                        null;
+                        
+                     when 16#3B# => -- SWC3 -> NOP
+                        null;
+   
+                     when 16#3C# => -- SCD 
+                        decodeResultWriteEnable <= '1';
+                        decodeResultMux         <= RESULTMUX_BIT;
+                        decodeBitFuncType       <= BITFUNC_SC;
+                        decodeMemWriteLL        <= '1';
+                        decodeResetLL           <= '1';
+                        decodeMem64Bit          <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_DWORD;
+                        decodeExcType           <= EXCTYPE_ADDRD;
+                        decodeExcCode           <= x"5";
+               
+                     when 16#3D# => -- SDC1 
+                        decodeMem64Bit          <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_COP1D;
+                        if (COP1_enable = '0') then
+                           decodeExcType           <= EXCTYPE_DECODE;
+                           decodeExcCode           <= x"B";
+                           decodeExcCOP            <= "01";
+                        else
+                           decodeMemWriteEnable    <= '1';
+                        end if;
+               
+                     when 16#3F# => -- SD
+                        decodeMemWriteEnable    <= '1';
+                        decodeMem64Bit          <= '1';
+                        decodeMemWriteType      <= MEMWRITETYPE_DWORD;
+                        decodeExcType           <= EXCTYPE_ADDRD;
+                        decodeExcCode           <= x"5";
+                     
+                     when others =>
+                        decodeExcType  <= EXCTYPE_DECODE;
+                        decodeExcCode  <= x"A";                     
+                     
+                  end case;
+                  
+                  if (irqTrigger = '1' and blockIRQ = '0') then
+                     decode_irq <= '1';
+                     decodeNew  <= '0';
+                  end if;
+                  
+                  if (decode_irq = '1') then
+                     decodeNew <= '0';
+                  end if;
+                  
+               end if; -- fetchReady
+      
+            else
+               
+               -- operand forwarding in stall
+               if (decodeSource1 > 0 and writebackTarget = decodeSource1 and writebackWriteEnable = '1') then decodeValue1 <= writebackData; end if;
+               if (decodeSource2 > 0 and writebackTarget = decodeSource2 and writebackWriteEnable = '1') then decodeValue2 <= writebackData; end if;
+      
+               if (unsigned(FPUregs_address_a) = decodeFPUSource1 and FPUregs_wren_a(1) = '1') then decodeFPUValue1(63 downto 32) <= unsigned(FPUregs_data_a(63 downto 32)); end if;
+               if (unsigned(FPUregs_address_a) = decodeFPUSource1 and FPUregs_wren_a(0) = '1') then decodeFPUValue1(31 downto  0) <= unsigned(FPUregs_data_a(31 downto  0)); end if;
+               if (unsigned(FPUregs_address_a) = decodeFPUSource2 and FPUregs_wren_a(1) = '1') then decodeFPUValue2(63 downto 32) <= unsigned(FPUregs_data_a(63 downto 32)); end if;
+               if (unsigned(FPUregs_address_a) = decodeFPUSource2 and FPUregs_wren_a(0) = '1') then decodeFPUValue2(31 downto  0) <= unsigned(FPUregs_data_a(31 downto  0)); end if;
+      
+            end if; -- stall
+
+         end if; -- ce
+      end if; -- clk
+   end process;
+   
+   
+--##############################################################
+--############################### stage 3
+--##############################################################
+   
+   ---------------------- Operand forward ------------------
+   
+   value1 <= resultData    when (executeForwardValue1   = '1' and resultWriteEnable = '1') else 
+             writebackData when (writebackForwardValue1 = '1') else 
+             decodeValue1;
+   
+   value2 <= resultData    when (executeForwardValue2   = '1' and resultWriteEnable = '1') else 
+             writebackData when (writebackForwardValue2 = '1') else 
+             decodeValue2;
+   
+   ---------------------- Adder ------------------
+   value2_muxedSigned <= unsigned(resize(signed(decodeImmData), 64)) when (decodeUseImmidateValue2) else value2;
+   calcResult_add     <= value1 + value2_muxedSigned;
+   
+   calcMemAddr        <= value1 + unsigned(resize(signed(decodeImmData), 64));
+   
+   ---------------------- Shifter ------------------
+   -- multiplex immidiate and register based shift amount, so both types can use the same shifters
+   executeShamt <= decodeShamt              when (decodeShiftAmountType = "00") else
+                   '0' & value1(4 downto 0) when (decodeShiftAmountType = "01") else
+                   value1(5 downto 0);
+   
+   -- multiplex high bit of rightshift so arithmetic shift can be reused for logical shift
+   shiftValue(31 downto 0)  <= signed(value2(31 downto 0));
+   shiftValue(63 downto 32) <= (others => '0') when (decodeShift32 = '1') else signed(value2(63 downto 32));
+   shiftValue(64) <= value2(63) when (decodeShiftSigned = '1') else '0';
+
+   calcResult_shiftL <= value2 sll to_integer(executeShamt);
+   calcResult_shiftR <= resize(unsigned(shift_right(shiftValue,to_integer(executeShamt))), 64);  
+
+   ---------------------- Sub ------------------
+   calcResult_sub    <= value1 - value2;
+   
+   ---------------------- logical calcs ------------------
+   value2_muxedLogical <= x"000000000000" & decodeImmData when (decodeUseImmidateValue2) else value2;
+   
+   calcResult_and    <= value1 and value2_muxedLogical;
+   calcResult_or     <= value1 or value2_muxedLogical;
+   calcResult_xor    <= value1 xor value2_muxedLogical;
+   calcResult_nor    <= value1 nor value2;
+
+   ---------------------- bit functions ------------------
+   
+   calcResult_lesserSigned      <= '1' when (signed(value1) < signed(value2)) else '0'; 
+   calcResult_lesserUnsigned    <= '1' when (value1 < value2) else '0';    
+   calcResult_lesserIMMSigned   <= '1' when (signed(value1) < resize(signed(decodeImmData), 64)) else '0'; 
+   calcResult_lesserIMMUnsigned <= '1' when (value1 < unsigned(resize(signed(decodeImmData), 64))) else '0'; 
+   calcResult_equal             <= '1' when (signed(value1) = resize(signed(decodeImmData), 64)) else '0'; 
+   
+   calcResult_bit(63 downto 1) <= (others => '0');
+   calcResult_bit(0) <= calcResult_lesserSigned       when (decodeBitFuncType = BITFUNC_SIGNED) else
+                        calcResult_lesserUnSigned     when (decodeBitFuncType = BITFUNC_UNSIGNED) else
+                        calcResult_lesserIMMSigned    when (decodeBitFuncType = BITFUNC_IMM_SIGNED) else
+                        calcResult_lesserIMMUnsigned  when (decodeBitFuncType = BITFUNC_IMM_UNSIGNED) else
+                        llBit;
+   
+   ---------------------- branching ------------------
+   --PCnext       <= PC + 4;
+   --PCnextBranch <= pcOld0 + unsigned((resize(signed(decodeImmData), 62) & "00"));
+   -- assume region change cannot/will not happen with counting up or short jumps
+   PCnext       <= PC(63 downto 29) & (PC(28 downto 0) + 4);
+   PCnextBranch <= pcOld0(63 downto 29) & (pcOld0(28 downto 0) + unsigned((resize(signed(decodeImmData), 27) & "00")));
+   
+   cmpEqual    <= '1' when (value1 = value2) else '0';
+   cmpNegative <= value1(63);
+   cmpZero     <= '1' when (value1 = 0) else '0';
+   
+   -- use two nextaddress/branch paths with 2 tag rams, so different paths can be calculated in parallel to improve timing
+   
+   FetchAddrSelect <= '0'  when (exception = '1' or exceptionStage1 = '1' or executeIgnoreNext = '1' or decodeNew = '0') else
+                      '1'  when (decodeBranchType = BRANCH_BRANCH_BGEZ and (cmpZero = '1' or cmpNegative = '0'))  else
+                      '1'  when (decodeBranchType = BRANCH_BRANCH_BLTZ and cmpNegative = '1')                     else
+                      '1'  when (decodeBranchType = BRANCH_BRANCH_BEQ  and cmpEqual = '1')                        else
+                      '1'  when (decodeBranchType = BRANCH_BRANCH_BNE  and cmpEqual = '0')                        else
+                      '1'  when (decodeBranchType = BRANCH_BRANCH_BLEZ and (cmpZero = '1' or cmpNegative = '1'))  else
+                      '1'  when (decodeBranchType = BRANCH_BRANCH_BGTZ and (cmpZero = '0' and cmpNegative = '0')) else
+                      '1'  when (decodeBranchType = BRANCH_BC1         and decodeSource2(0) = FPU_CF) else
+                      '0';
+   
+   FetchAddr1 <= exceptionPC                                    when (exception = '1' or exceptionStage1 = '1') else
+                 PCnext                                         when (executeIgnoreNext = '1' or decodeNew = '0') else
+                 value1                                         when (decodeBranchType = BRANCH_ALWAYS_REG) else
+                 pcOld0(63 downto 28) & decodeJumpTarget & "00" when (decodeBranchType = BRANCH_JUMPIMM) else
+                 eretPC                                         when (decodeBranchType = BRANCH_ERET) else
+                 PCnext;
+
+   FetchAddr2 <= PCnextBranch;
+
+   -- WHICH ARM OF THE MUX ABOVE PRODUCED THIS FETCH ADDRESS.
+   --
+   -- This is the field the whole FMV investigation has been missing. Both games
+   -- leave a non-control-transfer instruction in RAM and land on 0xBFC00004,
+   -- and only three of these arms can produce that address at all:
+   --
+   --   5 REG    a jr/jalr whose register held BFC00004
+   --   7 ERET   an eret with EPC = BFC00004
+   --   0 SEQ    PC was already BFC00000 and simply advanced
+   --
+   -- while 1 EXC would mean COP0 produced a vector it has no code to produce,
+   -- and 4 BRA or 6 JMP cannot reach BFC00004 from a 0x88xxxxxx pc - a taken
+   -- branch is limited to a signed 16-bit word offset and a jump immediate
+   -- inherits the top nibble of the delay slot's pc. So whichever tag appears
+   -- beside the landing entry either names the mechanism or convicts the mux.
+   --
+   -- Deliberately written in the SAME priority order as FetchAddrSelect and
+   -- FetchAddr1 above, and placed next to them, so the two cannot drift apart
+   -- unnoticed.
+   fetch_src <= x"4" when (FetchAddrSelect = '1')                                else -- taken branch
+                x"1" when (exception = '1' or exceptionStage1 = '1')             else -- exception vector
+                x"2" when (executeIgnoreNext = '1')                              else -- annulled slot -> PCnext
+                x"3" when (decodeNew = '0')                                      else -- no decode -> PCnext
+                x"5" when (decodeBranchType = BRANCH_ALWAYS_REG)                 else -- jr / jalr
+                x"6" when (decodeBranchType = BRANCH_JUMPIMM)                    else -- j / jal
+                x"7" when (decodeBranchType = BRANCH_ERET)                       else -- eret
+                x"0";                                                                 -- sequential PCnext
+
+   EXECOPBranchDelaySlot <= '0' when (executeIgnoreNext = '1') else
+                            '1' when (decodeBranchType /= BRANCH_OFF) else 
+                            '0';
+
+   -- DELAY SLOTS DO NOT CHAIN.
+   --
+   -- This flag means "the instruction after the one now in decode is a delay
+   -- slot", and it feeds cop0's isDelaySlot, which is the ONLY consumer - it
+   -- decides Cause.BD and whether EPC is backed up by four. It has no effect on
+   -- how branches actually execute.
+   --
+   -- When a branch sits in another branch's delay slot, the second branch also
+   -- raised this flag, so the FIRST branch's TARGET was marked as a delay slot
+   -- too. An interrupt arriving at that target then recorded
+   -- EPC = target - 4, an address that is not a delay slot of anything in the
+   -- real control flow. eret resumed there, executed whatever instruction
+   -- happens to precede the target, and fell THROUGH into the target instead of
+   -- entering it via the branch.
+   --
+   -- That is the KI FMV restart. The decompressor uses the "jump either way"
+   -- idiom - KI1 880322D4/880322D8, KI2 8802F074/8802F078, a bnez with a beqz
+   -- to the same target in its delay slot - and both games recorded
+   -- EPC = target - 4 on hardware. cpu_cop0.vhd carries the donor author's own
+   -- note that this case was never tested.
+   --
+   -- A branch in a delay slot is architecturally undefined on MIPS, so there is
+   -- no "correct" answer to copy; what matters is that the exception state
+   -- stays self-consistent, with EPC pointing at a real instruction.
+   --
+   -- NOT FIXED HERE YET. The obvious one-liner - suppressing this flag while
+   -- executeBranchdelaySlot is already set - is WRONG. That signal is
+   -- registered under `if (stall = 0)` and therefore HOLDS across a stall, so
+   -- the suppression also swallows the flag for an unrelated branch decoded
+   -- after a stall. Tried in simulation: legitimate delay slots stopped being
+   -- marked, EPC stopped being backed up, and the test program escaped its own
+   -- loop - 64 bad EPCs instead of 2.
+   --
+   -- What this needs is a DECODE-ALIGNED "the instruction now in decode is
+   -- itself a delay slot" signal, advanced only when the decode advances,
+   -- rather than reusing the execute-stage flag.
+   --
+   -- sim/tb_ki_cpu_delayslot_irq.sv reproduces the defect and stays red.
+   EXEBranchdelaySlot <= '0' when (executeIgnoreNext = '1') else
+                         '1' when (decodeBranchType = BRANCH_ALWAYS_REG) else
+                         '1' when (decodeBranchType = BRANCH_JUMPIMM) else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BGEZ and (decodeBranchLikely = '0' or (cmpZero = '1' or cmpNegative = '0')))  else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BLTZ and (decodeBranchLikely = '0' or cmpNegative = '1')                   )  else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BEQ  and (decodeBranchLikely = '0' or cmpEqual = '1')                      )  else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BNE  and (decodeBranchLikely = '0' or cmpEqual = '0')                      )  else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BLEZ and (decodeBranchLikely = '0' or (cmpZero = '1' or cmpNegative = '1')))  else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BGTZ and (decodeBranchLikely = '0' or (cmpZero = '0' and cmpNegative = '0'))) else
+                         '1' when (decodeBranchType = BRANCH_BC1         and (decodeBranchLikely = '0' or decodeSource2(0) = FPU_CF))             else
+                         '0';
+                         
+   EXEIgnoreNext      <= '0' when (executeIgnoreNext = '1') else
+                         '1' when (decodeBranchType = BRANCH_ERET) else                      
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BGEZ and decodeBranchLikely = '1' and cmpZero = '0' and cmpNegative = '1')  else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BLTZ and decodeBranchLikely = '1' and cmpNegative = '0')                    else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BEQ  and decodeBranchLikely = '1' and cmpEqual = '0')                       else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BNE  and decodeBranchLikely = '1' and cmpEqual = '1')                       else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BLEZ and decodeBranchLikely = '1' and cmpZero = '0' and cmpNegative = '0')  else
+                         '1' when (decodeBranchType = BRANCH_BRANCH_BGTZ and decodeBranchLikely = '1' and (cmpZero = '1' or cmpNegative = '1')) else
+                         '1' when (decodeBranchType = BRANCH_BC1         and decodeBranchLikely = '1' and decodeSource2(0) /= FPU_CF)           else
+                         '0';
+
+   ---------------------- result muxing ------------------
+   resultDataMuxed <= calcResult_shiftL when (decodeResultMux = RESULTMUX_SHIFTLEFT)  else
+                      calcResult_shiftR when (decodeResultMux = RESULTMUX_SHIFTRIGHT) else
+                      calcResult_add    when (decodeResultMux = RESULTMUX_ADD)        else
+                      PCnext            when (decodeResultMux = RESULTMUX_PC)         else
+                      HI                when (decodeResultMux = RESULTMUX_HI)         else
+                      LO                when (decodeResultMux = RESULTMUX_LO)         else
+                      calcResult_sub    when (decodeResultMux = RESULTMUX_SUB)        else
+                      calcResult_and    when (decodeResultMux = RESULTMUX_AND)        else
+                      calcResult_or     when (decodeResultMux = RESULTMUX_OR )        else
+                      calcResult_xor    when (decodeResultMux = RESULTMUX_XOR)        else
+                      calcResult_nor    when (decodeResultMux = RESULTMUX_NOR)        else
+                      calcResult_bit    when (decodeResultMux = RESULTMUX_BIT)        else
+                      FPU_TransferData  when (decodeResultMux = RESULTMUX_FPU)        else
+                      unsigned(resize(signed(decodeImmData) & x"0000", 64)); -- (decodeResultMux = RESULTMUX_LUI);
+                      
+   resultDataMuxed64(31 downto 0) <= resultDataMuxed(31 downto 0);
+   resultDataMuxed64(63 downto 32) <= (others => resultDataMuxed(31)) when decodeResult32 else resultDataMuxed(63 downto 32);
+
+   ---------------------- exceptions ------------------
+   exceptionCode_3  <= decodeExcCode;
+   exception_COP    <= decodeExcCOP;
+   
+   EXEExceptionMem <= '1' when (decodeExcType = EXCTYPE_ADDRH   and calcMemAddr(0) = '1') else
+                      '1' when (decodeExcType = EXCTYPE_ADDRW   and calcMemAddr(1 downto 0) > 0) else
+                      '1' when (decodeExcType = EXCTYPE_ADDRD   and calcMemAddr(2 downto 0) > 0) else
+                      -- 2 below should use calcMemAddr to allow inter cycle wraparound, but we can't do that due to timing closure
+                      '1' when (region64 = '0' and value1(63 downto 32) = x"FFFFFFFF" and value1(31) = '0') else 
+                      '1' when (region64 = '0' and value1(63 downto 32) = x"00000000" and value1(31) = '1') else
+                      '1' when (region_unused = '1') else
+                      '0';
+   
+   exceptionNew3  <= '0' when (exception = '1' or stall > 0 or executeIgnoreNext = '1' or decodeNew = '0') else
+                     '1' when (EXEExceptionMem = '1' and (decodeMemReadEnable = '1' or decodeMemWriteEnable = '1')) else
+                     '1' when (decodeExcType = EXCTYPE_DECODE) else
+                     '1' when (decodeExcType = EXCTYPE_PC      and value1(1 downto 0) > 0) else
+                     '1' when (decodeExcType = EXCTYPE_ADD     and (((calcResult_add(31) xor value1(31)) and (calcResult_add(31) xor value2(31))) = '1')) else
+                     '1' when (decodeExcType = EXCTYPE_DADD    and (((calcResult_add(63) xor value1(63)) and (calcResult_add(63) xor value2(63))) = '1')) else
+                     '1' when (decodeExcType = EXCTYPE_ADDI    and (((calcResult_add(31) xor value1(31)) and (calcResult_add(31) xor decodeImmData(15))) = '1')) else
+                     '1' when (decodeExcType = EXCTYPE_DADDI   and (((calcResult_add(63) xor value1(63)) and (calcResult_add(63) xor decodeImmData(15))) = '1')) else
+                     '1' when (decodeExcType = EXCTYPE_SUB     and (((calcResult_sub(31) xor value1(31)) and (value1(31) xor value2(31))) = '1')) else
+                     '1' when (decodeExcType = EXCTYPE_DSUB    and (((calcResult_sub(63) xor value1(63)) and (value1(63) xor value2(63))) = '1')) else
+                     -- See NO_TRAP_INSTR. When set, none of the twelve trap
+                     -- terms below is built, and the 64-bit comparator stops
+                     -- feeding the exception path.
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPU0  and calcResult_lesserUnsigned = '0') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPU1  and calcResult_lesserUnsigned = '1') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPS0  and calcResult_lesserSigned = '0') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPS1  and calcResult_lesserSigned = '1') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPE0  and cmpEqual = '0') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPE1  and cmpEqual = '1') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPIU0 and calcResult_lesserIMMUnsigned = '0') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPIU1 and calcResult_lesserIMMUnsigned = '1') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPIS0 and calcResult_lesserIMMSigned = '0') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPIS1 and calcResult_lesserIMMSigned = '1') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPIE0 and calcResult_equal = '0') else
+                     '1' when ((not NO_TRAP_INSTR) and decodeExcType = EXCTYPE_TRAPIE1 and calcResult_equal = '1') else
+                     '0';
+    
+   exceptionNewPC <= '1' when (decodeExcType = EXCTYPE_PC and value1(1 downto 0) > 0) else '0';
+    
+   ---------------------- COP ------------------                  
+   FPU_command_ena      <= decodeFPUCommandEnable  when (exception = '0' and stall = 0 and executeIgnoreNext = '0' and decodeNew = '1') else '0';
+   FPU_TransferEna      <= decodeFPUTransferEnable when (exception = '0' and stall = 0 and executeIgnoreNext = '0' and decodeNew = '1') else '0';
+                     
+   EXECOP0WriteValue    <= unsigned(resize(signed(value2(31 downto 0)), 64)) when (decodeCOP64 = '0') else
+                           value2;
+
+   -- region check
+   -- we optimize the 64bit region to use only the base address for timing purposes. 
+   -- If base+immidiate switches the region-> bad luck
+   process (value1, calcMemAddr, privilegeMode, region64, kusegUnmapped)
+   begin
+   
+      region_TLBmapped <= '0';
+      region_cached    <= '0';
+      region_full32    <= '0';
+      region_unused    <= '0';
+   
+      if (region64 = '1') then
+         if (privilegeMode = "00") then
+            if    (value1 <= x"000000ffffffffff") then region_TLBmapped <= '1';                   
+            elsif (value1 <= x"3fffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"400000ffffffffff") then region_TLBmapped <= '1';                   
+            elsif (value1 <= x"7fffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"80000000ffffffff") then region_cached <= '1'; region_full32 <= '1';
+            elsif (value1 <= x"87ffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"88000000ffffffff") then region_cached <= '1'; region_full32 <= '1';
+            elsif (value1 <= x"8fffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"90000000ffffffff") then region_full32 <= '1';                      
+            elsif (value1 <= x"97ffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"98000000ffffffff") then region_cached <= '1'; region_full32 <= '1';
+            elsif (value1 <= x"9fffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"a0000000ffffffff") then region_cached <= '1'; region_full32 <= '1';
+            elsif (value1 <= x"a7ffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"a8000000ffffffff") then region_cached <= '1'; region_full32 <= '1';
+            elsif (value1 <= x"afffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"b0000000ffffffff") then region_cached <= '1'; region_full32 <= '1';
+            elsif (value1 <= x"b7ffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"b8000000ffffffff") then region_cached <= '1'; region_full32 <= '1';
+            elsif (value1 <= x"bfffffffffffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"c00000ff7fffffff") then region_TLBmapped <= '1';                   
+            elsif (value1 <= x"ffffffff7fffffff") then region_unused <= '1';                      
+            elsif (value1 <= x"ffffffff9fffffff") then region_cached <= '1';                      
+            elsif (value1 <= x"ffffffffbfffffff") then null;                                           
+            elsif (value1 <= x"ffffffffdfffffff") then region_TLBmapped <= '1';                   
+            else region_TLBmapped <= '1'; 
+            end if;
+         elsif (privilegeMode = "01") then
+            if    (value1 <= x"000000ffffffffff") then region_TLBmapped <= '1';
+            elsif (value1 <= x"3fffffffffffffff") then region_unused <= '1';   
+            elsif (value1 <= x"400000ffffffffff") then region_TLBmapped <= '1';
+            elsif (value1 <= x"ffffffffbfffffff") then region_unused <= '1';   
+            elsif (value1 <= x"ffffffffdfffffff") then region_TLBmapped <= '1';
+            else region_unused <= '1';
+            end if;
+         elsif (privilegeMode = "10") then
+            if (value1 <= x"FFFFFFFFFF") then region_TLBmapped <= '1'; end if;
+         end if;
+      else
+         -- kusegUnmapped is Status.ERL. See the note in cpu_cop0.vhd: while it is
+         -- set, region < 4 is unmapped and must not go to the TLB.
+         if (privilegeMode = "00") then
+            if ((calcMemAddr(31 downto 29) < 4 and kusegUnmapped = '0') or calcMemAddr(31 downto 29) = 6 or calcMemAddr(31 downto 29) = 7) then region_TLBmapped <= '1'; end if;
+            if (calcMemAddr(31 downto 29) = 4) then region_cached <= '1'; end if;
+         elsif (privilegeMode = "01") then
+            if ((calcMemAddr(31 downto 29) < 4 and kusegUnmapped = '0') or calcMemAddr(31 downto 29) = 6) then region_TLBmapped <= '1'; end if;
+            if (calcMemAddr(31 downto 29) = 4 or calcMemAddr(31 downto 29) = 5 or calcMemAddr(31 downto 29) = 7) then region_unused <= '1'; end if;
+         elsif (privilegeMode = "10") then
+            if (calcMemAddr(31 downto 29) < 4 and kusegUnmapped = '0') then region_TLBmapped <= '1'; end if;
+            if (calcMemAddr(31 downto 29) > 3 and calcMemAddr(31 downto 29) < 8) then region_unused <= '1'; end if;
+         end if;
+      end if;
+   end process;
+   
+   region64     <= '0' when ADDR32_ONLY else bit64region;
+
+   EXETLBMapped <= region_TLBmapped;
+   
+   EXETLBDataAccess <= decodeMemReadEnable or decodeMemWriteEnable or decodeCacheTLBTranslate or decodeMemWriteLL when (EXETLBMapped = '1' and exception = '0' and stall = 0 and executeIgnoreNext = '0' and decodeNew = '1') else '0';
+
+   ---------------------- load/store ------------------
+   
+   EXECacheAddr(31 downto 3) <= calcMemAddr(31 downto 3);
+                                
+   EXECacheAddr(2 downto 0)  <= "000"                  when (decodeLoadType = LOADTYPE_LEFT64 or decodeLoadType = LOADTYPE_RIGHT64) else 
+                                calcMemAddr(2) & "00"  when (decodeLoadType = LOADTYPE_LEFT or decodeLoadType = LOADTYPE_RIGHT) else 
+                                calcMemAddr(2 downto 0);  
+   
+   
+   process (all)
+      variable rotatedData          : unsigned(63 downto 0) := (others => '0');
+      variable storeHalf            : unsigned(15 downto 0) := (others => '0');
+   begin
+   
+      rotatedData             := cpu_to_bus64(value2);
+      storeHalf               := cpu_to_bus16(value2(15 downto 0));
+      EXEMemWriteData         <= rotatedData;
+      EXEMemWriteMask         <= "00000000";
+      
+      case (decodeMemWriteType) is
+      
+         when MEMWRITETYPE_BYTE =>
+            EXEMemWriteData <= x"00000000" & value2(7 downto 0) & value2(7 downto 0) &
+                               value2(7 downto 0) & value2(7 downto 0);
+            case (to_integer(calcMemAddr(1 downto 0))) is 
+               when 0 => EXEMemWriteMask(3 downto 0) <= "0001";
+               when 1 => EXEMemWriteMask(3 downto 0) <= "0010";
+               when 2 => EXEMemWriteMask(3 downto 0) <= "0100";
+               when 3 => EXEMemWriteMask(3 downto 0) <= "1000";
+               when others => null;
+            end case;
+
+         when MEMWRITETYPE_HALF =>
+            EXEMemWriteData <= x"00000000" & storeHalf & storeHalf;
+            if (calcMemAddr(1) = '1') then
+               EXEMemWriteMask(3 downto 0) <= "1100";
+            else
+               EXEMemWriteMask(3 downto 0) <= "0011";
+            end if;
+               
+         when MEMWRITETYPE_WORD =>
+            EXEMemWriteMask(3 downto 0) <= "1111";
+               
+         when MEMWRITETYPE_SWL =>
+            if LITTLE_ENDIAN then
+               case (to_integer(calcMemAddr(1 downto 0))) is
+                  when 0 => EXEMemWriteMask(3 downto 0) <= "0001"; EXEMemWriteData <= x"00000000" & x"000000" & rotatedData(31 downto 24);
+                  when 1 => EXEMemWriteMask(3 downto 0) <= "0011"; EXEMemWriteData <= x"00000000" & x"0000" & rotatedData(31 downto 16);
+                  when 2 => EXEMemWriteMask(3 downto 0) <= "0111"; EXEMemWriteData <= x"00000000" & x"00" & rotatedData(31 downto 8);
+                  when 3 => EXEMemWriteMask(3 downto 0) <= "1111"; EXEMemWriteData <= x"00000000" & rotatedData(31 downto 0);
+                  when others => null;
+               end case;
+            else
+               case (to_integer(calcMemAddr(1 downto 0))) is
+                  when 0 => EXEMemWriteMask(3 downto 0) <= "1111"; EXEMemWriteData <= x"00000000" & rotatedData(31 downto 0);
+                  when 1 => EXEMemWriteMask(3 downto 0) <= "1110"; EXEMemWriteData <= x"00000000" & rotatedData(23 downto 0) & x"00";
+                  when 2 => EXEMemWriteMask(3 downto 0) <= "1100"; EXEMemWriteData <= x"00000000" & rotatedData(15 downto 0) & x"0000";
+                  when 3 => EXEMemWriteMask(3 downto 0) <= "1000"; EXEMemWriteData <= x"00000000" & rotatedData(7 downto 0) & x"000000";
+                  when others => null;
+               end case;
+            end if;
+            
+         when MEMWRITETYPE_SWR =>
+            if LITTLE_ENDIAN then
+               case (to_integer(calcMemAddr(1 downto 0))) is
+                  when 0 => EXEMemWriteMask(3 downto 0) <= "1111"; EXEMemWriteData <= x"00000000" & rotatedData(31 downto 0);
+                  when 1 => EXEMemWriteMask(3 downto 0) <= "1110"; EXEMemWriteData <= x"00000000" & rotatedData(23 downto 0) & x"00";
+                  when 2 => EXEMemWriteMask(3 downto 0) <= "1100"; EXEMemWriteData <= x"00000000" & rotatedData(15 downto 0) & x"0000";
+                  when 3 => EXEMemWriteMask(3 downto 0) <= "1000"; EXEMemWriteData <= x"00000000" & rotatedData(7 downto 0) & x"000000";
+                  when others => null;
+               end case;
+            else
+               case (to_integer(calcMemAddr(1 downto 0))) is
+                  when 0 => EXEMemWriteMask(3 downto 0) <= "0001"; EXEMemWriteData <= x"00000000" & x"000000" & rotatedData(31 downto 24);
+                  when 1 => EXEMemWriteMask(3 downto 0) <= "0011"; EXEMemWriteData <= x"00000000" & x"0000" & rotatedData(31 downto 16);
+                  when 2 => EXEMemWriteMask(3 downto 0) <= "0111"; EXEMemWriteData <= x"00000000" & x"00" & rotatedData(31 downto 8);
+                  when 3 => EXEMemWriteMask(3 downto 0) <= "1111"; EXEMemWriteData <= x"00000000" & rotatedData(31 downto 0);
+                  when others => null;
+               end case;
+            end if;
+            
+         when MEMWRITETYPE_DWORD =>  
+            EXEMemWriteMask <= "11111111";  
+               
+         when MEMWRITETYPE_SDL =>
+            if LITTLE_ENDIAN then
+               case (to_integer(calcMemAddr(2 downto 0))) is
+                  when 0 => EXEMemWriteMask <= "00000001"; EXEMemWriteData <= x"00000000000000" & rotatedData(63 downto 56);
+                  when 1 => EXEMemWriteMask <= "00000011"; EXEMemWriteData <= x"000000000000" & rotatedData(63 downto 48);
+                  when 2 => EXEMemWriteMask <= "00000111"; EXEMemWriteData <= x"0000000000" & rotatedData(63 downto 40);
+                  when 3 => EXEMemWriteMask <= "00001111"; EXEMemWriteData <= x"00000000" & rotatedData(63 downto 32);
+                  when 4 => EXEMemWriteMask <= "00011111"; EXEMemWriteData <= x"000000" & rotatedData(63 downto 24);
+                  when 5 => EXEMemWriteMask <= "00111111"; EXEMemWriteData <= x"0000" & rotatedData(63 downto 16);
+                  when 6 => EXEMemWriteMask <= "01111111"; EXEMemWriteData <= x"00" & rotatedData(63 downto 8);
+                  when 7 => EXEMemWriteMask <= "11111111"; EXEMemWriteData <= rotatedData;
+                  when others => null;
+               end case;
+            else
+               case (to_integer(calcMemAddr(2 downto 0))) is
+                  when 0 => EXEMemWriteMask <= "11111111"; EXEMemWriteData <= rotatedData(63 downto 0);
+                  when 1 => EXEMemWriteMask <= "11101111"; EXEMemWriteData <= rotatedData(55 downto 0) & rotatedData(63 downto 56);
+                  when 2 => EXEMemWriteMask <= "11001111"; EXEMemWriteData <= rotatedData(47 downto 0) & rotatedData(63 downto 48);
+                  when 3 => EXEMemWriteMask <= "10001111"; EXEMemWriteData <= rotatedData(39 downto 0) & rotatedData(63 downto 40);
+                  when 4 => EXEMemWriteMask <= "00001111"; EXEMemWriteData <= rotatedData(31 downto 0) & rotatedData(63 downto 32);
+                  when 5 => EXEMemWriteMask <= "00001110"; EXEMemWriteData <= rotatedData(23 downto 0) & rotatedData(63 downto 24);
+                  when 6 => EXEMemWriteMask <= "00001100"; EXEMemWriteData <= rotatedData(15 downto 0) & rotatedData(63 downto 16);
+                  when 7 => EXEMemWriteMask <= "00001000"; EXEMemWriteData <= rotatedData(7 downto 0) & rotatedData(63 downto 8);
+                  when others => null;
+               end case;
+            end if;
+            
+         when MEMWRITETYPE_SDR =>
+            if LITTLE_ENDIAN then
+               case (to_integer(calcMemAddr(2 downto 0))) is
+                  when 0 => EXEMemWriteMask <= "11111111"; EXEMemWriteData <= rotatedData;
+                  when 1 => EXEMemWriteMask <= "11111110"; EXEMemWriteData <= rotatedData(55 downto 0) & x"00";
+                  when 2 => EXEMemWriteMask <= "11111100"; EXEMemWriteData <= rotatedData(47 downto 0) & x"0000";
+                  when 3 => EXEMemWriteMask <= "11111000"; EXEMemWriteData <= rotatedData(39 downto 0) & x"000000";
+                  when 4 => EXEMemWriteMask <= "11110000"; EXEMemWriteData <= rotatedData(31 downto 0) & x"00000000";
+                  when 5 => EXEMemWriteMask <= "11100000"; EXEMemWriteData <= rotatedData(23 downto 0) & x"0000000000";
+                  when 6 => EXEMemWriteMask <= "11000000"; EXEMemWriteData <= rotatedData(15 downto 0) & x"000000000000";
+                  when 7 => EXEMemWriteMask <= "10000000"; EXEMemWriteData <= rotatedData(7 downto 0) & x"00000000000000";
+                  when others => null;
+               end case;
+            else
+               case (to_integer(calcMemAddr(2 downto 0))) is
+                  when 0 => EXEMemWriteMask <= "00010000"; EXEMemWriteData <= rotatedData(55 downto 0) & rotatedData(63 downto 56);
+                  when 1 => EXEMemWriteMask <= "00110000"; EXEMemWriteData <= rotatedData(47 downto 0) & rotatedData(63 downto 48);
+                  when 2 => EXEMemWriteMask <= "01110000"; EXEMemWriteData <= rotatedData(39 downto 0) & rotatedData(63 downto 40);
+                  when 3 => EXEMemWriteMask <= "11110000"; EXEMemWriteData <= rotatedData(31 downto 0) & rotatedData(63 downto 32);
+                  when 4 => EXEMemWriteMask <= "11110001"; EXEMemWriteData <= rotatedData(23 downto 0) & rotatedData(63 downto 24);
+                  when 5 => EXEMemWriteMask <= "11110011"; EXEMemWriteData <= rotatedData(15 downto 0) & rotatedData(63 downto 16);
+                  when 6 => EXEMemWriteMask <= "11110111"; EXEMemWriteData <= rotatedData(7 downto 0) & rotatedData(63 downto 8);
+                  when 7 => EXEMemWriteMask <= "11111111"; EXEMemWriteData <= rotatedData(63 downto 0);
+                  when others => null;
+               end case;
+            end if;
+         
+         when MEMWRITETYPE_COP1L =>         
+            EXEMemWriteMask(3 downto 0) <= "1111";
+            EXEMemWriteData(31 downto 0) <= cpu_to_bus32(decodeFPUValue2(31 downto 0));
+                  
+         when MEMWRITETYPE_COP1H =>         
+            EXEMemWriteMask(3 downto 0) <= "1111";
+            EXEMemWriteData(31 downto 0) <= cpu_to_bus32(decodeFPUValue2(63 downto 32));
+               
+         when MEMWRITETYPE_COP1D =>    
+            EXEMemWriteMask <= "11111111";
+            EXEMemWriteData   <= cpu_to_bus64(decodeFPUValue2);
+
+      end case;
+
+   end process;
+   
+   
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+      
+         DIVstart    <= '0';
+      
+         if (reset_93 = '1') then
+         
+            stall3                        <= '0';
+            executeNew                    <= '0';
+            executeIgnoreNext             <= '0';
+            executeStallFromMEM           <= '0';
+
+            resultWriteEnable             <= '0';
+            executeBranchdelaySlot        <= '0';
+            executeMemWriteEnable         <= '0';
+            executeMemReadEnable          <= '0';
+            executeCOP0WriteEnable        <= '0';
+            executeICacheEnable           <= '0';
+            executeDCacheEnable           <= '0';
+            executeSetLL                  <= '0';
+            llBit                         <= '0';
+            hiloWait                      <= 0;
+            exceptionAllowDelay           <= '0';
+            
+            hi                            <= unsigned(ss_in(3)); -- (others => '0');
+            lo                            <= unsigned(ss_in(4)); -- (others => '0');
+            
+         elsif (ce_93 = '1') then
+            
+            -- load delay block
+            if (stall3) then
+            
+               if (stall = "00100") then
+                  executeStallFromMEM <= '0';
+                  executeNew          <= '0';
+               end if;
+
+               if (writebackStallFromMEM = '1') then
+                  if (writebackNew = '1' or (mem_finished_read = '1' and writeback_COP1_ReadEnable = '0')) then
+                     stall3 <= '0';
+                  end if;
+               end if;
+               
+               if (executeStallFromMEM = '1') then               
+                  if (executeMemReadEnable = '1' and executeCOP1ReadEnable = '0') then
+                     if (executeMemUseCacheEffective = '1') then
+                        if (datacache_readdone = '1') then
+                           stall3 <= '0';
+                        end if;
+                     end if;
+                  end if;
+               end if;
+               
+            end if;
+            
+            -- mul/div calc/wait
+            if (hiloWait > 0) then
+               hiloWait <= hiloWait - 1;
+               if (hiloWait = 1) then
+                  stall3     <= '0';
+                  executeNew <= '1';
+                  case (hilocalc) is
+                     when HILOCALC_MULT | HILOCALC_MULTU => 
+                        hi <= unsigned(resize(  signed(mulResult(63 downto 32)),64)); 
+                        lo <= unsigned(resize(  signed(mulResult(31 downto 0)),64));
+                     when HILOCALC_DMULT | HILOCALC_DMULTU => 
+                        hi <= unsigned(mulResult(127 downto 64)); 
+                        lo <= unsigned(mulResult(63 downto 0));
+                     when HILOCALC_DIV | HILOCALC_DIVU => 
+                        hi <= unsigned(resize(DIVremainder(31 downto  0), 64)); 
+                        lo <= unsigned(resize(DIVquotient(31 downto 0), 64));
+                     when HILOCALC_DDIV | HILOCALC_DDIVU => 
+                        hi <= unsigned(DIVremainder(63 downto  0)); 
+                        lo <= unsigned(DIVquotient(63 downto 0));
+                  end case;
+               end if;
+            end if;
+            
+            -- FPU unstall
+            execute_unstallFPUForward <= '0';
+            
+            if (FPU_command_done = '1') then
+               if (decodeFPUForwardUse = '1') then
+                  execute_unstallFPUForward <= '1';
+               else
+                  stall3     <= '0';
+                  executeNew <= '1';
+               end if;
+            end if;
+            
+            if (execute_unstallFPUForward = '1') then
+               stall3     <= '0';
+               executeNew <= '1';
+            end if;
+            
+            -- TLB unstall            
+            if (TLB_dataUnStall = '1') then
+               executeMemAddress     <= TLB_dataAddrOutLookup;
+               executeNew            <= '1';
+               if (exception = '0') then
+                  if (executeMemReadEnable = '1') then
+                     executeStallFromMEM <= '1';
+                  else
+                     stall3              <= '0';
+                  end if;
+               else
+                  stall3                <= '0';
+                  executeMemReadEnable  <= '0';
+                  executeMemWriteEnable <= '0';
+                  executeICacheEnable   <= '0';
+                  executeDCacheEnable   <= '0';
+               end if;
+               if (TLB_dataUseCacheLookup = '1' and DATACACHEON_intern = '1') then
+                  executeMemUseCache <= DATACACHETLBON_intern;
+               else
+                  executeMemUseCache <= '0';
+               end if;
+            end if;
+            
+
+            if (stall = 0) then
+            
+               executeNew              <= '0';
+               executeICacheEnable     <= '0';
+               executeDCacheEnable     <= '0';
+               executeSetLL            <= '0';
+               
+               resultData              <= resultDataMuxed64;    
+               resultTarget            <= decodeTarget;
+                  
+               executeMem64Bit         <= decodeMem64Bit;
+               executeMemWriteData     <= EXEMemWriteData;             
+               executeMemWriteMask     <= EXEMemWriteMask;
+               executeMemReadLastData  <= value2;           
+
+               executeLLfromTLB        <= EXETLBDataAccess;
+               if (EXETLBDataAccess = '1') then
+                  executeMemAddress <= TLB_dataAddrOutFound;
+               elsif (region_full32 = '1') then
+                  executeMemAddress <= calcMemAddr(31 downto 0);
+               else
+                  executeMemAddress <= "000" & calcMemAddr(28 downto 0);
+               end if;
+               
+               executeCOP0WriteValue   <= EXECOP0WriteValue; 
+
+               executeBranchdelaySlot  <= EXEBranchdelaySlot;                
+            
+               if (exception = '1') then                          
+                  stall3                        <= '0';
+                  executeNew                    <= '0';
+                  executeIgnoreNext             <= '0';
+                     
+                  resultWriteEnable             <= '0';
+                  executeMemReadEnable          <= '0';
+                  executeMemWriteEnable         <= '0';
+                  executeCOP0WriteEnable        <= '0';
+               end if;
+                  
+               if (decodeNew = '1' and (exception = '0' or exceptionAllowDelay = '1')) then     
+               
+                  executeIgnoreNext             <= EXEIgnoreNext;
+                  exceptionAllowDelay           <= '0';
+                   
+                  if (executeIgnoreNext = '1') then
+                  
+                     resultWriteEnable      <= '0';
+                     executeCOP0WriteEnable <= '0';
+                     executeCOP0ReadEnable  <= '0';
+                     executeICacheEnable    <= '0';
+                     executeDCacheEnable    <= '0';
+                     executeMemReadEnable   <= '0';
+                     executeMemWriteEnable  <= '0';
+                  
+                  else
+               
+                     executeNew                    <= '1';
+               
+-- synthesis translate_off
+                     pcOld2                        <= pcOld1;  
+                     opcode2                       <= opcode1;
+-- synthesis translate_on
+                            
+                     -- from calculation
+                     if (decodeTarget = 0 or exceptionNew3 = '1') then
+                        resultWriteEnable <= '0';
+                     else
+                        resultWriteEnable <= decodeResultWriteEnable;
+                     end if;
+                       
+                     executeMemWriteEnable <= '0';
+                     if (EXEExceptionMem = '0') then
+                        if (decodeMemWriteEnable = '1') then
+                           executeMemWriteEnable <= '1';
+                        elsif (decodeMemWriteLL = '1') then
+                           executeMemWriteEnable <= llBit;
+                        end if;
+                     end if;
+                        
+                     executeLoadType               <= decodeLoadType;   
+                     executeMemReadEnable          <= decodeMemReadEnable and (not EXEExceptionMem); 
+   
+                     execute_ERET                  <= decodeERET;
+                     executeCOP0WriteEnable        <= decodeCOP0WriteEnable;     
+                     executeCOP0ReadEnable         <= decodeCOP0ReadEnable;      
+                     executeCOP0Register           <= decodeCOP0Register;
+                     
+                     executeCOP1ReadEnable         <= decodeCOP1ReadEnable;
+                     executeCOP1Target             <= decodeSource2;
+                     
+                     executeCOP2WriteEnable        <= decodeCOP2WriteEnable;     
+                     executeCOP2ReadEnable         <= decodeCOP2ReadEnable; 
+                     
+                     executeCOP64                  <= decodeCOP64;
+
+                     executeSetLL                  <= decodeSetLL;
+
+                     if (decodeExcType = EXCTYPE_PC and value1(1 downto 0) > 0) then
+                        exceptionAllowDelay <= '1';
+                     end if;
+
+                     if (decodeERET = '1') then
+                        llBit <= '0';
+                     elsif (EXEExceptionMem = '0') then
+                        if (decodeResetLL = '1') then
+                           llBit <= '0';
+                        elsif (decodeSetLL = '1') then
+                           llBit <= '1';
+                        end if;
+                     end if;
+
+                     executeMemUseCache <= '0';
+                     if (EXETLBDataAccess = '1') then
+                        if (TLB_dataUseCacheFound = '1' and DATACACHEON_intern = '1') then
+                           executeMemUseCache <= DATACACHETLBON_intern;
+                        end if;
+                     else
+                        if (region_cached = '1' and DATACACHEON_intern = '1') then
+                           executeMemUseCache <= '1';
+                        end if;
+                     end if;
+
+                     executeICacheEnable           <= decodeCacheEnable;
+                     executeDCacheEnable           <= decodeCacheEnable;
+                     executeCacheCommand           <= decodeSource2;
+                     
+                     if (DATACACHEON_intern = '0' or (DATACACHETLBON_intern = '0' and EXETLBDataAccess = '1')) then
+                        executeDCacheEnable <= '0';
+                     end if;
+                     
+                     execute_TLBR                  <= decodeTLBR; 
+                     execute_TLBWI                 <= decodeTLBWI;
+                     execute_TLBWR                 <= decodeTLBWR;
+                     execute_TLBP                  <= decodeTLBP; 
+                     
+                     -- new mul/div
+                     if (decodecalcMULT = '1') then
+                        hilocalc <= HILOCALC_MULT;
+                        mulsign  <= '1';
+                        mul1     <= std_logic_vector(resize(signed(value1(31 downto 0)), 64));
+                        mul2     <= std_logic_vector(resize(signed(value2(31 downto 0)), 64));
+                        hiloWait <= 4;
+                        stall3   <= '1';
+                     end if;
+                     
+                     if (decodecalcMULTU = '1') then
+                        hilocalc <= HILOCALC_MULTU;
+                        mulsign  <= '0';
+                        mul1     <= x"00000000" & std_logic_vector(value1(31 downto 0));
+                        mul2     <= x"00000000" & std_logic_vector(value2(31 downto 0));
+                        hiloWait <= 4;
+                        stall3   <= '1';
+                     end if;
+                     
+                     if (decodecalcDMULT = '1') then
+                        hilocalc <= HILOCALC_DMULT;
+                        mulsign  <= '1';
+                        mul1     <= std_logic_vector(value1);
+                        mul2     <= std_logic_vector(value2);
+                        hiloWait <= 7;
+                        stall3   <= '1';
+                     end if;
+                     
+                     if (decodecalcDMULTU = '1') then
+                        hilocalc <= HILOCALC_DMULTU;
+                        mulsign  <= '0';
+                        mul1     <= std_logic_vector(value1);
+                        mul2     <= std_logic_vector(value2);
+                        hiloWait <= 7;
+                        stall3   <= '1';
+                     end if;
+                     
+                     if (decodeFPUMULS = '1') then
+                        mulsign  <= '0';
+                        mul1 <= 40x"0" & '0' & std_logic_vector(decodeFPUValue1(22 downto 0));
+                        mul2 <= 40x"0" & '0' & std_logic_vector(decodeFPUValue2(22 downto 0));
+                        if (decodeFPUValue1(30 downto 23) > 0) then mul1(23) <= '1'; end if;
+                        if (decodeFPUValue2(30 downto 23) > 0) then mul2(23) <= '1'; end if;
+                     end if;
+                     
+                     if (decodeFPUMULD = '1') then
+                        mulsign  <= '0';
+                        mul1 <= 11x"0" & '0' & std_logic_vector(decodeFPUValue1(51 downto 0));
+                        mul2 <= 11x"0" & '0' & std_logic_vector(decodeFPUValue2(51 downto 0));
+                        if (decodeFPUValue1(62 downto 52) > 0) then mul1(52) <= '1'; end if;
+                        if (decodeFPUValue2(62 downto 52) > 0) then mul2(52) <= '1'; end if;
+                     end if;
+                     
+                     if (decodecalcDIV = '1') then
+                        DIVis32     <= '1';
+                        hiloWait    <= 36;
+                        stall3      <= '1';
+                        DIVdividend <= resize(signed(value1(31 downto 0)), 65);
+                        DIVdivisor  <= resize(signed(value2(31 downto 0)), 65);
+                        hilocalc    <= HILOCALC_DIV;
+                        DIVstart    <= '1';
+                     end if;
+                     
+                      if (decodecalcDDIV = '1') then
+                        DIVis32     <= '0';
+                        hiloWait    <= 68;
+                        stall3      <= '1';
+                        DIVdividend <= resize(signed(value1), 65);
+                        DIVdivisor  <= resize(signed(value2), 65);
+                        hilocalc    <= HILOCALC_DDIV;
+                        DIVstart    <= '1';
+                     end if;
+                     
+                     if (decodecalcDIVU = '1') then
+                        DIVis32     <= '1';
+                        hiloWait    <= 36;
+                        stall3      <= '1';
+                        DIVdividend <= '0' & x"00000000" & signed(value1(31 downto 0));
+                        DIVdivisor  <= '0' & x"00000000" & signed(value2(31 downto 0));
+                        hilocalc    <= HILOCALC_DIVU;
+                        DIVstart    <= '1';
+                     end if;
+                     
+                     if (decodecalcDDIVU = '1') then
+                        DIVis32     <= '0';
+                        hiloWait    <= 68;
+                        stall3      <= '1';
+                        DIVdividend <= '0' & signed(value1);
+                        DIVdivisor  <= '0' & signed(value2);
+                        hilocalc    <= HILOCALC_DDIVU;
+                        DIVstart    <= '1';
+                     end if;
+                     
+                     if (decodehiUpdate = '1') then hi <= value1; end if;
+                     if (decodeloUpdate = '1') then lo <= value1; end if;
+                     
+                     if ((EXEExceptionMem = '0' and decodeMemReadEnable = '1') or decodeCOP0ReadEnable = '1' or decodeCOP2ReadEnable = '1') then
+                        stall3              <= '1';
+                        executeStallFromMEM <= '1';
+                     end if;
+                     
+                     if (FPU_command_ena = '1' and FPU_command_done = '0') then
+                        stall3 <= '1';
+                     end if;
+                     
+                     if (decFPUForwardUse = '1') then
+                        stall3 <= '1';
+                        if (FPU_command_done = '1' or FPU_command_ena = '0') then
+                           execute_unstallFPUForward <= '1';
+                        end if;
+                     end if;
+                        
+                     if (TLB_dataStall = '1') then
+                        stall3              <= '1';
+                        executeStallFromMEM <= '0';
+                     end if; 
+                     
+                  end if;
+                  
+               end if;
+               
+               
+            end if;
+
+         end if;
+         
+      end if;
+   end process;
+   
+   
+--##############################################################
+--############################### stage 4
+--##############################################################
+
+   cache_commandEnableD <= executeDCacheEnable when (stall = 0) else '0';
+
+   icpu_datacache : entity work.cpu_datacache
+   generic map
+   (
+      LITTLE_ENDIAN => LITTLE_ENDIAN
+   )
+   port map
+   (
+      clk1x             => clk1x,
+      clk93             => clk93,
+      clk2x             => clk2x,
+      reset_1x          => reset_1x,
+      reset_93          => reset_93,
+      ce_93             => ce_93,
+      stall             => stall,
+      stall4            => stall4,
+      fifo_block        => writefifo_block,
+      
+      slow_in           => DATACACHESLOW,
+      force_wb_in       => DATACACHEFORCEWEB,
+      write_through_in  => DATACACHEWRITETHROUGH,
+      
+      ram_request       => datacache_request,
+      ram_reqAddr       => datacache_reqAddr,
+      ram_active        => datacache_active,
+      ram_grant         => rdram_granted2X,
+      ram_done          => mem_finished_read,
+      ddr3_DOUT         => ddr3_DOUT,      
+      ddr3_DOUT_READY   => ddr3_DOUT_READY,
+      
+      writeback_ena     => datacache_wb_ena,  
+      writeback_addr    => datacache_wb_addr, 
+      writeback_data    => datacache_wb_data,
+      
+      tag_addr          => EXECacheAddr,
+      
+      read_ena          => datacache_readena,
+      RW_addr           => datacache_addr,
+      RW_64             => executeMem64Bit,
+      read_busy         => datacache_readbusy,
+      read_done         => datacache_readdone,
+      read_data         => datacache_data_out,
+      
+      write_ena         => datacache_writeena,
+      write_be          => executeMemWriteMask,
+      write_data        => std_logic_vector(executeMemWriteData),
+      write_done        => datacache_writedone,
+      
+      CacheCommandEna   => cache_commandEnableD,
+      CacheCommand      => executeCacheCommand,
+      CachecommandStall => datacache_CmdStall,
+      CachecommandDone  => datacache_CmdDone,    
+      
+      TagLo_Valid       => TagLo_Valid,
+      TagLo_Dirty       => TagLo_Dirty,
+      TagLo_Addr        => TagLo_Addr, 
+      
+      writeTagEna       => writeDatacacheTagEna,      
+      writeTagValue     => writeDatacacheTagValue,
+
+      debug_state       => datacache_debug_state,
+      SS_reset          => SS_reset
+   );
+
+   stall4Masked <= stall(4 downto 3) & (stall(2) and (not executeStallFromMEM)) & stall(1 downto 0);
+   
+   process (all)
+      variable skipmem : std_logic;
+   begin
+   
+      stallNew4            <= stall4;
+            
+      mem4_request         <= '0';
+      mem4_req64           <= executeMem64Bit;
+      mem4_address         <= executeMemAddress;
+      mem4_rnw             <= '1';
+      mem4_dataWrite       <= std_logic_vector(executeMemWriteData);
+      mem4_writeMask       <= executeMemWriteMask;
+      
+      datacache_writeena   <= '0';
+      datacache_readena    <= '0';
+      
+      datacache_addr   <= executeMemAddress;
+      if (executeMemReadEnable = '1') then
+         if (executeLoadType = LOADTYPE_LEFT or executeLoadType = LOADTYPE_RIGHT) then 
+            datacache_addr(1 downto 0) <= "00";
+         end if;
+         if (executeLoadType = LOADTYPE_LEFT64 or executeLoadType = LOADTYPE_RIGHT64) then 
+            datacache_addr(2 downto 0) <= "000";
+         end if;
+      end if;
+      
+      -- ############
+      -- Load/Store
+      -- ############
+      
+      if (stall4Masked = 0 and executeNew = '1') then
+      
+         if (executeMemWriteEnable = '1') then
+            skipmem := '0';
+         
+            if (executeMemUseCacheEffective = '1') then
+               datacache_writeena <= '1';
+               skipmem            := '1';
+               if (DATACACHEWRITETHROUGH = '1') then
+                  mem4_request <= '1';
+                  if (writefifo_mem4_ready = '0') then
+                     stallNew4 <= '1';
+                  end if;
+               end if;
+               if (datacache_writedone = '0') then
+                  stallNew4      <= '1';
+               end if;
+            end if;
+            
+            if (skipmem = '0') then
+               mem4_request   <= '1';
+               if (writefifo_mem4_ready = '0') then
+                  stallNew4      <= '1';
+               end if;
+            end if;
+            
+            mem4_rnw       <= '0';
+            if (executeMem64Bit = '1') then
+               mem4_address(2 downto 0) <= "000";
+            else
+               mem4_address(1 downto 0) <= "00";
+            end if;
+         
+         end if;
+         
+         if (executeMemReadEnable = '1') then
+            skipmem := '0';
+            
+            if (executeMemUseCacheEffective = '1') then
+               datacache_readena  <= '1';
+               skipmem            := '1';
+               if (datacache_readdone = '0') then
+                  stallNew4      <= '1';
+               end if;
+            end if;
+
+            if (skipmem = '0') then
+               mem4_request   <= '1';
+               stallNew4      <= '1';
+            end if;
+            
+            if (executeLoadType = LOADTYPE_LEFT or executeLoadType = LOADTYPE_RIGHT) then 
+               mem4_address(1 downto 0) <= "00";
+            end if;
+            if (executeLoadType = LOADTYPE_LEFT64 or executeLoadType = LOADTYPE_RIGHT64) then 
+               mem4_address(2 downto 0) <= "000";
+            end if;
+         
+         end if;
+         
+      end if;
+
+      if (read_fifoStall = '1' and writefifo_mem4_ready = '1') then
+         mem4_request <= '1';
+         mem4_rnw     <= '1';
+         -- Same latching as the store replay below, for the same reason. This
+         -- path is NOT demonstrated broken by a bench, but it is the identical
+         -- construct - re-offering from executeMemAddress after stage 3 has
+         -- moved on - so it would read from whatever address happened to be in
+         -- the register rather than the one that was blocked.
+         mem4_address <= read_fifoStall_address;
+         mem4_req64   <= read_fifoStall_req64;
+      end if;
+
+      -- A blocked store was not accepted into the FIFO. Replay it once the
+      -- arbiter is ready, then let the clocked stage retire it on that edge.
+      if (writeback_fifoStall = '1' and writefifo_mem4_ready = '1') then
+         mem4_request   <= '1';
+         mem4_rnw       <= '0';
+         -- From the LATCHED copy. Replaying from executeMem* re-offered the
+         -- store with whatever stage 3 had advanced to, which in the game's
+         -- ATA loop was the next iteration's LOAD: the bench measured 0 of 176
+         -- replays carrying the data-port address, all of them carrying
+         -- 0800000c/08000010/08000014 with halfword masks instead. The ATA
+         -- write was lost and a stray halfword was written into main RAM.
+         mem4_address   <= fifoStall_address;
+         mem4_dataWrite <= fifoStall_dataWrite;
+         mem4_writeMask <= fifoStall_writeMask;
+         mem4_req64     <= fifoStall_req64;
+         if (fifoStall_useCache = '1') then
+            datacache_writeena <= '1';
+         end if;
+      end if;
+      
+   end process;
+   
+   read4_uncachedRot <=
+      "00"                   when (read4_useLoadType = LOADTYPE_LEFT    or
+                                   read4_useLoadType = LOADTYPE_RIGHT   or
+                                   read4_useLoadType = LOADTYPE_LEFT64  or
+                                   read4_useLoadType = LOADTYPE_RIGHT64 or
+                                   read4_useLoadType = LOADTYPE_QWORD)  else
+      read4_Addr(1 downto 0);
+
+   -- The response mailbox registers the raw bus word before completion is
+   -- asserted. Rotate that stable CPU-domain copy; a second mailbox stage
+   -- registers the rotated value before the completion pulse reaches users.
+   read4_uncachedData <=
+      unsigned(mem_finished_dataRead(63 downto 32)) &
+      (x"000000" & unsigned(mem_finished_dataRead(31 downto 24)))
+                                     when (read4_uncachedRot = "11") else
+      unsigned(mem_finished_dataRead(63 downto 32)) &
+      (x"0000" & unsigned(mem_finished_dataRead(31 downto 16)))
+                                     when (read4_uncachedRot = "10") else
+      unsigned(mem_finished_dataRead(63 downto 32)) &
+      (x"00" & unsigned(mem_finished_dataRead(31 downto 8)))
+                                     when (read4_uncachedRot = "01") else
+      unsigned(mem_finished_dataRead);
+
+   read4_dataReadData   <= unsigned(datacache_data_out) when (writeback_UseCache = '1' or datacache_readena = '1') else unsigned(mem_finished_dataRot);
+   read4_dataReadRot64  <= bus_to_cpu64(std_logic_vector(read4_dataReadData));
+   read4_dataReadRot32  <= bus_to_cpu32(std_logic_vector(read4_dataReadData(31 downto 0)));
+   
+   read4_Addr         <= writebackReadAddress         when (stall4 = '1') else executeMemAddress;
+   read4_oldData      <= writebackReadLastData        when (stall4 = '1') else executeMemReadLastData;
+   read4_cop1_readEna <= writeback_COP1_ReadEnable    when (stall4 = '1') else executeCOP1ReadEnable;
+   read4_cop1_target  <= cop1_stage4_target           when (stall4 = '1') else executeCOP1Target;
+   read4_useLoadType  <= writebackLoadType            when (stall4 = '1') else executeLoadType;       
+   read4_useTarget    <= writebackTarget              when (stall4 = '1') else resultTarget;
+   
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+      
+         DATACACHEON_intern    <= DATACACHEON;
+         DATACACHETLBON_intern <= DATACACHETLBON;
+      
+         if (reset_93 = '1') then
+         
+            stall4                           <= '0';
+            read_fifoStall                   <= '0';
+            writebackNew                     <= '0';
+            writebackStallFromMEM            <= '0';                  
+            writebackWriteEnable             <= '0';
+            writebackMemWrite                <= '0';
+            writeback_fifoStall              <= '0';
+            cop1_stage4_writeEnable          <= '0';
+            COP2Latch                        <= (others => '0');
+            
+         elsif (ce_93 = '1') then
+         
+            stall4                  <= stallNew4;    
+            
+            cop1_stage4_writeEnable <= '0';
+
+            if (stall4Masked = 0) then
+            
+               writebackNew   <= '0';
+               
+               writebackForwardValue1 <= '0';
+               writebackForwardValue2 <= '0';
+            
+               if (executeNew = '1') then
+               
+                  writebackStallFromMEM        <= executeStallFromMEM;
+               
+-- synthesis translate_off
+                  pcOld3                       <= pcOld2;
+                  opcode3                      <= opcode2;
+                  hi_1                         <= hi;
+                  lo_1                         <= lo;
+-- synthesis translate_on
+               
+                  writebackTarget              <= resultTarget;
+                  writebackData                <= resultData;
+                  writebackReadLastData        <= executeMemReadLastData;
+
+                  writebackWriteEnable         <= resultWriteEnable;
+                  writeback_UseCache           <= datacache_readena or datacache_writeena or executeDCacheEnable;
+                  writebackMemWrite            <= executeMemWriteEnable;
+                  
+                  writeback_COP1_ReadEnable    <= executeCOP1ReadEnable;
+                  cop1_stage4_target           <= executeCOP1Target;
+                  
+                  writeback_fifoStall          <= '0';
+                  
+                  -- check if last command must be forwarded
+                  if (resultWriteEnable = '1') then
+                     if (decSource1 > 0 and resultTarget = decSource1) then writebackForwardValue1 <= '1'; end if;
+                     if (decSource2 > 0 and resultTarget = decSource2) then writebackForwardValue2 <= '1'; end if;
+                  end if;
+                  
+                  if (executeMemReadEnable = '1' and executeCOP1ReadEnable = '0') then
+                     if (decodeSource1 > 0 and resultTarget = decodeSource1) then writebackForwardValue1 <= '1'; end if;
+                     if (decodeSource2 > 0 and resultTarget = decodeSource2) then writebackForwardValue2 <= '1'; end if;
+                  end if;
+                  
+                  if (executeMemReadEnable = '1' and
+                      executeMemUseCacheEffective = '0' and
+                      mem4_request = '1' and
+                      writefifo_mem4_ready = '0') then
+                     read_fifoStall         <= '1';
+                     read_fifoStall_address <= mem4_address;
+                     read_fifoStall_req64   <= mem4_req64;
+                  end if;
+
+                  if (executeMemWriteEnable = '1') then
+
+
+                     if (mem4_request = '1' and writefifo_mem4_ready = '0') then
+                        writeback_fifoStall <= '1';
+                        -- mem4_* here are this store's own combinational
+                        -- values, already address-masked by the issue path.
+                        fifoStall_address   <= mem4_address;
+                        fifoStall_dataWrite <= mem4_dataWrite;
+                        fifoStall_writeMask <= mem4_writeMask;
+                        fifoStall_req64     <= mem4_req64;
+                        fifoStall_useCache  <= executeMemUseCacheEffective;
+                     else
+                        writebackNew        <= '1';
+                     end if;
+                  
+                  elsif (executeMemReadEnable = '1') then
+                  
+                     writebackLoadType       <= executeLoadType;
+                     writebackReadAddress    <= executeMemAddress;
+
+                  else
+
+                     writebackNew         <= '1';
+                     
+                  end if;
+                  
+                  if (executeCOP0ReadEnable = '1') then
+                     if (resultTarget > 0) then
+                        writebackWriteEnable <= '1';
+                     end if;
+                     
+                     if (executeCOP64 = '1') then
+                        writebackData <= COP0ReadValue;
+                     else
+                        writebackData <= unsigned(resize(signed(COP0ReadValue(31 downto 0)), 64));
+                     end if;
+                  end if;
+                  
+                  if (executeCOP2ReadEnable = '1') then
+                     if (resultTarget > 0) then
+                        writebackWriteEnable <= '1';
+                     end if;
+                     
+                     if (executeCOP64 = '1') then
+                        writebackData <= COP2Latch;
+                     else
+                        writebackData <= unsigned(resize(signed(COP2Latch(31 downto 0)), 64));
+                     end if;
+                  end if;
+                  
+                  if (executeCOP2WriteEnable = '1') then
+                     COP2Latch <= executeMemReadLastData;
+                  end if;
+
+                  if (datacache_CmdStall = '1') then
+                     stall4 <= '1';
+                  end if;
+                  
+                  if (execute_TLBP = '1') then
+                     stall4 <= '1';
+                  end if;
+
+               end if;
+               
+            end if; -- stall4Masked
+            
+            if (writeback_fifoStall = '1' and
+                not (writefifo_mem4_ready = '1' and mem4_request = '1') and
+                (datacache_CmdDone = '1' or TLBDone = '1' or
+                 datacache_writedone = '1' or datacache_readdone = '1' or
+                 (writeback_UseCache = '0' and mem_finished_read = '1') or
+                 (writebackMemWrite = '1' and writeback_UseCache = '1' and
+                  DATACACHEWRITETHROUGH = '1' and
+                  datacache_debug_state = "0000"))) then
+            end if;
+
+            if (datacache_CmdDone = '1') then
+               stall4        <= '0';
+               writebackNew  <= '1';
+            end if;
+            
+            if (TLBDone = '1') then
+               stall4        <= '0';
+               writebackNew  <= '1';
+            end if;
+            
+            -- The replayed load has been taken by the FIFO. Drop the retry
+            -- flag but leave stall4 alone: the load is now genuinely in
+            -- flight and mem_finished_read releases it.
+            if (read_fifoStall = '1' and writefifo_mem4_ready = '1') then
+               read_fifoStall <= '0';
+            end if;
+
+            if (writeback_fifoStall = '1' and
+                writefifo_mem4_ready = '1' and mem4_request = '1') then
+               stall4              <= '0';
+               writebackNew        <= '1';
+               writeback_fifoStall <= '0';
+            end if;
+            
+            if (datacache_writedone = '1') then
+               stall4        <= '0';
+               writebackNew  <= '1';
+            end if;
+
+            -- A write-through cache store can be accepted by the CPU FIFO
+            -- before the cache's one-cycle write_done indication is sampled.
+            -- Once that accepted store's cache side is idle, release the
+            -- retained stage-4 entry rather than waiting forever for the
+            -- already-missed pulse.
+            if (stall4 = '1' and writebackMemWrite = '1' and
+                writeback_UseCache = '1' and DATACACHEWRITETHROUGH = '1' and
+                writeback_fifoStall = '0' and datacache_debug_state = "0000") then
+               stall4       <= '0';
+               writebackNew <= '1';
+            end if;
+            
+            if ((writeback_UseCache = '0' and mem_finished_read = '1') or datacache_readdone = '1') then
+            
+               stall4             <= '0';
+               writebackNew       <= '1';
+               
+               if (read4_cop1_readEna = '1') then
+                  cop1_stage4_writeEnable <= '1';
+                  if (fpuRegMode = '0') then
+                     cop1_stage4_target(0) <= '0';
+                  end if;
+               end if;
+               
+               if (read4_useTarget > 0 and read4_cop1_readEna = '0') then
+                  writebackWriteEnable <= '1';
+               end if;
+               
+            end if; -- mem_finished_read
+            
+            if ((writeback_UseCache = '0' and mem_finished_read = '1') or datacache_readena = '1' or datacache_readbusy = '1') then
+               
+               cop1_stage4_data <= bus_to_cpu64(std_logic_vector(read4_dataReadData));
+               
+               cop1_stage4_writeMask   <= "11";
+               if (fpuRegMode = '1') then
+                  if (read4_useLoadType = LOADTYPE_DWORD) then
+                     cop1_stage4_data(31 downto 0) <= bus_to_cpu32(std_logic_vector(read4_dataReadData(31 downto 0)));
+                     cop1_stage4_writeMask         <= "01";
+                  end if;
+               else
+                  if (read4_useLoadType = LOADTYPE_DWORD) then
+                     if (read4_cop1_target(0) = '1') then
+                        cop1_stage4_data(63 downto 32) <= bus_to_cpu32(std_logic_vector(read4_dataReadData(31 downto 0)));
+                        cop1_stage4_writeMask          <= "10";
+                     else
+                        cop1_stage4_data(31 downto 0) <= bus_to_cpu32(std_logic_vector(read4_dataReadData(31 downto 0)));
+                        cop1_stage4_writeMask         <= "01";
+                     end if;
+                  end if;
+               end if;
+               
+               case (read4_useLoadType) is
+                  
+                  when LOADTYPE_SBYTE => writebackData <= unsigned(resize(signed(read4_dataReadData(7 downto 0)), 64));
+                  when LOADTYPE_SWORD => writebackData <= unsigned(resize(signed(bus_to_cpu16(std_logic_vector(read4_dataReadData(15 downto 0)))), 64));
+                   when LOADTYPE_LEFT =>
+                      writebackData <= unsigned(resize(signed(merge_left32(read4_dataReadRot32,
+                                                                          read4_oldData(31 downto 0),
+                                                                          read4_Addr(1 downto 0))), 64));
+                        
+                  when LOADTYPE_DWORD  => writebackData <= unsigned(resize(signed(bus_to_cpu32(std_logic_vector(read4_dataReadData(31 downto 0)))), 64));
+                  when LOADTYPE_DWORDU => writebackData <= x"00000000" & bus_to_cpu32(std_logic_vector(read4_dataReadData(31 downto 0)));
+                  when LOADTYPE_BYTE  => writebackData <= x"00000000" & x"000000" & read4_dataReadData(7 downto 0);
+                  when LOADTYPE_WORD  => writebackData <= x"00000000" & x"0000" & bus_to_cpu16(std_logic_vector(read4_dataReadData(15 downto 0)));
+                   when LOADTYPE_RIGHT =>
+                      writebackData <= unsigned(resize(signed(merge_right32(read4_dataReadRot32,
+                                                                           read4_oldData(31 downto 0),
+                                                                           read4_Addr(1 downto 0))), 64));
+                     
+                  when LOADTYPE_QWORD => writebackData <= bus_to_cpu64(std_logic_vector(read4_dataReadData));
+                  
+                   when LOADTYPE_LEFT64 =>
+                      writebackData <= merge_left64(read4_dataReadRot64, read4_oldData,
+                                                    read4_Addr(2 downto 0));
+                  
+                   when LOADTYPE_RIGHT64 =>
+                      writebackData <= merge_right64(read4_dataReadRot64, read4_oldData,
+                                                     read4_Addr(2 downto 0));
+                     
+               end case; 
+               
+            end if; -- mem_read
+
+         end if; -- ce
+         
+
+      end if;
+   end process;
+   
+   
+--##############################################################
+--############################### stage 5
+--##############################################################
+   process (clk93)
+      variable store_byte     : std_logic_vector(7 downto 0);
+      variable write_data_slv : std_logic_vector(63 downto 0);
+      variable store_word     : std_logic_vector(31 downto 0);
+   begin
+      if (rising_edge(clk93)) then
+      
+-- synthesis translate_off
+         cpu_done <= '0';
+-- synthesis translate_on
+         
+         --debugTmr <= debugTmr + 1;
+
+         if (reset_93 = '1') then
+            debug_retired_count <= (others => '0');
+            debug_gpr_s1_register <= (others => '0');
+            debug_gpr_s2_register <= (others => '0');
+            debug_retire_pc_register <= (others => '0');
+            debug_retire_opcode_register <= (others => '0');
+            debug_irq_count_register <= (others => '0');
+            
+            --debugCnt             <= (others => '0');
+            --debugSum             <= (others => '0');
+            --debugTmr             <= (others => '0');
+         
+         elsif (ce_93 = '1') then
+
+            if (decode_irq = '1') then
+               debug_irq_count_register <= debug_irq_count_register + 1;
+            end if;
+            
+            if (stall4Masked = 0 and writebackNew = '1') then
+               debug_retired_count <= debug_retired_count + 1;
+            
+-- synthesis translate_off
+               debug_retire_pc_register <= std_logic_vector(PCold3(31 downto 0));
+               debug_retire_opcode_register <= std_logic_vector(opcode3);
+               pcOld4               <= pcOld3;
+               opcode4              <= opcode3;
+               hi_2                 <= hi_1;
+               lo_2                 <= lo_1;
+-- synthesis translate_on
+               
+               -- export
+               if (writebackWriteEnable = '1') then 
+                  if (writebackTarget > 0) then
+                      -- Track the decompressor stream state used by the
+                      -- frozen fault trace.
+                      if (writebackTarget = 17) then
+                         debug_gpr_s1_register <= std_logic_vector(writebackData(31 downto 0));
+                      end if;
+                      if (writebackTarget = 18) then
+                         debug_gpr_s2_register <= std_logic_vector(writebackData(31 downto 0));
+                      end if;
+-- synthesis translate_off
+                     regs(to_integer(writebackTarget)) <= writebackData;
+-- synthesis translate_on
+                     --debugSum <= debugSum + writebackData(31 downto 0);
+                  end if;
+               end if;
+               --debugCnt          <= debugCnt + 1;
+-- synthesis translate_off
+
+               cpu_done          <= '1';
+               cpu_export.pc     <= pcOld4;
+               cpu_export.opcode <= opcode4;
+               cpu_export.hi     <= hi_2;
+               cpu_export.lo     <= lo_2;
+               for i in 0 to 31 loop
+                  cpu_export.regs(i)    <= regs(i);
+                  cpu_export.FPUregs(i) <= FPUregs(i);
+               end loop;
+               cop0_export_1       <= cop0_export;
+               cpu_export.cop0regs <= cop0_export_1;
+               
+               csr_export_1        <= csr_export;
+               csr_export_2        <= csr_export_1;
+               cpu_export.csr      <= 7x"0" & csr_export_2;
+               
+-- synthesis translate_on
+               --debugwrite <= '0';
+               --if (debugCnt(31) = '1' and debugSum(31) = '1' and debugTmr(31) = '1' and writebackTarget = 0) then
+               --   debugwrite <= '1';
+               --end if;
+               
+            end if;
+             
+         end if;
+         
+         -- export
+-- synthesis translate_off
+         if (ss_regs_load = '1') then
+            regs(to_integer(ss_regs_addr)) <= unsigned(ss_regs_data);
+         end if;          
+         if (ss_FPUregs_load = '1') then
+            FPUregs(to_integer(ss_FPUregs_addr)) <= unsigned(ss_FPUregs_data);
+         end if; 
+         
+         if (FPUregs_wren_a(0) = '1') then
+            FPUregs(to_integer(unsigned(FPUregs_address_a)))(31 downto 0) <= unsigned(FPUregs_data_a(31 downto 0));
+         end if;        
+         
+         if (FPUregs_wren_a(1) = '1') then
+            FPUregs(to_integer(unsigned(FPUregs_address_a)))(63 downto 32) <= unsigned(FPUregs_data_a(63 downto 32));
+         end if;
+-- synthesis translate_on
+         
+      end if;
+   end process;
+
+--##############################################################
+--############################### submodules
+--##############################################################
+   
+   
+   icop0 : entity work.cpu_cop0
+   generic map
+   (
+      LITTLE_ENDIAN => LITTLE_ENDIAN,
+      ADDR32_ONLY   => ADDR32_ONLY
+   )
+   port map
+   (
+      clk93                   => clk93,
+      ce                      => ce_93,   
+      stall                   => stall,
+      stall4Masked            => stall4Masked,
+      executeNew              => executeNew,
+      reset                   => reset_93,
+      preNMI                  => preNMI,
+      
+      RANDOMMISS              => RANDOMMISS,
+      DISABLE_BOOTCOUNT       => DISABLE_BOOTCOUNT,
+      DISABLE_DTLBMINI        => DISABLE_DTLBMINI, 
+      ALECK64                 => ALECK64,
+            
+      error_exception         => error_exception,
+      error_TLB               => error_TLB,
+      
+      irqRequest              => irqRequest,
+      irqTrigger              => irqTrigger,
+      decode_irq              => decode_irq,
+
+-- synthesis translate_off
+      cop0_export             => cop0_export,
+-- synthesis translate_on
+
+      eret                    => execute_ERET,
+      exception3              => exceptionNew3,
+      exceptionNewPC          => exceptionNewPC,
+      exceptionPCStore        => value1,
+      exceptionFPU            => exceptionFPU,
+      exceptionCode_1         => "0000", -- todo
+      exceptionCode_3         => exceptionCode_3,
+      exception_COP           => exception_COP,
+      isDelaySlot             => executeBranchdelaySlot,
+      chainedDelaySlot        => chainedDelaySlot,
+      nextDelaySlot           => EXECOPBranchDelaySlot,
+      pcOld1                  => PCold1,
+            
+      eretPC                  => eretPC,
+      exceptionPC             => exceptionPC,
+      debug_cause             => cop0_debug_cause,
+      debug_epc               => cop0_debug_epc,
+      debug_badvaddr          => cop0_debug_badvaddr,
+      debug_eret_epc          => cop0_debug_eret_epc,
+      debug_eret_target       => cop0_debug_eret_target,
+      debug_eret_flags        => cop0_debug_eret_flags,
+      debug_ds_count          => cop0_debug_ds_count,
+      debug_ds_first          => cop0_debug_ds_first,
+      debug_tlb_census        => cop0_debug_tlb_census,
+      debug_tlb_exc_stb       => cop0_debug_tlb_exc_stb,
+      exception               => exception,   
+      exceptionStage1         => exceptionStage1,   
+            
+      COP1_enable             => COP1_enable,
+      COP2_enable             => COP2_enable,
+      fpuRegMode              => fpuRegMode,
+      privilegeMode           => privilegeMode,
+      kusegUnmapped           => kusegUnmapped,
+      bit64region             => bit64region,
+      
+      writeEnable             => executeCOP0WriteEnable,
+      regIndex                => executeCOP0Register,
+      writeValue              => executeCOP0WriteValue,
+      readValue               => COP0ReadValue,
+      
+      executeSetLL            => executeSetLL,
+      executeLLfromTLB        => executeLLfromTLB,
+      executeLLAddr           => executeMemAddress,
+      
+      TagLo_Valid             => TagLo_Valid,
+      TagLo_Dirty             => TagLo_Dirty,
+      TagLo_Addr              => TagLo_Addr, 
+      
+      writeDatacacheTagEna    => writeDatacacheTagEna,      
+      writeDatacacheTagValue  => writeDatacacheTagValue,
+            
+      TLBR                    => execute_TLBR,  
+      TLBWI                   => execute_TLBWI, 
+      TLBWR                   => execute_TLBWR, 
+      TLBP                    => execute_TLBP,  
+      TLBDone                 => TLBDone,
+            
+      TLB_instrReq            => TLB_instrReq,
+      TLB_ss_load             => TLB_ss_load,
+      TLB_instrAddrIn         => FetchAddr,
+      TLB_instrUseCache       => TLB_instrUseCache,
+      TLB_instrStall          => TLB_instrStall,
+      TLB_instrUnStall        => TLB_instrUnStall,
+      TLB_instrAddrOutFound   => TLB_instrAddrOutFound,
+      TLB_instrAddrOutLookup  => TLB_instrAddrOutLookup,
+      
+      TLB_dataReq             => EXETLBDataAccess,   
+      TLB_dataIsWrite         => decodeMemWriteEnable or decodeMemWriteLL,   
+      TLB_dataAddrIn          => calcMemAddr,
+      TLB_dataUseCacheFound   => TLB_dataUseCacheFound,
+      TLB_dataUseCacheLookup  => TLB_dataUseCacheLookup,
+      TLB_dataStall           => TLB_dataStall,
+      TLB_dataUnStall         => TLB_dataUnStall,
+      TLB_dataAddrOutFound    => TLB_dataAddrOutFound,
+      TLB_dataAddrOutLookup   => TLB_dataAddrOutLookup,
+            
+      SS_reset                => SS_reset,    
+      loading_savestate       => loading_savestate,    
+      SS_DataWrite            => SS_DataWrite,
+      SS_Adr                  => SS_Adr,      
+      SS_wren_CPU             => SS_wren_CPU, 
+      SS_rden_CPU             => SS_rden_CPU 
+   );
+   
+   icpu_mul : entity work.cpu_mul
+   port map
+   (
+      clk       => clk93,
+      sign      => mulsign,
+      value1_in => mul1,
+      value2_in => mul2,
+      result    => mulResult
+   );
+   
+   idivider : entity work.divider
+   port map
+   (
+      clk       => clk93,      
+      start     => DIVstart,
+      is32      => DIVis32,
+      done      => open,      
+      busy      => open,
+      dividend  => DIVdividend, 
+      divisor   => DIVdivisor,  
+      quotient  => DIVquotient, 
+      remainder => DIVremainder
+   );
+   
+   icpu_FPU : entity work.cpu_FPU
+   port map
+   (
+      clk93             => clk93,         
+      reset             => reset_93, 
+      error_FPU         => error_FPU,
+      
+      -- synthesis translate_off
+      csr_export        => csr_export,
+      -- synthesis translate_on
+      
+      fpuRegMode        => fpuRegMode,      
+                                         
+      command_ena       => FPU_command_ena,
+      command_code      => opcode1,  
+      command_op1       => decodeFPUValue1,  
+      command_op2       => decodeFPUValue2,   
+      command_done      => FPU_command_done,
+      
+      transfer_ena      => FPU_TransferEna,
+      transfer_code     => decodeSource1(3 downto 0),
+      transfer_RD       => decodeRD,
+      transfer_value    => value2,
+      transfer_data     => FPU_TransferData,
+      
+      mul_result        => unsigned(mulResult),
+      
+      exceptionFPU      => exceptionFPU,
+      FPU_CF            => FPU_CF,
+                                      
+      FPUWriteTarget    => FPUWriteTarget,
+      FPUWriteData      => FPUWriteData,  
+      FPUWriteEnable    => FPUWriteEnable,
+      FPUWriteMask      => FPUWriteMask,
+      
+      SS_FPU_CF         => ss_in(24)(32),
+      SS_CSR            => unsigned(ss_in(24)(24 downto 0))
+   );
+   
+--##############################################################
+--############################### savestates
+--##############################################################
+
+   SS_idle <= '1';
+
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+      
+         ss_regs_load    <= '0';
+         ss_FPUregs_load <= '0';
+      
+         if (SS_reset = '1') then
+         
+            for i in 0 to 31 loop
+               ss_in(i) <= (others => '0');
+            end loop;
+            
+            ss_in(0)  <= x"FFFFFFFFBFC00000"; -- PC
+            
+            ss_regs_loading <= '1';
+            ss_regs_addr    <= (others => '0');
+            ss_regs_data    <= (others => '0');
+            ss_FPUregs_addr <= (others => '0');
+            ss_FPUregs_data <= (others => '0');
+            
+         elsif (SS_wren_CPU = '1' and SS_Adr < 32) then
+            ss_in(to_integer(SS_Adr)) <= SS_DataWrite;
+         elsif (SS_wren_CPU = '1' and SS_Adr >= 32 and SS_Adr < 64) then
+            ss_regs_load <= '1';
+            ss_regs_addr <= SS_Adr(4 downto 0);
+            ss_regs_data <= SS_DataWrite;
+         elsif (SS_wren_CPU = '1' and SS_Adr >= 96 and SS_Adr < 128) then
+            ss_FPUregs_load <= '1';
+            ss_FPUregs_addr <= SS_Adr(4 downto 0);
+            ss_FPUregs_data <= SS_DataWrite;
+         end if;
+         
+         if (ss_regs_loading = '1') then
+            ss_regs_load    <= '1';
+            ss_regs_addr    <= ss_regs_addr + 1;            
+            ss_FPUregs_load <= '1';
+            ss_FPUregs_addr <= ss_regs_addr + 1;
+            if (ss_regs_addr = 31) then
+               ss_regs_loading <= '0';
+            end if;
+         end if;
+      
+         --SS_idle <= '0';
+         --if (hiloWait = 0 and blockIRQ = '0' and (irqRequest = '0' or cop0_SR(0) = '0') and mem_done = '0') then
+         --   SS_idle <= '1';
+         --end if;
+      
+         --regsSS_rden <= '0';
+         --if (SS_rden_CPU = '1' and SS_Adr >= 32 and SS_Adr < 64) then
+         --   regsSS_address_b <= std_logic_vector(SS_Adr(4 downto 0));
+         --   regsSS_rden      <= '1';
+         --end if;
+         --
+         --if (regsSS_rden = '1') then
+         --   SS_DataRead_CPU <= regsSS_q_b;
+         --elsif (SS_rden_CPU = '1' and SS_Adr < 31) then
+         --   SS_DataRead_CPU <= ss_out(to_integer(SS_Adr));
+         --end if;
+      
+      end if;
+   end process;
+   
+   SS_DataRead_CPU <= (others => '0');
+   
+--##############################################################
+--############################### debug
+--##############################################################
+
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+      
+         error_stall <= '0';
+      
+         if (reset_93 = '1') then
+         
+            debugStallcounter <= (others => '0');
+            
+-- synthesis translate_off
+            stallcountNo      <= 0;
+            stallcount1       <= 0;
+            stallcount3       <= 0;
+            stallcount4       <= 0;
+            stallcountDMA     <= 0;
+-- synthesis translate_on
+      
+         elsif (ce_93 = '1') then
+         
+            if (stall = 0) then
+               debugStallcounter <= (others => '0');
+            elsif (cpuPaused = '0' and debugStallcounter(12) = '0') then
+               debugStallcounter <= debugStallcounter + 1;
+            end if;
+
+            if (stall /= 0 and debugStallcounter(12) = '1') then
+               error_stall <= '1';
+            end if;
+
+            -- Capture the first cycle over the threshold while the pipeline
+            -- is still stalled. Do not overwrite it on the recovery cycle.
+            
+-- synthesis translate_off
+            
+            if (stallcountNo = 0 and stallcount4 = 0 and stallcount3 = 0 and stallcount1 = 0 and stallcountDMA = 0) then
+               stallcountNo <= 0;
+            end if;
+            
+            -- performance counters
+            if (stall = 0) then
+               stallcountNo <= stallcountNo + 1;
+            elsif (stall4 = '1') then
+               stallcount4 <= stallcount4 + 1;
+            elsif (stall3 = '1') then
+               stallcount3 <= stallcount3 + 1;
+            elsif (stall1 = '1') then
+               stallcount1 <= stallcount1 + 1;
+            end if;
+            
+         else
+            
+            stallcountDMA <= stallcountDMA + 1;
+            
+-- synthesis translate_on
+            
+         end if;
+         
+      end if;
+   end process;
+   
+   
+
+end architecture;
+
+
+
+
+

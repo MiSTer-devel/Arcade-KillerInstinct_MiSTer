@@ -1,0 +1,7 @@
+temp0=0
+temp1=0
+temp2=0
+bpset 0x9FC009C0,temp0<10,{printf "RTIDX %d ptr=%08X idx=%02X",temp0,v0,a2;temp0=temp0+1;g}
+bpset 0x9FC009CC,temp1<10,{printf "RTVAL %d a2=%02X",temp1,a2;temp1=temp1+1;g}
+bpset 0x9FC00C0C,temp2<6,{printf "ASM %d s4=%08X t1=%02X t4=%02X t5=%02X t6=%02X t7=%02X s3=%02X",temp2,s4,t1,t4,t5,t6,t7,s3;temp2=temp2+1;g}
+go

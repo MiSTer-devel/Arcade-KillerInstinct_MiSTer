@@ -1,0 +1,6 @@
+temp0=0
+temp1=0
+bpset 0x88000000,1,{printf "HANDOFF pc=%08X",pc;g}
+bpset 0x8802DBC0,temp0<6,{printf "WAIT %d ra=%08X v1=%08X",temp0,ra,v1;temp0=temp0+1;g}
+bpset 0x8802DBD4,temp1<6,{printf "POLL %d at=%08X v0=%08X",temp1,at,v0;temp1=temp1+1;g}
+go

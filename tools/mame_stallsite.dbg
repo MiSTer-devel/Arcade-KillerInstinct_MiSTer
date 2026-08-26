@@ -1,0 +1,2 @@
+bpset 0x88000000,1,{dasm KillerInstinct_MiSTer/stallsite.asm,0x8802DB80,0xA0;printf "DASM WRITTEN pc=%08X",pc;g}
+go

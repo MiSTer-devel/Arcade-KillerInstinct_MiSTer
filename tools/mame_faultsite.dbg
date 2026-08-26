@@ -1,0 +1,2 @@
+bpset 0x88000000,1,{dasm KillerInstinct_MiSTer/faultsite.asm,0x8802DB00,0x90;printf "DASM WRITTEN";g}
+go

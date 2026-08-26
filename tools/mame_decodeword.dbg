@@ -1,0 +1,7 @@
+temp0=0
+temp1=0
+temp2=0
+bpset 0x9FC00744,1,{printf "PASS s5=%d t2=%08X a3=%08X s6=%08X t3=%08X",s5,t2,a3,s6,t3;g}
+bpset 0x9FC00770,temp0<26,{printf "DW %d s5=%d a2=%08X v0=%08X",temp0,s5,a2,v0;temp0=temp0+1;g}
+bpset 0x9FC00C68,temp1<12,{printf "OUT %d s5=%d a3=%08X t0=%08X",temp1,s5,a3,t0;temp1=temp1+1;g}
+go

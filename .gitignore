@@ -1,0 +1,62 @@
+# Simulation build output
+sim/build/
+sim/cpu_build/
+sim/cpu_trace_build/
+sim/cpu_bridge_build/
+sim/cpu_system_build/
+sim/datacache_build/
+sim/instrcache_build/
+sim/fifo_build/
+sim/cache_scanout_build/
+sim/icache_stream_build/
+sim/ata_pio_write_build/
+sim/fb_hw_build/
+sim/hybrid_sdram_test/
+sim/top_build/
+sim/top_build_v31/
+sim/top_build_v32/
+sim/top_hybrid_compile/
+sim/check_build/
+sim/media/
+sim/*.log
+sim/*.flag
+work/
+modelsim.ini
+transcript
+vsim.wlf
+
+# Quartus build state and artifacts
+output_files/
+db/
+incremental_db/
+greybox_tmp/
+*.qws
+*.rpt
+*.summary
+*.smsg
+*.pin
+*.jdi
+*.sof
+*.rbf
+*.done
+*.qdf
+*.bak
+c5_pin_model_dump.txt
+PLLJ_PLLSPE_INFO.txt
+
+# Regenerated per build
+build_id.v
+
+# Never commit ROM, CHD or disk-image data. The MRAs reference the unmodified
+# MAME zip names; the media itself lives outside this tree under ../games.
+*.img
+*.chd
+*.zip
+*.bin
+*.hex
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.orig
