@@ -5,7 +5,7 @@ by Killer Instinct (1994) and Killer Instinct 2 (1996).
 
 ## Current status
 
-Both KI1 and KI2 boot and are fully playable on DE10-Nano hardware. The core
+Both KI1 and KI2 boot and are fully playable on MiSTer. The core
 implements:
 
 - R4600-compatible MIPS III CPU execution, caches, exceptions and interrupts.
@@ -41,6 +41,7 @@ Place the resulting image files in their respective folders ```games/kinst/``` o
 
 
 ## Credits
+Core by Keith Conger
 
 R4300i CPU adapted from the [N64](https://github.com/MiSTer-devel/N64_MiSTer) MiSTer core
 
