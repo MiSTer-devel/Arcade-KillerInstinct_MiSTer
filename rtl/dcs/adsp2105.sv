@@ -9,7 +9,6 @@
 `define SYNTHESIS 1
 `endif
 `endif
-`include "dcs_mem.sv"
 
 module adsp2105 #(
     parameter PMFILE    = "pm.hex",
