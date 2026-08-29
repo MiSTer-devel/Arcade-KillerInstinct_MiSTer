@@ -19,6 +19,26 @@ entity cpu is
       -- KI instruction fetches use the unmapped KSEG0/KSEG1 path. The data TLB
       -- remains enabled for mapped data accesses.
       INSTR_KSEG_ONLY       : boolean := false;
+      -- Build the pre-event execution trace.
+      --
+      -- The trace is a diagnostic, and it is not free. debug_trace_bus is 896
+      -- bits leaving cpu:core for the top level, where a 736-bit shadow latches
+      -- it; the SDC false-paths all of it, so it never shows up in a timing
+      -- report, but it is still ~900 real wires anchoring stage-2 and stage-4
+      -- registers toward the debug screen. The CPU domain's critical paths are
+      -- 61-78% interconnect, so what the fitter can and cannot pack tightly is
+      -- exactly what bounds Fmax here.
+      --
+      -- Only the EXPORT is gated. The capture registers are written in the same
+      -- process as debug_ret_count's and debug_h1_op's counters, which feed
+      -- screen fields worth keeping, so they cannot be generate-guarded without
+      -- splitting that process. Left with no reader they are dead logic and
+      -- synthesis removes them, which reaches the same place with far less
+      -- disturbance to code that works.
+      --
+      -- Turning this off blanks the trace rows on the debug screen. Every other
+      -- field on that screen keeps working.
+      DEBUG_TRACE           : boolean := true;
       -- How long the CPU must go without executing any boot ROM before the
       -- restart detectors arm, in decodes. It has to be long enough that no
       -- excursion into RAM during boot can satisfy it, and short enough to arm
@@ -1387,42 +1407,50 @@ begin
                             debug_entry_count_register >= 1)
                       else '0';
 
-   debug_trace_frozen <= trace_frozen;
-
-   -- Export oldest first, so the debug page renders top to bottom in program
-   -- order and entry 7 is always the landing decode.
-   trace_export : for i in 0 to TRACE_DEPTH - 1 generate
-      debug_trace_bus(i * 64 + 63 downto i * 64 + 32) <=
-         trace_pc(TRACE_DEPTH - 1 - i);
-      debug_trace_bus(i * 64 + 31 downto i * 64) <=
-         trace_op(TRACE_DEPTH - 1 - i);
-      debug_trace_bus(512 + i * 4 + 3 downto 512 + i * 4) <=
-         trace_src(TRACE_DEPTH - 1 - i);
-   end generate;
-
-   debug_trace_bus(575 downto 544) <= trace_cause;
-   debug_trace_bus(607 downto 576) <= trace_epc;
-   debug_trace_bus(639 downto 608) <= store_addr_0;
-   debug_trace_bus(671 downto 640) <= store_data_0;
-   debug_trace_bus(703 downto 672) <= store_pc_0;
-   debug_trace_bus(735 downto 704) <= store_addr_1;
-   -- The capture's own provenance, in its own word rather than stolen bits.
-   --   [2:0]  which trigger froze the trace
-   --   [3]    end-of-boot gate, so an unarmed detector is visible as such
    debug_cop0_cause_live <= std_logic_vector(cop0_debug_cause);
    debug_cop0_epc_live   <= std_logic_vector(cop0_debug_epc);
-   debug_trace_bus(738 downto 736) <= trace_trigger_id;
-   debug_trace_bus(739)            <= game_running;
-   debug_trace_bus(799 downto 768) <= trace_badvaddr;
-   debug_trace_bus(831 downto 800) <= trace_s1;
-   debug_trace_bus(863 downto 832) <= trace_s2;
-   debug_trace_bus(895 downto 864) <= trace_tlb_census;
-   -- Fill starts at 740, not 739: widening trace_trigger_id to three bits
-   -- pushed game_running up one, and leaving the fill where it was gave bit
-   -- 739 two drivers. ModelSim resolved that silently; only the Quartus
-   -- analysis pass rejects it, which is why BRINGUP makes that pass mandatory
-   -- after any change that moves bits between fields.
-   debug_trace_bus(767 downto 740) <= (others => '0');
+
+   gtrace_export : if DEBUG_TRACE generate
+      debug_trace_frozen <= trace_frozen;
+
+      -- Export oldest first, so the debug page renders top to bottom in program
+      -- order and entry 7 is always the landing decode.
+      trace_export : for i in 0 to TRACE_DEPTH - 1 generate
+         debug_trace_bus(i * 64 + 63 downto i * 64 + 32) <=
+            trace_pc(TRACE_DEPTH - 1 - i);
+         debug_trace_bus(i * 64 + 31 downto i * 64) <=
+            trace_op(TRACE_DEPTH - 1 - i);
+         debug_trace_bus(512 + i * 4 + 3 downto 512 + i * 4) <=
+            trace_src(TRACE_DEPTH - 1 - i);
+      end generate;
+
+      debug_trace_bus(575 downto 544) <= trace_cause;
+      debug_trace_bus(607 downto 576) <= trace_epc;
+      debug_trace_bus(639 downto 608) <= store_addr_0;
+      debug_trace_bus(671 downto 640) <= store_data_0;
+      debug_trace_bus(703 downto 672) <= store_pc_0;
+      debug_trace_bus(735 downto 704) <= store_addr_1;
+      -- The capture's own provenance, in its own word rather than stolen bits.
+      --   [2:0]  which trigger froze the trace
+      --   [3]    end-of-boot gate, so an unarmed detector is visible as such
+      debug_trace_bus(738 downto 736) <= trace_trigger_id;
+      debug_trace_bus(739)            <= game_running;
+      debug_trace_bus(799 downto 768) <= trace_badvaddr;
+      debug_trace_bus(831 downto 800) <= trace_s1;
+      debug_trace_bus(863 downto 832) <= trace_s2;
+      debug_trace_bus(895 downto 864) <= trace_tlb_census;
+      -- Fill starts at 740, not 739: widening trace_trigger_id to three bits
+      -- pushed game_running up one, and leaving the fill where it was gave bit
+      -- 739 two drivers. ModelSim resolved that silently; only the Quartus
+      -- analysis pass rejects it, which is why BRINGUP makes that pass mandatory
+      -- after any change that moves bits between fields.
+      debug_trace_bus(767 downto 740) <= (others => '0');
+   end generate;
+
+   gtrace_off : if not DEBUG_TRACE generate
+      debug_trace_frozen <= '0';
+      debug_trace_bus    <= (others => '0');
+   end generate;
 
    process (clk93)
    begin
@@ -4109,20 +4137,58 @@ begin
                         end if;
                      end if;
                         
-                     if (TLB_dataStall = '1') then
-                        stall3              <= '1';
-                        executeStallFromMEM <= '0';
-                     end if; 
-                     
+                     -- The TLB stall term used to sit here, as the last
+                     -- assignment inside this nest. It is hoisted to the end of
+                     -- the process instead; see below.
+
                   end if;
-                  
+
                end if;
-               
-               
+
+
+            end if;
+
+            -- Hoisted TLB stall.
+            --
+            -- stall3 was the largest critical endpoint in the CPU domain when
+            -- this was written: 152 of the 300 worst setup paths ended here, and
+            -- the last thing to arrive is TLB_dataStall, which sits behind the
+            -- address adder and the mini-TLB CAM. Written inside the nest above,
+            -- this term reached stall3's D input through two levels of logic,
+            -- because synthesis has to interleave it with the enclosing
+            -- set/clear priority cone. Hoisted to the end of the process it is
+            -- one OR against everything else, and everything else settles well
+            -- before it does. It does remove stall3 from the critical set - but
+            -- see the note below on what that was worth.
+            --
+            -- No gate is needed, and that is not an approximation. This term
+            -- fired inside "stall = 0", "decodeNew = '1' and (exception = '0' or
+            -- exceptionAllowDelay = '1')" and "executeIgnoreNext = '0'", but
+            -- TLB_dataStall is TLB_dataReq and not mini_hit, and TLB_dataReq is
+            -- EXETLBDataAccess, which is already '0' unless exception = '0',
+            -- stall = 0, executeIgnoreNext = '0' and decodeNew = '1'. Every
+            -- enclosing condition is therefore implied by the term itself, so
+            -- the hoisted form fires on exactly the same cycles.
+            --
+            -- executeStallFromMEM comes with it and stays correct at the end.
+            -- The two earlier writes it must not disturb are the load-delay
+            -- block's clear, which requires stall3 = '1', and the TLB unstall's
+            -- set, which requires TLB_dataUnStall. Both imply stall /= 0, which
+            -- TLB_dataStall excludes, so neither can coincide with this one.
+            --
+            -- This did NOT raise Fmax. stall3 owned the most critical endpoints
+            -- but was not the binding path: instrcache_fill sat a fraction of a
+            -- ns behind and took over the moment stall3 was relieved. Kept
+            -- because it is free (+39 ALMs, no fanout change) and the cone binds
+            -- again once the I-cache tag path is fixed. Judge any successor with
+            -- a DSE sweep, not a single fit - one seed cannot resolve this.
+            if (TLB_dataStall = '1') then
+               stall3              <= '1';
+               executeStallFromMEM <= '0';
             end if;
 
          end if;
-         
+
       end if;
    end process;
    

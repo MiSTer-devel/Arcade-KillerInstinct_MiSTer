@@ -505,13 +505,8 @@ module ki_debug_screen (
         //                IDENTIFY, 20/21/C4 read sectors, 30/31/C5 write.
         //   digit  2     bit 3 irq line now, bit 2 irq_pending, bit 1 nIEN
         //                (interrupts DISABLED when set), bit 0 unused
-        //   digits 4-7   how many times the interrupt has been RAISED
-        //
-        // The raise count is the field that matters. A status-register read
-        // clears irq_pending - correct ATA - so the live line alone cannot
-        // distinguish "never asserted" from "asserted and consumed". If the
-        // count is non-zero the drive did its part and the loss is downstream
-        // in Cause; if it is zero the command never completed.
+        //   digits 3-4   the live sector-buffer index
+        //   digits 5-7   data-port writes accepted, the write-path counter
         // AF shows the worst output step and the same discontinuity count.
         14: begin
           if (column == 0) screen_char="A";

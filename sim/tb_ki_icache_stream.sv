@@ -99,7 +99,7 @@ module tb_ki_icache_stream;
     .bus_read_data(ata_read_data), .bus_done(ata_done), .irq(),
     .img_mounted(1'b0), .img_readonly(1'b0), .img_size(64'd1048576),
     .sd_lba(), .sd_rd(), .sd_wr(), .sd_ack(1'b0),
-    .sd_buff_addr(8'd0), .sd_buff_dout(16'd0),
+    .sd_buff_addr(13'd0), .sd_buff_dout(16'd0),
     .sd_buff_din(), .sd_buff_wr(1'b0),
     .debug_state(), .debug_status(), .debug_error(), .debug_image_ready(),
     .debug_info(), .debug_read_lba(), .debug_write_lba(),

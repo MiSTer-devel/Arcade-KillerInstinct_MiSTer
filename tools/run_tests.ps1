@@ -177,8 +177,9 @@ if ($LASTEXITCODE -ne 0) { throw 'instruction cache test failed' }
 & (Join-Path $PSScriptRoot 'run_cpu_trace_test.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'CPU pre-event trace test failed' }
 
-# The DCS audio board. adsp2105.sv `include`s dcs_mem.sv rather than compiling
-# it separately, so it needs its own script rather than the vlog flow above.
+# The DCS audio board. It needs its own script rather than the vlog flow above
+# because the benches build with +define+KI_DCS_SIMULATION, which selects the
+# behavioural memories and the simulation checks.
 # Covers the sparse Audio 2K ROM geometry, the host command mailbox, DDR
 # response capture and the mono PCM path.
 & (Join-Path $PSScriptRoot 'run_dcs_tests.ps1')

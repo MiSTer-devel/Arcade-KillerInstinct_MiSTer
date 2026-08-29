@@ -95,7 +95,8 @@ module tb_ki_ata_pio_write;
   wire  [31:0]  sd_lba;
   wire          sd_rd, sd_wr;
   logic         sd_ack = 1'b0;
-  logic  [7:0]  sd_buff_addr = 8'd0;
+  logic [12:0]  sd_buff_addr = 13'd0;
+  wire   [5:0]  sd_blk_cnt;
   logic [15:0]  sd_buff_dout = 16'd0;
   wire  [15:0]  sd_buff_din;
   logic         sd_buff_wr = 1'b0;
@@ -273,7 +274,7 @@ module tb_ki_ata_pio_write;
         sd_ack <= 1'b1;
         for (hps_index = 0; hps_index < BLOCK_WORDS; hps_index = hps_index + 1)
         begin
-          sd_buff_addr <= hps_index[7:0];
+          sd_buff_addr <= {5'd0, hps_index[7:0]};
           @(posedge clk);
           @(posedge clk);             // the sector buffer is registered
           disk_block[hps_index] = sd_buff_din;
