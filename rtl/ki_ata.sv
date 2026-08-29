@@ -19,10 +19,17 @@ module ki_ata (
   input  wire         img_readonly,
   input  wire  [63:0] img_size,
   output logic [31:0] sd_lba,
+  // Blocks-1 for the request being issued. hps_io reads this while sd_rd is
+  // up, so it is registered alongside sd_lba and held for the transfer.
+  output logic  [5:0] sd_blk_cnt,
   output logic        sd_rd,
   output logic        sd_wr,
   input  wire         sd_ack,
-  input  wire   [7:0] sd_buff_addr,
+  // Wide enough for a whole batch, not one sector. hps_io declares this
+  // [12:0] under WIDE(1) and counts 16-bit words across the entire multi-block
+  // transfer; the core previously took only the low 8 bits because it only
+  // ever asked for one 512-byte block.
+  input  wire  [12:0] sd_buff_addr,
   input  wire  [15:0] sd_buff_dout,
   output logic [15:0] sd_buff_din,
   input  wire         sd_buff_wr,
@@ -65,6 +72,15 @@ module ki_ata (
     ATA_SD_WRITE_WAIT
   } ata_state_t;
 
+  // Sector streaming.
+  localparam integer BATCH_SECTORS = 8;
+  localparam integer SECTOR_WORDS  = 256;
+  localparam integer BANK_WORDS    = BATCH_SECTORS * SECTOR_WORDS; // 2048
+  localparam integer BUF_WORDS     = 2 * BANK_WORDS;               // 4096
+  localparam integer BANK_AW       = $clog2(BANK_WORDS);           // 11
+  localparam integer BUF_AW        = $clog2(BUF_WORDS);            // 12
+  localparam integer SECT_AW       = $clog2(BATCH_SECTORS);        // 3
+
   ata_state_t state = ATA_IDLE;
   logic [7:0]  data_index;
   logic [7:0]  geom_sectors;
@@ -98,6 +114,32 @@ module ki_ata (
   logic        sd_ack_d;
   logic        identify_transfer;
 
+  // Read streaming state. read_active gates the fetch engine so it can never
+  // touch sd_rd while a write command owns the HPS handshake.
+  logic                 read_active;
+  logic                 fill_bank;    // bank the HPS is filling
+  logic                 drain_bank;   // bank the CPU is reading
+  logic           [1:0] bank_valid;
+  logic [SECT_AW:0]     bank_count [0:1]; // sectors actually held, 1..BATCH
+  logic [SECT_AW-1:0]   drain_sector;     // sector within the drain bank
+  logic           [8:0] fetch_remaining;  // sectors not yet asked of the HPS
+  logic           [8:0] deliver_remaining;// sectors not yet given to the CPU
+  logic [SECT_AW:0]     fetch_batch;      // sectors in the request in flight
+  logic                 fetch_busy;
+
+  // How many sectors the next request may cover: whatever is left of the
+  // command, capped at a batch, and capped again so a batch can never run off
+  // the end of the image. The single-sector path re-checked the bound on every
+  // sector because it re-entered ATA_READ_SETUP each time; batching has to
+  // carry that check into the request size instead.
+  wire [31:0] sectors_to_end = image_sectors - sd_lba;
+  wire  [8:0] fetch_avail    = (sectors_to_end > 32'd256)
+                                 ? 9'd256 : sectors_to_end[8:0];
+  wire  [8:0] fetch_cap      = (fetch_remaining > BATCH_SECTORS[8:0])
+                                 ? BATCH_SECTORS[8:0] : fetch_remaining;
+  wire  [8:0] fetch_want     = (fetch_cap > fetch_avail) ? fetch_avail
+                                                        : fetch_cap;
+
   assign debug_state = state;
   assign debug_status = status;
   assign debug_error = error_reg;
@@ -125,17 +167,34 @@ module ki_ata (
   assign bus_done = bus_access;
   assign irq = irq_pending && !device_control[1];
 
+  // Buffer addressing.
+  //
+  // Writes are untouched by the streaming work: they remain one sector at a
+  // time and use the first sector of bank 0, so both ports address the same
+  // 256 words the single-sector implementation used. Only reads see the banks.
+  wire hps_write_mode = (state == ATA_PIO_WRITE) || (state == ATA_SD_WRITE_WAIT);
+
+  wire [BUF_AW-1:0] buf_cpu_addr =
+      (state == ATA_PIO_WRITE)
+        ? {{(BUF_AW-8){1'b0}}, data_index}
+        : {drain_bank, drain_sector, data_index};
+
+  wire [BUF_AW-1:0] buf_hps_addr =
+      hps_write_mode
+        ? {{(BUF_AW-8){1'b0}}, sd_buff_addr[7:0]}
+        : {fill_bank, sd_buff_addr[BANK_AW-1:0]};
+
 `ifdef ALTERA_RESERVED_QIS
   altsyncram sector_buffer (
     .clock0(clk),
-    .address_a(data_index),
+    .address_a(buf_cpu_addr),
     .data_a(bus_write_data[15:0]),
     .wren_a(cpu_buffer_write),
     .byteena_a(bus_byte_enable[1:0]),
     .q_a(cpu_buffer_data),
 
     .clock1(clk),
-    .address_b(sd_buff_addr),
+    .address_b(buf_hps_addr),
     .data_b(sd_buff_dout),
     .wren_b(sd_ack && sd_buff_wr),
     .byteena_b(1'b1),
@@ -154,12 +213,12 @@ module ki_ata (
     .rden_b(1'b1)
   );
   defparam
-    sector_buffer.numwords_a = 256,
-    sector_buffer.widthad_a = 8,
+    sector_buffer.numwords_a = BUF_WORDS,
+    sector_buffer.widthad_a = BUF_AW,
     sector_buffer.width_a = 16,
     sector_buffer.width_byteena_a = 2,
-    sector_buffer.numwords_b = 256,
-    sector_buffer.widthad_b = 8,
+    sector_buffer.numwords_b = BUF_WORDS,
+    sector_buffer.widthad_b = BUF_AW,
     sector_buffer.width_b = 16,
     sector_buffer.width_byteena_b = 1,
     sector_buffer.address_reg_b = "CLOCK1",
@@ -180,28 +239,28 @@ module ki_ata (
     sector_buffer.read_during_write_mode_port_b = "NEW_DATA_NO_NBE_READ",
     sector_buffer.wrcontrol_wraddress_reg_b = "CLOCK1";
 `else
-  logic [15:0] simulation_sector_buffer [0:255];
+  logic [15:0] simulation_sector_buffer [0:BUF_WORDS-1];
 
-  logic [7:0] sim_data_index_q;
-  logic [7:0] sim_sd_buff_addr_q;
+  logic [BUF_AW-1:0] sim_cpu_addr_q;
+  logic [BUF_AW-1:0] sim_hps_addr_q;
 
   always_ff @(posedge clk) begin
-    sim_data_index_q   <= data_index;
-    sim_sd_buff_addr_q <= sd_buff_addr;
+    sim_cpu_addr_q <= buf_cpu_addr;
+    sim_hps_addr_q <= buf_hps_addr;
   end
 
-  assign cpu_buffer_data = simulation_sector_buffer[sim_data_index_q];
-  assign sd_buff_din = simulation_sector_buffer[sim_sd_buff_addr_q];
+  assign cpu_buffer_data = simulation_sector_buffer[sim_cpu_addr_q];
+  assign sd_buff_din = simulation_sector_buffer[sim_hps_addr_q];
 
   always_ff @(posedge clk) begin
     if (cpu_buffer_write) begin
       if (bus_byte_enable[0])
-        simulation_sector_buffer[data_index][7:0] <= bus_write_data[7:0];
+        simulation_sector_buffer[buf_cpu_addr][7:0] <= bus_write_data[7:0];
       if (bus_byte_enable[1])
-        simulation_sector_buffer[data_index][15:8] <= bus_write_data[15:8];
+        simulation_sector_buffer[buf_cpu_addr][15:8] <= bus_write_data[15:8];
     end
     if (sd_ack && sd_buff_wr)
-      simulation_sector_buffer[sd_buff_addr] <= sd_buff_dout;
+      simulation_sector_buffer[buf_hps_addr] <= sd_buff_dout;
   end
 `endif
 
@@ -329,6 +388,10 @@ module ki_ata (
       state <= ATA_IDLE;
       sd_rd <= 1'b0;
       sd_wr <= 1'b0;
+      fetch_busy <= 1'b0;
+      bank_valid <= 2'b00;
+      fetch_remaining <= 9'd0;
+      deliver_remaining <= 9'd0;
     end
   endtask
 
@@ -368,9 +431,21 @@ module ki_ata (
       image_sectors     <= 32'h0000_0000;
       identify_transfer <= 1'b0;
       sd_lba            <= 32'h0000_0000;
+      sd_blk_cnt        <= 6'd0;
       sd_rd             <= 1'b0;
       sd_wr             <= 1'b0;
       sd_ack_d          <= 1'b0;
+      read_active       <= 1'b0;
+      fill_bank         <= 1'b0;
+      drain_bank        <= 1'b0;
+      bank_valid        <= 2'b00;
+      bank_count[0]     <= '0;
+      bank_count[1]     <= '0;
+      drain_sector      <= '0;
+      fetch_remaining   <= 9'd0;
+      deliver_remaining <= 9'd0;
+      fetch_batch       <= '0;
+      fetch_busy        <= 1'b0;
     end else begin
       // Count the write handshake from both ends: every sector this core asks
       // the HPS to commit, and every one the HPS acknowledges. If issued
@@ -413,13 +488,57 @@ module ki_ata (
       image_readonly <= img_readonly;
       image_sectors  <= img_size[40:9];
 
+      // READ SECTORS no longer issues the transfer itself. It validates the
+      // request and hands off to the fetch engine below, which owns sd_rd for
+      // the whole command and runs ahead of the host.
       if (state == ATA_READ_SETUP) begin
         if (!image_ready || sd_lba >= image_sectors) begin
           command_abort();
+          read_active <= 1'b0;
         end else begin
-          sd_rd <= 1'b1;
           state <= ATA_SD_READ_WAIT;
         end
+      end
+
+      // ---- fetch engine -------------------------------------------------
+      // Fills whichever bank is free, independently of what the host is
+      // draining. This is the prefetch: while ATA_PIO_READ hands one bank to
+      // the CPU 260 ns at a time, the HPS round trip for the next batch is
+      // already in flight against the other.
+      if (read_active && !fetch_busy && fetch_remaining != 9'd0 &&
+          !bank_valid[fill_bank]) begin
+        if (!image_ready || sd_lba >= image_sectors || fetch_want == 9'd0) begin
+          command_abort();
+          read_active <= 1'b0;
+        end else begin
+          sd_blk_cnt  <= fetch_want[5:0] - 6'd1;
+          fetch_batch <= fetch_want[SECT_AW:0];
+          sd_rd       <= 1'b1;
+          fetch_busy  <= 1'b1;
+        end
+      end
+
+      if (fetch_busy && sd_ack && !sd_ack_d)
+        sd_rd <= 1'b0;
+
+      if (fetch_busy && !sd_ack && sd_ack_d) begin
+        bank_valid[fill_bank] <= 1'b1;
+        bank_count[fill_bank] <= fetch_batch;
+        fetch_remaining       <= fetch_remaining - {5'd0, fetch_batch};
+        sd_lba                <= sd_lba + {28'd0, fetch_batch};
+        fill_bank             <= ~fill_bank;
+        fetch_busy            <= 1'b0;
+      end
+
+      // ---- drain start ---------------------------------------------------
+      // ATA_SD_READ_WAIT now means "the host is waiting for its bank", not
+      // "a request is in flight". When the prefetch has already landed this
+      // fires the cycle after the previous bank was released.
+      if (read_active && state == ATA_SD_READ_WAIT && bank_valid[drain_bank]) begin
+        data_index  <= 8'h00;
+        status      <= ATA_DRQ;
+        irq_pending <= 1'b1;
+        state       <= ATA_PIO_READ;
       end
 
       if (state == ATA_WRITE_SETUP) begin
@@ -430,16 +549,6 @@ module ki_ata (
           status      <= ATA_DRQ;
           state       <= ATA_PIO_WRITE;
         end
-      end
-
-      if (state == ATA_SD_READ_WAIT && sd_ack && !sd_ack_d)
-        sd_rd <= 1'b0;
-
-      if (state == ATA_SD_READ_WAIT && !sd_ack && sd_ack_d) begin
-        data_index  <= 8'h00;
-        status      <= ATA_DRQ;
-        irq_pending <= 1'b1;
-        state       <= ATA_PIO_READ;
       end
 
       if (state == ATA_SD_WRITE_WAIT && sd_ack && !sd_ack_d)
@@ -464,17 +573,38 @@ module ki_ata (
 
         if (cs0_selected && cs0_register == 3'd0 && state == ATA_PIO_READ) begin
           if (data_index == 8'hff) begin
-            if (sectors_remaining > 1) begin
-              sectors_remaining <= sectors_remaining - 1'b1;
-              sd_lba            <= sd_lba + 1'b1;
-              sd_rd             <= 1'b1;
-              status            <= ATA_BUSY;
-              irq_pending       <= 1'b0;
-              state             <= ATA_SD_READ_WAIT;
-            end else begin
-              status <= ATA_READY;
-              state  <= ATA_IDLE;
+            if (identify_transfer) begin
+              // IDENTIFY is answered from identify_word(), never the buffer,
+              // and is always exactly one sector.
+              status            <= ATA_READY;
+              state             <= ATA_IDLE;
               identify_transfer <= 1'b0;
+            end else if (deliver_remaining <= 9'd1) begin
+              // Last sector of the command.
+              bank_valid[drain_bank] <= 1'b0;
+              deliver_remaining      <= 9'd0;
+              read_active            <= 1'b0;
+              status                 <= ATA_READY;
+              state                  <= ATA_IDLE;
+            end else begin
+              deliver_remaining <= deliver_remaining - 1'b1;
+              data_index        <= 8'h00;
+              if ({1'b0, drain_sector} + 1'b1 < bank_count[drain_bank]) begin
+                // Another sector is already sitting in this bank. No HPS
+                // round trip, no BUSY gap - straight on to the next DRQ.
+                drain_sector <= drain_sector + 1'b1;
+                status       <= ATA_DRQ;
+                irq_pending  <= 1'b1;
+              end else begin
+                // Bank exhausted. Release it so the fetch engine can refill
+                // it, and switch to the one the prefetch has been filling.
+                bank_valid[drain_bank] <= 1'b0;
+                drain_bank             <= ~drain_bank;
+                drain_sector           <= '0;
+                status                 <= ATA_BUSY;
+                irq_pending            <= 1'b0;
+                state                  <= ATA_SD_READ_WAIT;
+              end
             end
           end else begin
             data_index <= data_index + 1'b1;
@@ -492,6 +622,14 @@ module ki_ata (
             irq_pending       <= 1'b0;
             sd_rd             <= 1'b0;
             sd_wr             <= 1'b0;
+            read_active       <= 1'b0;
+            fetch_busy        <= 1'b0;
+            bank_valid        <= 2'b00;
+            fill_bank         <= 1'b0;
+            drain_bank        <= 1'b0;
+            drain_sector      <= '0;
+            fetch_remaining   <= 9'd0;
+            deliver_remaining <= 9'd0;
             data_index        <= 8'h00;
             sectors_remaining <= 9'd0;
           end
@@ -521,6 +659,10 @@ module ki_ata (
                 8'hec: begin
                   data_index        <= 8'h00;
                   sectors_remaining <= 9'd1;
+                  read_active       <= 1'b0;
+                  fetch_busy        <= 1'b0;
+                  bank_valid        <= 2'b00;
+                  sd_rd             <= 1'b0;
                   identify_transfer <= 1'b1;
                   status            <= ATA_DRQ;
                   error_reg         <= 8'h00;
@@ -531,13 +673,27 @@ module ki_ata (
                   identify_transfer <= 1'b0;
                   sd_lba            <= selected_lba();
                   last_read_lba     <= selected_lba();
-                  sectors_remaining <= (sector_count == 0) ? 9'd256 : {1'b0, sector_count};
+                  fetch_remaining   <= (sector_count == 0) ? 9'd256 : {1'b0, sector_count};
+                  deliver_remaining <= (sector_count == 0) ? 9'd256 : {1'b0, sector_count};
+                  read_active       <= 1'b1;
+                  sd_rd             <= 1'b0;
+                  fill_bank         <= 1'b0;
+                  drain_bank        <= 1'b0;
+                  drain_sector      <= '0;
+                  bank_valid        <= 2'b00;
+                  fetch_busy        <= 1'b0;
+                  data_index        <= 8'h00;
                   status            <= ATA_BUSY;
                   error_reg         <= 8'h00;
                   state             <= ATA_READ_SETUP;
                 end
                 8'h30, 8'h31, 8'hc5: begin
                   identify_transfer <= 1'b0;
+                  read_active       <= 1'b0;
+                  fetch_busy        <= 1'b0;
+                  bank_valid        <= 2'b00;
+                  sd_rd             <= 1'b0;
+                  sd_blk_cnt        <= 6'd0;
                   sd_lba            <= selected_lba();
                   last_write_lba    <= selected_lba();
                   if (write_cmds != 12'hfff) write_cmds <= write_cmds + 1'b1;

@@ -140,7 +140,8 @@ module tb_ki_cpu_system_boot;
     logic        sd_rd;
     logic        sd_wr;
     logic        sd_ack;
-    logic [7:0]  sd_buff_addr;
+    logic [12:0] sd_buff_addr;
+    logic  [5:0] sd_blk_cnt;
     logic [15:0] sd_buff_dout;
     logic [15:0] sd_buff_din;
     logic        sd_buff_wr;
@@ -697,7 +698,7 @@ module tb_ki_cpu_system_boot;
             end
         end else if (disk_active) begin
             if (disk_phase < 256) begin
-                sd_buff_addr <= disk_phase[7:0];
+                sd_buff_addr <= {5'd0, disk_phase[7:0]};
                 if (!disk_is_write) begin
                     disk_word = disk_phase * 2;
                     sd_buff_dout <= {

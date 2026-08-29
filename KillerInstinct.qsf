@@ -59,7 +59,7 @@ set_global_assignment -name ROUTER_TIMING_OPTIMIZATION_LEVEL MAXIMUM
 # on the 75 MHz CPU domain. Hold is not the same risk class as setup: it
 # fails on FAST silicon and when cold, and corrupts data non-deterministically,
 # so a hold-violating build cannot be trusted for a data-integrity test.
-set_global_assignment -name SEED 7
+set_global_assignment -name SEED 43
 
 # Framebuffer mode is enabled after the DDR3 memory controller is integrated.
 # set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"

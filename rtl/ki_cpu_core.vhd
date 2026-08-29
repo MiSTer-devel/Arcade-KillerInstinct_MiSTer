@@ -3,6 +3,16 @@ use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
 entity ki_cpu_core is
+   generic
+   (
+      -- Build the CPU's pre-event execution trace. See cpu.vhd's generic of
+      -- the same name for what it costs and what turning it off blanks.
+      --
+      -- Integer, not boolean, because this crosses the language boundary: the
+      -- instantiation is in KillerInstinct.sv and Quartus will not convert a
+      -- SystemVerilog bit into a VHDL boolean. Converted below.
+      DEBUG_TRACE    : integer := 1
+   );
    port
    (
       clk1x          : in  std_logic;
@@ -97,7 +107,8 @@ begin
          -- KI does not use the optional trap-instruction exception path.
          NO_TRAP_INSTR        => true,
          -- KI instruction fetches use KSEG0/KSEG1.
-         INSTR_KSEG_ONLY      => true
+         INSTR_KSEG_ONLY      => true,
+         DEBUG_TRACE          => (DEBUG_TRACE /= 0)
       )
       port map
       (

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Killer Instinct MiSTer board-shell bring-up top level.
 
+// Comment this line out for a release build.
+//`define KI_DEBUG_BUILD
+
 module emu
 (
 	input         CLK_50M,
@@ -121,11 +124,13 @@ localparam CONF_STR = {
 	"-;",
 	"DIP;",
 	"-;",
+`ifdef KI_DEBUG_BUILD
 	"P2,Debug;",
 	"P2O4,Video Output,Game,Debug;",
 	"P2O5,Debug Page,Status,Trace;",
 	"P2O3,FPS Overlay,Off,On;",
 	"-;",
+`endif
 	"R0,Reset;",
 	"J1,High Quick,High Medium,High Fierce,Low Quick,Low Medium,Low Fierce,Start,Coin,Service,Test;",
 	"V,1.59"
@@ -149,10 +154,11 @@ wire [63:0] img_size;
 wire hdd_image_present = (img_size >= 64'd512);
 wire startup_osd_button;
 wire [31:0] sd_lba;
+wire [5:0] sd_blk_cnt;
 wire sd_rd;
 wire sd_wr;
 wire sd_ack;
-wire [7:0] sd_buff_addr;
+wire [12:0] sd_buff_addr;
 wire [15:0] sd_buff_dout;
 wire [15:0] sd_buff_din;
 wire sd_buff_wr;
@@ -203,7 +209,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.ioctl_din(16'h0000),
 	.ioctl_wait(ioctl_wait),
 	.sd_lba('{sd_lba}),
-	.sd_blk_cnt('{6'd0}),
+	.sd_blk_cnt('{sd_blk_cnt}),
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
 	.sd_ack(sd_ack),
@@ -606,6 +612,28 @@ wire [7:0] debug_ata_status;
 wire [7:0] debug_ata_error;
 wire debug_ata_image_ready;
 wire [31:0] debug_ata_info;
+
+// Release switch for everything diagnostic; driven by KI_DEBUG_BUILD at the
+// top of this file, which also decides whether CONF_STR carries the Debug page.
+`ifdef KI_DEBUG_BUILD
+localparam DEBUG_BUILD = 1;
+`else
+localparam DEBUG_BUILD = 0;
+`endif
+
+// Build the CPU's pre-event execution trace.
+//
+// Set to 0 for builds where CPU Fmax is what matters. It removes the 896-bit
+// debug_trace_bus leaving cpu:core, the 736-bit shadow that latches it here,
+// and - by leaving them unread - the trace capture registers inside the CPU.
+// The SDC false-paths all of it so none of it appears in a timing report, but
+// it is ~900 wires pulling CPU registers toward the debug screen, and this
+// design's CPU paths are 61-78% interconnect.
+//
+// The debug screen itself stays either way. Only its trace rows go blank.
+// Separate from DEBUG_BUILD so the trace - which is the part that anchors CPU
+// placement - can be dropped while keeping the screen.
+localparam DEBUG_TRACE = DEBUG_BUILD;
 reg [31:0] debug_ata_info_meta = 32'h0000_0000;
 reg [31:0] debug_ata_info_sync = 32'h0000_0000;
 wire [18:0] framebuffer_base;
@@ -954,7 +982,7 @@ always @(posedge clk_core) begin
 	end
 end
 
-ki_cpu_core cpu
+ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 (
 	.clk1x(clk_core),
 	.clk93(clk_cpu_75),
@@ -994,30 +1022,43 @@ ki_cpu_core cpu
 	.debug_retire_opcode()
 );
 
-// Latch the frozen trace once, on the clk_core side. See the declaration
-// comment for why this is a single wide capture instead of the usual per-bit
-// two-flop sync.
-always @(posedge clk_core) begin
-	debug_trace_frozen_meta <= debug_cpu_trace_frozen;
-	debug_trace_frozen_sync <= debug_trace_frozen_meta;
+generate if (DEBUG_TRACE) begin : g_trace_shadow
+	// Latch the frozen trace once, on the clk_core side. See the declaration
+	// comment for why this is a single wide capture instead of the usual per-bit
+	// two-flop sync.
+	always @(posedge clk_core) begin
+		debug_trace_frozen_meta <= debug_cpu_trace_frozen;
+		debug_trace_frozen_sync <= debug_trace_frozen_meta;
 
-	if(shell_reset) begin
-		debug_trace_frozen_meta <= 1'b0;
-		debug_trace_frozen_sync <= 1'b0;
-		debug_trace_settle <= 5'd0;
-		debug_trace_valid <= 1'b0;
-		debug_trace_shadow <= 896'd0;
-	end else if(!debug_trace_valid) begin
-		if(!debug_trace_frozen_sync) begin
+		if(shell_reset) begin
+			debug_trace_frozen_meta <= 1'b0;
+			debug_trace_frozen_sync <= 1'b0;
 			debug_trace_settle <= 5'd0;
-		end else if(debug_trace_settle != DEBUG_TRACE_SETTLE[4:0]) begin
-			debug_trace_settle <= debug_trace_settle + 5'd1;
-		end else begin
-			debug_trace_shadow <= debug_cpu_trace_bus;
-			debug_trace_valid <= 1'b1;
+			debug_trace_valid <= 1'b0;
+			debug_trace_shadow <= 896'd0;
+		end else if(!debug_trace_valid) begin
+			if(!debug_trace_frozen_sync) begin
+				debug_trace_settle <= 5'd0;
+			end else if(debug_trace_settle != DEBUG_TRACE_SETTLE[4:0]) begin
+				debug_trace_settle <= debug_trace_settle + 5'd1;
+			end else begin
+				debug_trace_shadow <= debug_cpu_trace_bus;
+				debug_trace_valid <= 1'b1;
+			end
 		end
 	end
-end
+end else begin : g_no_trace_shadow
+	// Nothing to latch: cpu.vhd drives the bus to zero when the trace is not
+	// built, so the shadow and its settle counter would be 896 registers
+	// holding a constant.
+	always @(posedge clk_core) begin
+		debug_trace_frozen_meta <= 1'b0;
+		debug_trace_frozen_sync <= 1'b0;
+		debug_trace_settle      <= 5'd0;
+		debug_trace_valid       <= 1'b0;
+		debug_trace_shadow      <= 896'd0;
+	end
+end endgenerate
 
 ki_memory_bridge memory_bridge
 (
@@ -1296,6 +1337,7 @@ ki_ata ata
 	.img_readonly(img_readonly),
 	.img_size(img_size),
 	.sd_lba(sd_lba),
+	.sd_blk_cnt(sd_blk_cnt),
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
 	.sd_ack(sd_ack),
@@ -1334,69 +1376,79 @@ wire [6:0] fps_value;
 wire fps_box_pixel;
 wire fps_glyph_pixel;
 
-ki_fps_overlay fps_overlay
-(
-	.clk(clk_core),
-	.reset(core_reset),
-	.frame_start(frame_start),
-	.timing_60hz(crt_60hz),
-	.framebuffer_base(framebuffer_base),
-	.h_count(h_count),
-	.v_count(v_count),
-	.fps(fps_value),
-	.box_pixel(fps_box_pixel),
-	.glyph_pixel(fps_glyph_pixel)
-);
+generate if (DEBUG_BUILD) begin : g_overlays
+	ki_fps_overlay fps_overlay
+	(
+		.clk(clk_core),
+		.reset(core_reset),
+		.frame_start(frame_start),
+		.timing_60hz(crt_60hz),
+		.framebuffer_base(framebuffer_base),
+		.h_count(h_count),
+		.v_count(v_count),
+		.fps(fps_value),
+		.box_pixel(fps_box_pixel),
+		.glyph_pixel(fps_glyph_pixel)
+	);
 
-ki_debug_screen debug_screen
-(
-	.clk(clk_core),
-	.frame_start(frame_start),
-	.h_count(h_count),
-	.v_count(v_count),
-	.display_enable(VGA_DE),
-	.cpu_reset(cpu_reset),
-	.boot_loaded(boot_loaded),
-	.pll_locked(pll_locked),
-	.image_present((img_size >= 64'd512) | debug_ata_image_ready),
-	.cpu_errors(cpu_errors),
-	.cpu_pc(debug_cpu_pc_sync),
-	.cpu_retired(debug_cpu_retired_sync),
-	.cpu_irq_count(debug_cpu_irq_count_sync),
-	.cpu_prev_op(debug_ds_first_sync),
-	.cpu_ret_prev(debug_eret_target_sync),
-	.cpu_eret_flags(debug_eret_flags_sync),
-	.cpu_ret_count(debug_restart_info),
-	.cpu_ret_pc(debug_ds_count_sync),
-	.pcm_health(dcs_pcm_health),
-	.pcm_level(dcs_pcm_level),
-	.cpu_response_status(debug_eret_epc_sync),
-	.reset_info(debug_reset_info),
-	.reset_first(debug_reset_first),
-	.ata_info(debug_ata_info_sync),
-	.cpu_t2_reload_count(debug_cpu_t2_reload_count_sync),
-	.video_max_v_count(video_max_v_count),
-	.video_vblank_seen(video_vblank_seen),
-	.cpu_vblank_seen(debug_vblank_cpu_seen),
-	.vblank_count(video_vblank_count),
-	.ata_state(debug_ata_state),
-	.ata_status(debug_ata_status),
-	.ata_error(debug_ata_error),
-	// Page 1 is the frozen pre-event trace. It is fed from the clk_core
-	// shadow, not from the CPU domain directly, so what is on screen is a
-	// coherent capture rather than a live sample of a 736-bit bus.
-	.page(status[5]),
-	.trace_bus(debug_trace_shadow),
-	.trace_valid(debug_trace_valid),
-	.bist_done(bist_done),
-	.bist_pass(bist_pass),
-	.bist_error_count(bist_error_count),
-	.bist_first_bad_expected(bist_first_bad_expected),
-	.bist_first_bad_actual(bist_first_bad_actual),
-	.red(debug_red),
-	.green(debug_green),
-	.blue(debug_blue)
-);
+	ki_debug_screen debug_screen
+	(
+		.clk(clk_core),
+		.frame_start(frame_start),
+		.h_count(h_count),
+		.v_count(v_count),
+		.display_enable(VGA_DE),
+		.cpu_reset(cpu_reset),
+		.boot_loaded(boot_loaded),
+		.pll_locked(pll_locked),
+		.image_present((img_size >= 64'd512) | debug_ata_image_ready),
+		.cpu_errors(cpu_errors),
+		.cpu_pc(debug_cpu_pc_sync),
+		.cpu_retired(debug_cpu_retired_sync),
+		.cpu_irq_count(debug_cpu_irq_count_sync),
+		.cpu_prev_op(debug_ds_first_sync),
+		.cpu_ret_prev(debug_eret_target_sync),
+		.cpu_eret_flags(debug_eret_flags_sync),
+		.cpu_ret_count(debug_restart_info),
+		.cpu_ret_pc(debug_ds_count_sync),
+		.pcm_health(dcs_pcm_health),
+		.pcm_level(dcs_pcm_level),
+		.cpu_response_status(debug_eret_epc_sync),
+		.reset_info(debug_reset_info),
+		.reset_first(debug_reset_first),
+		.ata_info(debug_ata_info_sync),
+		.cpu_t2_reload_count(debug_cpu_t2_reload_count_sync),
+		.video_max_v_count(video_max_v_count),
+		.video_vblank_seen(video_vblank_seen),
+		.cpu_vblank_seen(debug_vblank_cpu_seen),
+		.vblank_count(video_vblank_count),
+		.ata_state(debug_ata_state),
+		.ata_status(debug_ata_status),
+		.ata_error(debug_ata_error),
+		// Page 1 is the frozen pre-event trace. It is fed from the clk_core
+		// shadow, not from the CPU domain directly, so what is on screen is a
+		// coherent capture rather than a live sample of a 736-bit bus.
+		.page(status[5]),
+		.trace_bus(debug_trace_shadow),
+		.trace_valid(debug_trace_valid),
+		.bist_done(bist_done),
+		.bist_pass(bist_pass),
+		.bist_error_count(bist_error_count),
+		.bist_first_bad_expected(bist_first_bad_expected),
+		.bist_first_bad_actual(bist_first_bad_actual),
+		.red(debug_red),
+		.green(debug_green),
+		.blue(debug_blue)
+	);
+end else begin : g_no_overlays
+	// Release: nothing renders. The video mux below folds these constants
+	// away, so neither overlay nor the registers feeding them are built.
+	assign fps_box_pixel   = 1'b0;
+	assign fps_glyph_pixel = 1'b0;
+	assign debug_red       = 8'h00;
+	assign debug_green     = 8'h00;
+	assign debug_blue      = 8'h00;
+end endgenerate
 
 reg [7:0] red;
 reg [7:0] green;
@@ -1406,8 +1458,9 @@ always @(*) begin
 	green = 8'h00;
 	blue = 8'h00;
 	if(VGA_DE) begin
-		// Game or Debug.
-		if(!status[4]) begin
+		// Game or Debug. With DEBUG_BUILD off there is no debug raster to
+		// select, so the option falls back to the game instead of black.
+		if(!DEBUG_BUILD || !status[4]) begin
 			red = framebuffer_red;
 			green = framebuffer_green;
 			blue = framebuffer_blue;
@@ -1478,3 +1531,5 @@ assign FB_PAL_WR = 1'b0;
 `endif
 
 endmodule
+
+`undef KI_DEBUG_BUILD

@@ -1,5 +1,2 @@
-# DCS audio board. dcs_mem.sv is `include`d by adsp2105.sv rather than compiled
-# separately, so it must NOT be listed here - but SEARCH_PATH must be, or the
-# include cannot resolve.
-set_global_assignment -name SEARCH_PATH rtl/dcs
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dcs/dcs_mem.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dcs/adsp2105.sv
