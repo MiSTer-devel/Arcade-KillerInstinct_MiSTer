@@ -329,9 +329,34 @@ module tb_ki_memory_bridge;
         @(posedge clk);
         #1;
         timeout = timeout + 1;
-        if (timeout > 200)
+        if (timeout > 800)
           $fatal(1, "CPU transaction timed out");
       end
+    end
+  endtask
+
+  // Count only the explicit EPROM-ready stall, excluding the memory path's
+  // ordinary return latency. No SDRAM request may escape before that original
+  // board timing has elapsed.
+  task automatic wait_boot_rom_delay(input integer expected_cycles);
+    integer delay_cycles;
+    integer reads_before;
+    begin
+      delay_cycles = 0;
+      reads_before = sdram_read_request_count;
+      while (dut.boot_rom_wait_cycles != 0) begin
+        @(posedge clk);
+        #1;
+        delay_cycles = delay_cycles + 1;
+        if (delay_cycles > 600)
+          $fatal(1, "boot-ROM ready delay did not finish");
+      end
+      assert (delay_cycles == expected_cycles)
+        else $fatal(1,
+            "boot-ROM ready delay was %0d clocks, expected %0d",
+            delay_cycles, expected_cycles);
+      assert (sdram_read_request_count == reads_before)
+        else $fatal(1, "boot-ROM memory request escaped during ready delay");
     end
   endtask
 
@@ -404,13 +429,26 @@ module tb_ki_memory_bridge;
     assert (ddram_write_count == 0)
       else $fatal(1, "boot loader incorrectly consumed DDR3");
 
-    // A real boot fetch must return the MIPS jump 0x0bf000e2 first.
+    // MAME's 32-bit EPROM read owes 128 R4600 execution cycles. Its scheduler
+    // runs two cycles per 100 MHz CPU clock, so this is 32 clocks in the
+    // 50 MHz bridge before even the on-chip boot cache answers.
     reset = 1'b0;
     cpu_rnw = 1'b1;
     cpu_address = 32'h1fc0_0000;
+    cpu_req64 = 1'b0;
+    cpu_size = 3'd1;
+    issue_cpu_request();
+    wait_boot_rom_delay(32);
+    wait_cpu_done();
+    assert (cpu_data_read[31:0] == 32'h0bf0_00e2)
+      else $fatal(1, "32-bit boot cache read returned incorrect data");
+
+    // A real 64-bit boot fetch must return the MIPS jump 0x0bf000e2 first and
+    // owes twice the 32-bit delay.
     cpu_req64 = 1'b1;
     cpu_size = 3'd1;
     issue_cpu_request();
+    wait_boot_rom_delay(64);
     wait_cpu_done();
     assert (cpu_cache_data == 64'h0000_0000_0bf0_00e2)
       else $fatal(1, "boot cache beat is not little-endian U98 data");
@@ -420,6 +458,7 @@ module tb_ki_memory_bridge;
     // A boot cache line must return four ordered 64-bit on-chip beats.
     cpu_size = 3'd4;
     issue_cpu_request();
+    wait_boot_rom_delay(256);
     begin
       integer boot_beat_count;
       integer boot_timeout;
@@ -443,7 +482,7 @@ module tb_ki_memory_bridge;
           boot_beat_count = boot_beat_count + 1;
         end
         boot_timeout = boot_timeout + 1;
-        if (boot_timeout > 200)
+        if (boot_timeout > 100)
           $fatal(1, "boot cache fill timed out");
       end
       assert (boot_beat_count == 4)

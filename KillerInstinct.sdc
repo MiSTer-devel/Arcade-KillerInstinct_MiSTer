@@ -3,13 +3,13 @@ derive_clock_uncertainty
 
 # The CPU clock is asynchronous to the rest of the design.
 #
-# sys_top.sdc puts every output of this PLL in ONE -exclusive group, so the
-# 75 MHz CPU clock and the 50 MHz clk_core were analysed as RELATED clocks.
-# Related clocks are given a setup window of gcd(T_a, T_b): at 75/50 MHz that
-# is 6.667 ns, and the 1867 paths crossing the boundary passed with about 1 ns
-# to spare. The window is NOT monotonic in frequency - it collapses to 2.5 ns
-# at 80 MHz and 2.222 ns at 90 MHz, and only reopens at 100 MHz, where the
-# ratio is a clean 2:1. Raising the CPU clock at all therefore used to break
+# sys_top.sdc puts every output of this PLL in ONE -exclusive group. When the
+# CPU ran at 75 MHz, it and the 50 MHz clk_core were therefore analysed as
+# RELATED clocks. Related clocks are given a setup window of gcd(T_a, T_b): at
+# 75/50 MHz that was 6.667 ns. The window is NOT monotonic in frequency - it
+# collapses to 2.5 ns at 80 MHz and 2.222 ns at 90 MHz, then reopens at the
+# current 100 MHz target, where the ratio is a clean 2:1. Raising the CPU clock
+# without the asynchronous group therefore used to break
 # ~1867 paths that had nothing to do with CPU speed, and no fitter seed can
 # recover a window that arithmetic has closed. Quartus hides this: Fmax is
 # computed only for same-clock paths, so the Fmax Summary never showed them.
@@ -55,7 +55,7 @@ set_multicycle_path -setup -end \
   -rise_from [get_clocks {KI_SDRAM_CLK}] \
   -rise_to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}] 2
 
-# Passive CPU diagnostics cross from the 75 MHz CPU domain through explicit
+# Passive CPU diagnostics cross from the 100 MHz CPU domain through explicit
 # two-stage synchronizers. Only the metastability-catching stages are async.
 set_false_path -to [get_keepers {*|debug_cpu_pc_meta[*]}]
 set_false_path -to [get_keepers {*|debug_cpu_retired_meta[*]}]

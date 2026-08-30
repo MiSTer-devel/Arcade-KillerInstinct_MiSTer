@@ -167,7 +167,20 @@ module ki_memory_bridge (
   localparam logic [4:0] SDRAM_MAX_BURST = 5'd16;
   localparam integer SDRAM_ROW_WORDS = 512;
 
-  // 17 states, so five bits. debug_state still exports the low three, which is
+  // The real CPU board does not return its EPROM at FPGA-memory speed. MAME's
+  // kinst_state::rom_r models 128 R4600 execution cycles of RdRdy delay for
+  // every 32-bit EPROM access. MAME's R4600 scheduler runs two execution
+  // cycles per configured 100 MHz clock, while this bridge runs at 50 MHz,
+  // so each 16-bit bridge word owes 16 clk cycles:
+  //
+  //   2 words * 16 clk = 32 clk = 64 CPU clocks = 128 MAME cycles.
+  //
+  // Scaling by active_read_words preserves the same board-visible delay for
+  // 64-bit fetches and 32-byte cache-line fills, regardless of whether the
+  // data itself comes from the boot M10K, the line buffer, or SDRAM.
+  localparam integer BOOT_ROM_WAIT_SHIFT = 4;
+
+  // 21 states, so five bits. debug_state still exports the low three, which is
   // what the debug screen has always shown.
   typedef enum logic [4:0] {
     IDLE,
@@ -189,10 +202,13 @@ module ki_memory_bridge (
     DOWNLOAD_SDRAM_WRITE_WAIT,
     ROM_LINE_FILL_ISSUE,
     ROM_LINE_FILL_WAIT,
-    ROM_LINE_RETURN
+    ROM_LINE_RETURN,
+    BOOT_ROM_ACCESS_WAIT
   } state_t;
 
   state_t state = IDLE;
+  state_t boot_rom_return_state = IDLE;
+  logic [8:0] boot_rom_wait_cycles = 9'd0;
 
   logic cpu_pending = 1'b0;
   logic pending_rnw = 1'b1;
@@ -742,6 +758,8 @@ module ki_memory_bridge (
       sdram_burst <= 5'd1;
       rom_line_valid <= 1'b0;
       rom_fill_index <= 4'd0;
+      boot_rom_return_state <= IDLE;
+      boot_rom_wait_cycles <= 9'd0;
       ddr_read_done_seen <= ddr_read_done_sync2;
       dcs_rom_inflight <= 1'b0;
       dcs_rom_request_seen_level <= 1'b0;
@@ -863,7 +881,10 @@ module ki_memory_bridge (
                 read_beats_remaining <= active_req64 ?
                     active_read_beats : 3'd1;
                 cpu_grant <= 1'b1;
-                state <= BOOT_CACHE_READ_WAIT;
+                boot_rom_return_state <= BOOT_CACHE_READ_WAIT;
+                boot_rom_wait_cycles <=
+                    {active_read_words, {BOOT_ROM_WAIT_SHIFT{1'b0}}};
+                state <= BOOT_ROM_ACCESS_WAIT;
               end else if (active_req64) begin
                 memory_word_address <=
                     {active_storage_address[25:3], 2'b00};
@@ -890,12 +911,23 @@ module ki_memory_bridge (
                 // it, so the next 31 byte reads of that line cost nothing on
                 // the SDRAM bus.
                 cpu_grant <= 1'b1;
-                state <= rom_line_hit ? ROM_LINE_RETURN : ROM_LINE_FILL_ISSUE;
+                boot_rom_return_state <=
+                    rom_line_hit ? ROM_LINE_RETURN : ROM_LINE_FILL_ISSUE;
+                boot_rom_wait_cycles <=
+                    {active_read_words, {BOOT_ROM_WAIT_SHIFT{1'b0}}};
+                state <= BOOT_ROM_ACCESS_WAIT;
               end else if (active_rnw) begin
                 // read_words_remaining, not read_beats_remaining: the burst
                 // covers every beat of the request in one or two requests.
                 cpu_grant <= 1'b1;
-                state <= SDRAM_READ_ISSUE;
+                if (is_boot_address(active_address)) begin
+                  boot_rom_return_state <= SDRAM_READ_ISSUE;
+                  boot_rom_wait_cycles <=
+                      {active_read_words, {BOOT_ROM_WAIT_SHIFT{1'b0}}};
+                  state <= BOOT_ROM_ACCESS_WAIT;
+                end else begin
+                  state <= SDRAM_READ_ISSUE;
+                end
               end else if (is_boot_address(active_address)) begin
                 cpu_pending <= 1'b0;
                 cpu_done <= 1'b1;
@@ -936,6 +968,15 @@ module ki_memory_bridge (
 
         BOOT_CACHE_READ_WAIT: begin
           state <= BOOT_CACHE_READ_RETURN;
+        end
+
+        BOOT_ROM_ACCESS_WAIT: begin
+          if (boot_rom_wait_cycles <= 9'd1) begin
+            boot_rom_wait_cycles <= 9'd0;
+            state <= boot_rom_return_state;
+          end else begin
+            boot_rom_wait_cycles <= boot_rom_wait_cycles - 1'b1;
+          end
         end
 
         BOOT_CACHE_READ_RETURN: begin
