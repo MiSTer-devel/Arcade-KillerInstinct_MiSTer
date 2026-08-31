@@ -50,16 +50,6 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
 set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 2.0
 set_global_assignment -name ROUTER_TIMING_OPTIMIZATION_LEVEL MAXIMUM
-# Placement seed. This design sits at the fitter's limit on the 75 MHz CPU
-# domain and slack there is seed-sensitive rather than structural: V59 timed
-# at -0.065 ns with seed 0 while using FEWER ALMs than V58, which made
-# +0.973 ns. Pin the seed so a passing fit is reproducible, and treat
-# changing it as a workaround - reducing area is the durable fix.
-# Seed 3 held V60/V61 but V62 came back with a HOLD violation of -0.018 ns
-# on the 75 MHz CPU domain. Hold is not the same risk class as setup: it
-# fails on FAST silicon and when cold, and corrupts data non-deterministically,
-# so a hold-violating build cannot be trusted for a data-integrity test.
-set_global_assignment -name SEED 43
 
 # Framebuffer mode is enabled after the DDR3 memory controller is integrated.
 # set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
