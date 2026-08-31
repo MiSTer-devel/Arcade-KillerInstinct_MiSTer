@@ -116,7 +116,7 @@ module emu
 
 localparam CONF_STR = {
 	"KillerInstinct;;",
-	"S0,IMG,Mount HDD Image;",
+	"SC0,IMG,Mount HDD Image;",
 	"-;",
 	"P1,Video Settings;",
 	"P1O1,Aspect Ratio,Original,Full Screen;",
