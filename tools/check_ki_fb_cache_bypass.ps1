@@ -5,6 +5,10 @@ $cpuPath = Join-Path $root 'rtl\cpu\cpu.vhd'
 $wrapperPath = Join-Path $root 'rtl\ki_cpu_core.vhd'
 $cpu = Get-Content -Raw -LiteralPath $cpuPath
 $wrapper = Get-Content -Raw -LiteralPath $wrapperPath
+# Code only: a comment that names a signal is not a use of it, and counting
+# one here made this check fail on a perf-page comment in cpu.vhd.
+$cpu = [regex]::Replace($cpu, '--[^\r\n]*', '')
+$wrapper = [regex]::Replace($wrapper, '--[^\r\n]*', '')
 
 $cpuChecks = [ordered]@{
     'opt-in CPU generic' = 'FRAMEBUFFER_UNCACHED\s*:\s*boolean\s*:=\s*false'

@@ -80,6 +80,7 @@ begin
          ADDR32_ONLY => true,
          NO_TRAP_INSTR => true,
          INSTR_KSEG_ONLY => true,
+         DCACHE_SKIP_FILL => true,
          -- Eight decodes without boot ROM arms the restart detectors. The
          -- bench programs are a dozen instructions long, so the hardware
          -- default of 2^26 could never arm inside one; this keeps the gate in
@@ -129,6 +130,9 @@ begin
          debug_eret_target     => open,
          debug_eret_flags      => open,
          debug_ds_count        => open,
+         -- Taps for the per-frame stall census; the counters that consume
+         -- them live in rtl/ki_cpu_core.vhd, which the benches do not build.
+         debug_perf_events     => open,
          debug_ds_first        => open,
          debug_trace_trigger   => '0',
          mem_request           => mem_request,

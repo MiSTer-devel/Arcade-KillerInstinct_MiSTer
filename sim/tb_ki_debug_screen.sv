@@ -101,7 +101,10 @@ module tb_ki_debug_screen;
   // 0x003 data-register writes.
   logic [31:0] ata_info = 32'hecc1_2003;
   logic [31:0] framebuffer_count = 32'h0000_4444;
-  logic page = 0;
+  logic [1:0] page = 2'd0;
+  // Page 2's per-frame stall census; ten 16-bit fields of 256-cycle units.
+  logic [191:0] perf = 192'd0;
+  logic [191:0] perf_worst = 192'd0;
   logic trace_valid = 1;
   logic [895:0] trace_bus = {
     32'h0030_2011,  // [895:864] TX census: 3 read, 2 write, 1 instr, first=MISS
@@ -396,7 +399,7 @@ module tb_ki_debug_screen;
     // something that looks like a plausible instruction stream, and only a
     // value check separates those from a correct page.
     // -----------------------------------------------------------------
-    page = 1;
+    page = 2'd1;
     #1;
 
     // Row 8 is the LANDING. This is the row the investigation turns on: the
@@ -517,7 +520,129 @@ module tb_ki_debug_screen;
     if (dut.screen_char(12, 1, dut.diagnostic_snapshot, dut.bist_snapshot) ==
         dut.trace_char(12, 1, trace_bus, trace_valid))
       $fatal(1, "the two pages render the same character where they must differ");
-    page = 0;
+    page = 2'd0;
+    #1;
+
+    // -----------------------------------------------------------------
+    // PAGE 2: the per-frame stall census.
+    //
+    // Every field gets a DISTINCT value for the same reason as the trace
+    // page: the whole point is reading ten counters off one photograph, and
+    // a slice off by one 16-bit field renders a perfectly plausible number.
+    // -----------------------------------------------------------------
+    page = 2'd2;
+    perf = {16'h000B,   // 11 NS narrow uncached store
+            16'h000A,   // 10 FA FB fetch, adjacent line
+            16'h8888,   // 9  FH FB line buffer hit count
+            16'h7777,   // 8  FL FB load count
+            16'h6666,   // 7  DC stall4, cached
+            16'h5555,   // 6  UO other uncached load
+            16'h4444,   // 5  UF uncached framebuffer load
+            16'h3333,   // 4  S4 stall4
+            16'h2222,   // 3  UW uncached store
+            16'h1111,   // 2  FR FB fetch, recent line
+            16'h0ABC,   // 1  RT retired
+            16'h1970};  // 0  CY cycles
+    #1;
+
+    if (dut.perf_char(0, 3, perf, perf_worst) != "P")
+      $fatal(1, "perf page is missing its title");
+
+    // CY is the frame length; every other field is read against it.
+    if (dut.perf_char(1, 0, perf, perf_worst) != "C" || dut.perf_char(1, 1, perf, perf_worst) != "Y" ||
+        dut.perf_char(1, 2, perf, perf_worst) != ":" ||
+        dut.perf_char(1, 3, perf, perf_worst) != "1" || dut.perf_char(1, 4, perf, perf_worst) != "9" ||
+        dut.perf_char(1, 5, perf, perf_worst) != "7" || dut.perf_char(1, 6, perf, perf_worst) != "0")
+      $fatal(1, "CY did not render the cycle count");
+    if (dut.perf_char(1, 8, perf, perf_worst) != "R" || dut.perf_char(1, 9, perf, perf_worst) != "T" ||
+        dut.perf_char(1, 11, perf, perf_worst) != "0" || dut.perf_char(1, 12, perf, perf_worst) != "A" ||
+        dut.perf_char(1, 13, perf, perf_worst) != "B" || dut.perf_char(1, 14, perf, perf_worst) != "C")
+      $fatal(1, "RT did not render the retired count");
+
+    // Rows 2-5, every field in its slot. Each value is distinct, so a field
+    // rendered from its neighbour's slice shows the wrong digit.
+    if (dut.perf_char(2, 0, perf, perf_worst) != "S" || dut.perf_char(2, 1, perf, perf_worst) != "4" ||
+        dut.perf_char(2, 3, perf, perf_worst) != "3")
+      $fatal(1, "S4 did not render stall4");
+    if (dut.perf_char(2, 8, perf, perf_worst) != "D" || dut.perf_char(2, 9, perf, perf_worst) != "C" ||
+        dut.perf_char(2, 14, perf, perf_worst) != "6")
+      $fatal(1, "DC did not render the cached stall");
+    if (dut.perf_char(3, 0, perf, perf_worst) != "U" || dut.perf_char(3, 1, perf, perf_worst) != "W" ||
+        dut.perf_char(3, 3, perf, perf_worst) != "2")
+      $fatal(1, "UW did not render the uncached store stall");
+    if (dut.perf_char(3, 8, perf, perf_worst) != "U" || dut.perf_char(3, 9, perf, perf_worst) != "F" ||
+        dut.perf_char(3, 14, perf, perf_worst) != "4")
+      $fatal(1, "UF did not render the framebuffer load stall");
+    if (dut.perf_char(4, 0, perf, perf_worst) != "F" || dut.perf_char(4, 1, perf, perf_worst) != "L" ||
+        dut.perf_char(4, 3, perf, perf_worst) != "7")
+      $fatal(1, "FL did not render the framebuffer load count");
+    if (dut.perf_char(4, 8, perf, perf_worst) != "F" || dut.perf_char(4, 9, perf, perf_worst) != "H" ||
+        dut.perf_char(4, 14, perf, perf_worst) != "8")
+      $fatal(1, "FH did not render the line buffer hit count");
+    if (dut.perf_char(5, 0, perf, perf_worst) != "U" || dut.perf_char(5, 1, perf, perf_worst) != "O" ||
+        dut.perf_char(5, 3, perf, perf_worst) != "5")
+      $fatal(1, "UO did not render the other uncached load stall");
+    if (dut.perf_char(5, 8, perf, perf_worst) != "F" || dut.perf_char(5, 9, perf, perf_worst) != "R" ||
+        dut.perf_char(5, 14, perf, perf_worst) != "1")
+      $fatal(1, "FR did not render the recent-line fetch count");
+
+    // Same visible-area rule as the other pages.
+    for (int c = 0; c < 20; c = c + 1)
+      if (dut.perf_char(15, c[4:0], perf, perf_worst) != " ")
+        $fatal(1, "perf page row 15 is below the visible area but renders '%c'",
+               dut.perf_char(15, c[4:0], perf, perf_worst));
+
+    // The worst-frame block repeats rows 1-5 at rows 8-12 from the OTHER bus.
+    // A renderer that ignored the row offset, or read the live bus for both,
+    // would render identical blocks - so give them different values and check
+    // the second block tracks perf_worst.
+    perf_worst = {16'h000B, 16'h000A,
+                  16'h0009, 16'h0008, 16'h0007, 16'h0006, 16'h0005,
+                  16'h0004, 16'h0003, 16'h0002, 16'h0001, 16'h0FFF};
+    #1;
+    if (dut.perf_char(7, 0, perf, perf_worst) != "W" ||
+        dut.perf_char(7, 4, perf, perf_worst) != "T" ||
+        dut.perf_char(7, 6, perf, perf_worst) != "U" ||
+        dut.perf_char(7, 7, perf, perf_worst) != "F")
+      $fatal(1, "the worst-frame block is missing its header, or does not say it is keyed on UF");
+    if (dut.perf_char(8, 0, perf, perf_worst) != "C" ||
+        dut.perf_char(8, 3, perf, perf_worst) != "0" ||
+        dut.perf_char(8, 4, perf, perf_worst) != "F" ||
+        dut.perf_char(8, 5, perf, perf_worst) != "F" ||
+        dut.perf_char(8, 6, perf, perf_worst) != "F")
+      $fatal(1, "worst-frame CY did not come from perf_worst");
+    if (dut.perf_char(11, 8, perf, perf_worst) != "F" ||
+        dut.perf_char(11, 9, perf, perf_worst) != "H" ||
+        dut.perf_char(11, 14, perf, perf_worst) != "9")
+      $fatal(1, "worst-frame FH did not come from perf_worst");
+    // The two blocks must not be the same: row 1 is live, row 8 is worst.
+    if (dut.perf_char(1, 6, perf, perf_worst) ==
+        dut.perf_char(8, 6, perf, perf_worst))
+      $fatal(1, "the live and worst blocks render identically");
+    // Row 6 is FA and NS, in both blocks, from the right buses.
+    if (dut.perf_char(6, 0, perf, perf_worst) != "F" ||
+        dut.perf_char(6, 1, perf, perf_worst) != "A" ||
+        dut.perf_char(6, 6, perf, perf_worst) != "A")
+      $fatal(1, "FA did not render the adjacent-line fetch count");
+    if (dut.perf_char(6, 8, perf, perf_worst) != "N" ||
+        dut.perf_char(6, 9, perf, perf_worst) != "S" ||
+        dut.perf_char(6, 14, perf, perf_worst) != "B")
+      $fatal(1, "NS did not render the narrow uncached store count");
+    if (dut.perf_char(13, 6, perf, perf_worst) != "A" ||
+        dut.perf_char(13, 14, perf, perf_worst) != "B")
+      $fatal(1, "the worst block's FA/NS did not come from perf_worst");
+    // 14 and 15 are below the census.
+    for (int c = 0; c < 20; c = c + 1)
+      if (dut.perf_char(14, c[4:0], perf, perf_worst) != " ")
+        $fatal(1, "row 14 is below the census but renders '%c'",
+               dut.perf_char(14, c[4:0], perf, perf_worst));
+
+    // Selected by `page`, not merely renderable.
+    if (dut.perf_char(1, 0, perf, perf_worst) ==
+        dut.trace_char(1, 0, trace_bus, trace_valid))
+      $fatal(1, "the perf and trace pages render the same character where they must differ");
+
+    page = 2'd0;
     #1;
 
     $display("tb_ki_debug_screen: PASS");

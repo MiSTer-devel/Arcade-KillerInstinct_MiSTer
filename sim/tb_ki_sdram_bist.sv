@@ -128,6 +128,20 @@ localparam integer WORDS = 256;
     end
   end
 
+  // The DQM sub-tests have to put a mask on the bus, or they say nothing
+  // about the board. Count the write beats where the device is told to
+  // ignore a byte: sub-test 0 masks one whole word, 1 one byte, 2 one byte in
+  // each of four words, 3 three of its four words - nine beats, and no other
+  // write in the run masks anything. A phase that stopped running, or whose
+  // enables were all set, would otherwise pass in silence.
+  localparam integer MASKED_BEATS = 9;
+  integer masked_write_beats = 0;
+  always @(posedge clk) begin
+    if (!good.SDRAM_nCS && good.SDRAM_nRAS && !good.SDRAM_nCAS && !good.SDRAM_nWE &&
+        (good.SDRAM_DQMH || good.SDRAM_DQML))
+      masked_write_beats <= masked_write_beats + 1;
+  end
+
   initial begin
     repeat (4) @(posedge clk);
     init = 1'b0;
@@ -195,6 +209,15 @@ localparam integer WORDS = 256;
       errors = errors + 1;
     end else begin
       $display("  burst read-back pass issued %0d-word bursts", longest_burst);
+    end
+
+    if (masked_write_beats != MASKED_BEATS) begin
+      $error("the DQM sub-tests masked %0d write beats, expected %0d - they are not exercising DQM",
+             masked_write_beats, MASKED_BEATS);
+      errors = errors + 1;
+    end else begin
+      $display("  DQM sub-tests masked %0d write beats: a whole word, a byte, a byte in each of four, and three of four",
+               masked_write_beats);
     end
 
     // A BIST that cannot fail is worthless. At 5.00 ns the sweep says every
@@ -274,8 +297,8 @@ module ki_sdram_bist_path #(
   wire bist_data_valid, bist_done;
 
   wire [24:0] controller_address;
-  wire [63:0] controller_write_data;
-  wire  [7:0] controller_byte_enable;
+  wire [255:0] controller_write_data;
+  wire  [31:0] controller_byte_enable;
   wire  [4:0] controller_burst;
   wire controller_read, controller_write;
   wire [15:0] controller_read_data;
@@ -311,8 +334,8 @@ module ki_sdram_bist_path #(
   // is released.
   ki_sdram_adapter adapter (
     .clk(clk), .reset(1'b0),
-    .request_address(25'd0), .request_write_data(64'd0),
-    .request_byte_enable(8'h00), .request_burst(5'd1),
+    .request_address(25'd0), .request_write_data(256'd0),
+    .request_byte_enable(32'h0), .request_burst(5'd1),
     .request_read(1'b0), .request_write(1'b0),
     .request_read_data(), .request_data_valid(), .request_done(),
     .aux_address(bist_address), .aux_write_data(bist_write_data),

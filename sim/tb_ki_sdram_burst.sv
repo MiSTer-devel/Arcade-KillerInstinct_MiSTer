@@ -91,6 +91,11 @@ module tb_ki_sdram_burst;
     end
   end
 
+  // The controller raises `ready` on the edge that captures the last beat, so
+  // that beat's dout_valid is high in the same cycle as `ready`. The collector
+  // counts it on the next edge; #1 lets that count land before the caller
+  // reads got_n. Every beat is still required - this only stops the check
+  // from racing the count.
   task automatic rd_burst(input logic [24:0] a, input integer n);
     begin
       got_n = 0;
@@ -101,6 +106,7 @@ module tb_ki_sdram_burst;
       @(posedge clk);
       wait (ready);
       @(posedge clk);
+      #1;
     end
   endtask
 
@@ -116,20 +122,20 @@ module tb_ki_sdram_burst;
   integer row_misses = 0;
   integer hits0, misses0;
 
-  // Count only the cycle a transaction is COMMITTED, which is where `pending`
-  // clears. A row miss passes through S_IDLE twice - once to decide to close
-  // the row, once after S_RP to issue the ACTIVE - so counting every visit
-  // would double every miss and understate the hit rate.
+  // Count only the cycle a transaction is COMMITTED. S_IDLE acts on the request
+  // arriving that cycle or on one held pending (cur_valid): a row hit commits
+  // there, and so does an ACTIVE with no row open. A row CHANGE precharges in
+  // S_IDLE and commits one clock later in S_ACTIVE, so the close pass is not
+  // counted and the ACTIVE is, once.
   always @(posedge clk) begin
-    if (dut.state == dut.S_IDLE && dut.pending && !dut.refresh_due) begin
-      if (dut.open_valid && (dut.req_row == dut.open_row) &&
-          (dut.req_bank == dut.open_bank))
+    if (dut.state == dut.S_IDLE && dut.cur_valid && !dut.refresh_due) begin
+      if (dut.cur_row_hit)
         row_hits = row_hits + 1;          // straight to S_READ/S_WRITE
       else if (!dut.open_valid)
-        row_misses = row_misses + 1;      // ACTIVE + tRCD
-      // open_valid with a different row: the close pass, counted next time
-      // round as a miss once open_valid has dropped.
+        row_misses = row_misses + 1;      // ACTIVE now
     end
+    if (dut.state == dut.S_ACTIVE)
+      row_misses = row_misses + 1;        // ACTIVE after a row change's PRECHARGE
   end
 
   initial begin

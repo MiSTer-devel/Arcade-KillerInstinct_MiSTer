@@ -174,8 +174,8 @@ module ki_sdram_contention_path #(
   wire bist_data_valid, bist_done;
 
   wire [24:0] controller_address;
-  wire [63:0] controller_write_data;
-  wire  [7:0] controller_byte_enable;
+  wire [255:0] controller_write_data;
+  wire  [31:0] controller_byte_enable;
   wire  [4:0] controller_burst;
   wire controller_read, controller_write;
   wire [15:0] controller_read_data;
@@ -262,8 +262,8 @@ module ki_sdram_contention_path #(
 
   ki_sdram_adapter adapter (
     .clk(clk), .reset(1'b0),
-    .request_address(primary_address), .request_write_data(64'd0),
-    .request_byte_enable(8'h00), .request_burst(primary_burst),
+    .request_address(primary_address), .request_write_data(256'd0),
+    .request_byte_enable(32'h0), .request_burst(primary_burst),
     .request_read(primary_read), .request_write(1'b0),
     .request_read_data(primary_read_data),
     .request_data_valid(primary_data_valid),

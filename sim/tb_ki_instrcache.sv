@@ -39,8 +39,8 @@ module tb_ki_instrcache;
   logic       ddr3_DOUT_READY = 1'b0;
 
   logic        read_select = 1'b0;
-  logic [31:0] read_addr1 = 32'd0;
-  logic [31:0] read_addr2 = 32'd0;
+  logic [13:2] read_index1 = 12'd0;
+  logic [13:2] read_index2 = 12'd0;
   logic [31:0] read_addrCompare1 = 32'd0;
   logic [31:0] read_addrCompare2 = 32'd0;
   wire         read_hit;
@@ -66,7 +66,7 @@ module tb_ki_instrcache;
     .ram_grant(ram_grant), .ram_done(ram_done),
     .ddr3_DOUT(ddr3_DOUT), .ddr3_DOUT_READY(ddr3_DOUT_READY),
     .read_select(read_select),
-    .read_addr1(read_addr1), .read_addr2(read_addr2),
+    .read_index1(read_index1), .read_index2(read_index2),
     .read_addrCompare1(read_addrCompare1),
     .read_addrCompare2(read_addrCompare2),
     .read_hit(read_hit), .read_data(read_data),
@@ -195,11 +195,13 @@ module tb_ki_instrcache;
   endtask
 
   // Present an address on port 1 and sample hit/data. read_addrCompare1 is the
-  // address the tag is compared against; read_addr1 selects the index.
+  // address the tag is compared against; read_index1 selects the RAM index.
+  // cpu.vhd derives read_index1 from its own flattened mux, so the bench
+  // mirrors that here by slicing the same address.
   task automatic probe(input logic [31:0] addr);
     begin
       read_select <= 1'b0;
-      read_addr1 <= addr;
+      read_index1 <= addr[13:2];
       read_addrCompare1 <= addr;
       step(3);
     end

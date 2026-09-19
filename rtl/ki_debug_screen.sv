@@ -62,7 +62,14 @@ module ki_debug_screen (
   // trace_valid is the clk_core side saying it has latched a frozen capture.
   // Zero means the trace never froze, which is itself the answer if a restart
   // ever happens WITHOUT a RAM -> boot ROM transition.
-  input  wire         page,
+  // 0 status, 1 trace, 2 performance census.
+  input  wire   [1:0] page,
+  // Per-frame stall census from ki_cpu_core; ten 16-bit fields, each counting
+  // units of 256 CPU cycles. See debug_perf_bus there for the field order.
+  input  wire [191:0] perf,
+  // The worst frame since the last clear, same ten fields. Gameplay slowdowns
+  // are occasional, so the live row usually shows a good frame.
+  input  wire [191:0] perf_worst,
   input  wire [895:0] trace_bus,
   input  wire         trace_valid,
 
@@ -163,6 +170,101 @@ module ki_debug_screen (
     begin
       shifted = value >> ((7 - digit) * 4);
       hex32_ascii = hex_ascii(shifted[3:0]);
+    end
+  endfunction
+
+  // "XX:hhhh" at a fixed column, so the perf page reads as two columns of
+  // labelled counters rather than a wall of hex.
+  function automatic [7:0] perf_field(
+    input logic  [4:0] column,
+    input logic  [4:0] base,
+    input logic  [7:0] c0,
+    input logic  [7:0] c1,
+    input logic [15:0] value
+  );
+    logic [15:0] shifted;
+    begin
+      perf_field = " ";
+      if (column == base) begin
+        perf_field = c0;
+      end else if (column == base + 5'd1) begin
+        perf_field = c1;
+      end else if (column == base + 5'd2) begin
+        perf_field = ":";
+      end else if (column >= base + 5'd3 && column <= base + 5'd6) begin
+        shifted = value >> ((base + 5'd6 - column) * 4);
+        perf_field = hex_ascii(shifted[3:0]);
+      end
+    end
+  endfunction
+
+  // Where the CPU's cycles went in the frame just finished. Effective speed is
+  // clock x IPC; the DSE work only ever moved the clock, and this is the other
+  // half. CY is the frame length, so every other field is read against it -
+  // a full 100 MHz frame is about 1970 hex units of 256 cycles.
+  function automatic [7:0] perf_char(
+    input logic  [3:0] row,
+    input logic  [4:0] column,
+    input logic [191:0] p,
+    input logic [191:0] w
+  );
+    logic [15:0] f [0:11];
+    logic  [3:0] r;
+    integer i;
+    begin
+      // Rows 8-13 repeat the same six rows for the worst frame, so one
+      // renderer serves both blocks and they cannot drift apart.
+      r = (row >= 4'd8) ? (row - 4'd7) : row;
+      for (i = 0; i < 12; i = i + 1)
+        f[i] = (row >= 4'd8) ? w[i*16 +: 16] : p[i*16 +: 16];
+      perf_char = " ";
+      case (r)
+        0: case (column)
+          0: perf_char="K"; 1: perf_char="I"; 3: perf_char="P";
+          4: perf_char="E"; 5: perf_char="R"; 6: perf_char="F";
+          default: perf_char=" ";
+        endcase
+        // Frame length and instructions retired: CY/RT is IPC in 256-cycle
+        // units, and the single number that says whether the clock is even
+        // the limit.
+        1: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "C", "Y", f[0])
+                                       : perf_field(column, 5'd8, "R", "T", f[1]);
+        // Stage 4 stalled on memory, and the cached part of it. S4 - DC is
+        // the uncached part, which UW, UF and UO split exactly: S4 = DC + UW +
+        // UF + UO, give or take rounding. A remainder that is not near zero is
+        // a stall that is not a memory access at all.
+        2: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "S", "4", f[4])
+                                       : perf_field(column, 5'd8, "D", "C", f[7]);
+        // UW is a store the full write FIFO will not take yet. UF is a load
+        // from the framebuffer pages, which are uncached for scanout.
+        3: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "U", "W", f[3])
+                                       : perf_field(column, 5'd8, "U", "F", f[5]);
+        // COUNTS: framebuffer loads (FL) and the ones the line buffer answered
+        // from the line it held (FH). FL - FH fetched; UF / FL is cycles per
+        // framebuffer load.
+        4: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "L", f[8])
+                                       : perf_field(column, 5'd8, "F", "H", f[9]);
+        // UO is every other uncached load - I/O, boot ROM, RAM through KSEG1.
+        // FR is a COUNT: fetches of a line the buffer held within the last
+        // three lines before - what a four-line buffer would have hit.
+        5: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "U", "O", f[6])
+                                       : perf_field(column, 5'd8, "F", "R", f[2]);
+        // COUNTS: fetches of the line next to the held one (FA), and of the
+        // line one pixel row - 640 bytes - from it (FV).
+        6: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "A", f[10])
+                                       : perf_field(column, 5'd8, "N", "S", f[11]);
+        default: perf_char = " ";
+      endcase
+      // Row 7 labels the second block, and the field its frame was chosen by;
+      // row 0 keeps the page title.
+      if (row == 4'd7) begin
+        case (column)
+          0: perf_char="W"; 1: perf_char="O"; 2: perf_char="R";
+          3: perf_char="S"; 4: perf_char="T";
+          6: perf_char="U"; 7: perf_char="F";
+          default: perf_char=" ";
+        endcase
+      end
     end
   endfunction
 
@@ -684,10 +786,13 @@ module ki_debug_screen (
     // once and never changes again, and KillerInstinct.sv latches it on the
     // clk_core side only after that freeze has been observed, so it is already
     // a stable capture rather than a live value being sampled.
-    character = page
-      ? trace_char(v_count[7:4], h_count[8:4], trace_bus, trace_valid)
-      : screen_char(v_count[7:4], h_count[8:4], diagnostic_snapshot,
-                    bist_snapshot);
+    case (page)
+      2'd1: character = trace_char(v_count[7:4], h_count[8:4],
+                                   trace_bus, trace_valid);
+      2'd2: character = perf_char(v_count[7:4], h_count[8:4], perf, perf_worst);
+      default: character = screen_char(v_count[7:4], h_count[8:4],
+                                       diagnostic_snapshot, bist_snapshot);
+    endcase
     glyph = glyph_bits(character);
     font_x = h_count[3:1];
     font_y = v_count[3:1];
@@ -710,7 +815,7 @@ module ki_debug_screen (
       // Row 3 is the CPU error row on the status page only. On the trace page
       // it is an ordinary decode, and colouring it red would read as a fault
       // marker on whichever instruction happened to land there.
-      end else if (!page && (v_count[7:4] == 3) && (errors_snapshot != 0)) begin
+      end else if ((page == 2'd0) && (v_count[7:4] == 3) && (errors_snapshot != 0)) begin
         red = 8'hff;
         green = 8'h40;
         blue = 8'h40;

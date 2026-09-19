@@ -74,12 +74,12 @@ module tb_ki_cpu_system_boot;
     logic        ata_irq;
 
     logic [24:0] sdram_address;
-    logic [63:0] sdram_write_data;
+    logic [255:0] sdram_write_data;
     wire  [15:0] sdram_read_data;
     logic  [4:0] sdram_burst;
     logic        sdram_read;
     logic        sdram_write;
-    logic  [7:0] sdram_byte_enable;
+    logic  [31:0] sdram_byte_enable;
     wire         sdram_data_valid;
     wire         sdram_done;
     wire         sdram_ready;
@@ -213,6 +213,7 @@ module tb_ki_cpu_system_boot;
         .cpu_size(cpu_size),
         .cpu_write_mask(cpu_write_mask),
         .cpu_data_write(cpu_write_data),
+        .cpu_line_write(1'b0), .cpu_line_data(256'd0),
         .cpu_data_read(cpu_read_data),
         .cpu_done(cpu_done),
         .cpu_grant(cpu_cache_grant),
@@ -416,8 +417,8 @@ module tb_ki_cpu_system_boot;
     always @(clk_1x) fork emit_dev_edge(clk_1x, 16750); join_none
 
     wire [24:0] controller_address;
-    wire [63:0] controller_write_data;
-    wire  [7:0] controller_byte_enable;
+    wire [255:0] controller_write_data;
+    wire  [31:0] controller_byte_enable;
     wire  [4:0] controller_burst;
     wire        controller_read, controller_write;
     wire [15:0] controller_read_data;

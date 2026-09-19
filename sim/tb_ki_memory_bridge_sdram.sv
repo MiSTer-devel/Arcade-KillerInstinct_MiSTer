@@ -74,8 +74,8 @@ module tb_ki_memory_bridge_sdram;
   wire video_done;
 
   wire [24:0] bridge_address;
-  wire [63:0] bridge_write_data;
-  wire  [7:0] bridge_byte_enable;
+  wire [255:0] bridge_write_data;
+  wire  [31:0] bridge_byte_enable;
   wire  [4:0] bridge_burst;
   wire bridge_read, bridge_write;
   wire [15:0] bridge_read_data;
@@ -83,8 +83,8 @@ module tb_ki_memory_bridge_sdram;
   wire sdram_ready;
 
   wire [24:0] controller_address;
-  wire [63:0] controller_write_data;
-  wire  [7:0] controller_byte_enable;
+  wire [255:0] controller_write_data;
+  wire  [31:0] controller_byte_enable;
   wire  [4:0] controller_burst;
   wire controller_read, controller_write;
   wire [15:0] controller_read_data;
@@ -119,7 +119,7 @@ module tb_ki_memory_bridge_sdram;
     .clk(clk), .ddr_clk(ddr_clk), .reset(reset),
     .cpu_request(cpu_request), .cpu_rnw(cpu_rnw),
     .cpu_address(cpu_address), .cpu_req64(cpu_req64), .cpu_size(cpu_size),
-    .cpu_write_mask(cpu_write_mask), .cpu_data_write(cpu_data_write),
+    .cpu_write_mask(cpu_write_mask), .cpu_data_write(cpu_data_write), .cpu_line_write(1'b0), .cpu_line_data(256'd0),
     .cpu_data_read(cpu_data_read), .cpu_done(cpu_done), .cpu_grant(cpu_grant),
     .cpu_cache_data(cpu_cache_data),
     .cpu_cache_data_ready(cpu_cache_data_ready),
@@ -320,8 +320,10 @@ module tb_ki_memory_bridge_sdram;
     if (bridge_read) read_requests <= read_requests + 1;
     if (bridge_write) begin
       store_requests <= store_requests + 1;
-      if (bridge_burst > 4) begin
-        $error("write burst of %0d exceeds the controller's 4-word payload",
+      // The bridge gathers a dirty 32-byte line and writes it as one burst,
+      // so a write is now up to 16 words - the same ceiling reads have.
+      if (bridge_burst > 16) begin
+        $error("write burst of %0d exceeds the controller's 16-word payload",
                bridge_burst);
         errors = errors + 1;
       end
@@ -393,6 +395,7 @@ module tb_ki_memory_bridge_sdram;
   endfunction
 
   integer i, t0, t1;
+  integer gather_stores_before;
   real ns_per_word;
   real ns_per_store;
   real full_clear_ms;
@@ -428,6 +431,48 @@ module tb_ki_memory_bridge_sdram;
         end
       if (errors == 0) $display("  32-byte cache line: 4 beats, data OK");
     end
+
+    // Dirty-line gather. Four consecutive full-mask 64-bit stores to a
+    // 32-byte-aligned line must reach the controller as ONE 16-word write
+    // and read back intact. Checking the COUNT, not only the data, means
+    // this fails if gathering is ever switched off, not just if it corrupts.
+    gather_stores_before = store_requests;
+    for (i = 0; i < 4; i = i + 1)
+      write64(32'h0000_0200 + (i * 8), pattern(32 + i));
+    read_line(32'h0000_0200);
+    if ((store_requests - gather_stores_before) != 1) begin
+      $error("a gathered line issued %0d write requests, expected 1",
+             store_requests - gather_stores_before);
+      errors = errors + 1;
+    end
+    for (i = 0; i < 4; i = i + 1)
+      if (beat[i] !== pattern(32 + i)) begin
+        $error("gathered line beat %0d: got %h expected %h",
+               i, beat[i], pattern(32 + i));
+        errors = errors + 1;
+      end
+
+    // A read landing between the beats must see the ones already held:
+    // the bridge flushes before it serves anything else.
+    write64(32'h0000_0240, pattern(40));
+    write64(32'h0000_0248, pattern(41));
+    read64(32'h0000_0240);
+    if (cpu_data_read !== pattern(40)) begin
+      $error("read between gathered beats returned %h, expected %h",
+             cpu_data_read, pattern(40));
+      errors = errors + 1;
+    end
+    write64(32'h0000_0250, pattern(42));
+    write64(32'h0000_0258, pattern(43));
+    read_line(32'h0000_0240);
+    for (i = 0; i < 4; i = i + 1)
+      if (beat[i] !== pattern(40 + i)) begin
+        $error("interrupted line beat %0d: got %h expected %h",
+               i, beat[i], pattern(40 + i));
+        errors = errors + 1;
+      end
+    if (errors == 0)
+      $display("  dirty-line gather: 1 write request per line, interleaved read coherent");
 
     read_line(32'h0000_0040);
     if (beat[0] !== pattern(8) || beat[3] !== pattern(11)) begin
