@@ -250,8 +250,8 @@ module ki_sdram_bridge_path #(
   wire video_data_valid, video_done;
 
   wire [24:0] bridge_address;
-  wire [63:0] bridge_write_data;
-  wire  [7:0] bridge_byte_enable;
+  wire [255:0] bridge_write_data;
+  wire  [31:0] bridge_byte_enable;
   wire  [4:0] bridge_burst;
   wire bridge_read, bridge_write;
   wire [15:0] bridge_read_data;
@@ -272,8 +272,8 @@ module ki_sdram_bridge_path #(
   assign busy_o = busy;
 
   wire [24:0] controller_address;
-  wire [63:0] controller_write_data;
-  wire  [7:0] controller_byte_enable;
+  wire [255:0] controller_write_data;
+  wire  [31:0] controller_byte_enable;
   wire  [4:0] controller_burst;
   wire controller_read, controller_write;
   wire [15:0] controller_read_data;
@@ -421,7 +421,7 @@ module ki_sdram_bridge_path #(
     .clk(clk), .ddr_clk(ddr_clk), .reset(reset),
     .cpu_request(cpu_request), .cpu_rnw(cpu_rnw),
     .cpu_address(cpu_address), .cpu_req64(cpu_req64), .cpu_size(cpu_size),
-    .cpu_write_mask(cpu_write_mask), .cpu_data_write(cpu_data_write),
+    .cpu_write_mask(cpu_write_mask), .cpu_data_write(cpu_data_write), .cpu_line_write(1'b0), .cpu_line_data(256'd0),
     .cpu_data_read(cpu_data_read), .cpu_done(cpu_done), .cpu_grant(cpu_grant),
     .cpu_cache_data(cpu_cache_data),
     .cpu_cache_data_ready(cpu_cache_data_ready),

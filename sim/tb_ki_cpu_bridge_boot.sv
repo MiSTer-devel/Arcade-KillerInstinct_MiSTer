@@ -62,8 +62,8 @@ module tb_ki_cpu_bridge_boot;
     // 64 bits and eight byte enables, one pair per word of a write burst - the
     // bridge has driven this width since stores became bursts. This was [15:0]
     // and [1:0], which silently truncated every store.
-    logic [63:0] sdram_write_data;
-    logic  [7:0] sdram_byte_enable;
+    logic [255:0] sdram_write_data;
+    logic  [31:0] sdram_byte_enable;
     logic  [4:0] sdram_burst;
     logic [15:0] sdram_read_data;
     logic        sdram_data_valid;
@@ -166,6 +166,7 @@ module tb_ki_cpu_bridge_boot;
         .cpu_size(cpu_size),
         .cpu_write_mask(cpu_write_mask),
         .cpu_data_write(cpu_write_data),
+        .cpu_line_write(1'b0), .cpu_line_data(256'd0),
         .cpu_data_read(cpu_read_data),
         .cpu_done(cpu_done),
         .cpu_grant(cpu_cache_grant),

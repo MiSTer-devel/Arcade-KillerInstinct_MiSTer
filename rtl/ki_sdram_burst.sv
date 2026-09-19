@@ -15,12 +15,20 @@
 //    inside one open row. After the initial ACTIVE + tRCD + CAS latency, that
 //    is one word per clock.
 //
-// Writes burst up to four words. A write burst needs no streaming handshake
-// because the payload is already
-// 64 bits wide everywhere above the DRAM: a 64-bit CPU store is exactly 4
-// words and they are all available at once. `din` is therefore 4 words and
-// `wtbt` is one enable pair per word, driven onto DQM per beat. A word with no
-// enabled bytes still consumes its column but writes nothing.
+// 3. NO CLOCK THE DEVICE DOES NOT NEED. S_IDLE acts on a request on the edge
+//    it arrives, a row change issues PRECHARGE, ACTIVE and the command one
+//    clock apart - each pair at its 18 ns floor, which one 20 ns clock meets -
+//    and a read releases on the edge that captures its last word. Together
+//    with ki_sdram_adapter launching an arriving request directly and passing
+//    words straight through, that takes three clocks off every read and three
+//    more off every row change. The MT48 model $fatals on a violated tRP, tRCD or tRC, so
+//    every bench using it checks the spacing.
+//
+// Writes burst up to 16 words. A write burst needs no streaming handshake
+// because the payload is presented all at once: `din` is 16 words wide - one
+// 32-byte cache line, the largest write anything above issues - and `wtbt` is
+// one enable pair per word, driven onto DQM per beat. A word with no enabled
+// bytes still consumes its column but writes nothing.
 module ki_sdram_burst #(
   // DRAM timing floors in CYCLES of clk. Defaults are for a 50 MHz (20 ns)
   // clock: tRP 18ns -> 1, tRCD 18ns -> 1. Recompute if the clock changes; the
@@ -46,19 +54,26 @@ module ki_sdram_burst #(
   output wire         SDRAM_CKE,
 
   // Write byte mask, one pair per word: [2n+1]=high byte, [2n]=low byte.
-  input  wire   [7:0] wtbt,
+  input  wire  [31:0] wtbt,
   input  wire  [24:0] addr,      // BYTE address; addr[0]=0 for 16-bit access
   // Words to transfer: 1..16 on a read, 1..MAX_WRITE_BURST on a write.
   input  wire   [4:0] burst,
   output logic [15:0] dout,
-  output logic        dout_valid,// one pulse per returned word, in order
-  input  wire  [63:0] din,       // up to 4 words, low word first
+  // One pulse per returned word, in order. The LAST word's pulse and `ready`
+  // rise on the same edge: S_READ_DRAIN releases as it captures that word.
+  // ki_sdram_adapter turns `ready` into a done a clock later, so its own
+  // ports keep the final word strictly before done.
+  output logic        dout_valid,
+  input  wire [255:0] din,       // up to 16 words, low word first
   input  wire         we,
   input  wire         rd,
   output logic        ready = 1'b0
 );
-  // Bounded by the width of `din`, not by DRAM. Reads are unaffected.
-  localparam [4:0] MAX_WRITE_BURST = 5'd4;
+  // Bounded by the width of `din`, not by DRAM. A 32-byte cache line is
+  // 16 words, and issuing it as ONE burst instead of four 4-word ones saves
+  // three lots of the per-transaction overhead - measured at ~16 CPU cycles
+  // each against 8 cycles of actual data. See docs/OPTIMIZATION-HISTORY.md.
+  localparam [4:0] MAX_WRITE_BURST = 5'd16;
   localparam [2:0] CAS_LATENCY = 3'd2;
   localparam logic [12:0] MODE =
       {3'b000, 1'b1 /*single write*/, 2'b00, CAS_LATENCY, 1'b0, 3'b000};
@@ -99,8 +114,8 @@ module ki_sdram_burst #(
   logic  [1:0] open_bank = 2'b00;
 
   logic [24:0] req_addr = '0;
-  logic [63:0] req_din = '0;
-  logic  [7:0] req_wtbt = 8'h00;
+  logic [255:0] req_din = '0;
+  logic [31:0] req_wtbt = 32'h0000_0000;
   logic  [4:0] req_burst = 5'd1;
   logic req_we = 1'b0;
   logic pending = 1'b0;
@@ -110,9 +125,11 @@ module ki_sdram_burst #(
   logic [4:0] beats_out;
 
   // Which word of req_din the next WRITE command carries.
-  logic [1:0] wr_index = 2'd0;
-  wire [15:0] wr_word = req_din[{4'd0, wr_index} * 16 +: 16];
-  wire  [1:0] wr_be   = req_wtbt[{5'd0, wr_index} * 2 +: 2];
+  logic [3:0] wr_index = 4'd0;
+  // {wr_index, 4'd0} is wr_index * 16 in 8 bits, which a 4-bit index cannot
+  // overflow; likewise {wr_index, 1'b0} is wr_index * 2.
+  wire [15:0] wr_word = req_din[{wr_index, 4'd0} +: 16];
+  wire  [1:0] wr_be   = req_wtbt[{wr_index, 1'b0} +: 2];
 
   logic [CAS_LATENCY:0] cas_pipe = '0;
 
@@ -133,6 +150,31 @@ module ki_sdram_burst #(
   wire [8:0]  req_col  = req_addr[9:1];
   wire [12:0] req_row  = req_addr[22:10];
   wire [1:0]  req_bank = req_addr[24:23];
+
+  // The request S_IDLE acts on this cycle: one arriving NOW, taken straight
+  // from the inputs, or one held in `pending` from a state that could not take
+  // it. Acting on the arriving edge saves the clock the edge detector used to
+  // spend loading `pending` before S_IDLE looked at it - a clock on every
+  // SDRAM operation this core makes.
+  wire        new_rd    = rd && !old_rd;
+  wire        new_we    = we && !old_we;
+  wire        new_req   = new_rd || new_we;
+  wire        cur_valid = new_req || pending;
+  wire        cur_we    = new_req ? new_we : req_we;
+  wire [24:0] cur_addr  = new_req ? addr : req_addr;
+  wire  [4:0] cur_burst = new_req ?
+      ((burst == 0) ? 5'd1 :
+       (new_we && (burst > MAX_WRITE_BURST)) ? MAX_WRITE_BURST : burst) :
+      req_burst;
+  wire [8:0]  cur_col   = cur_addr[9:1];
+  wire [12:0] cur_row   = cur_addr[22:10];
+  wire [1:0]  cur_bank  = cur_addr[24:23];
+  wire        cur_row_hit = open_valid && (cur_row == open_row) && (cur_bank == open_bank);
+  // S_IDLE starts the arriving request itself - a row hit, or no row open -
+  // so the capture block below must not also leave it pending. A row CHANGE
+  // still captures it: S_ACTIVE issues it a clock later from req_*.
+  wire        take_new  = (state == S_IDLE) && !refresh_due && new_req &&
+                          (cur_row_hit || !open_valid);
 
   always_ff @(posedge clk) begin
     command <= CMD_NOP;
@@ -190,35 +232,74 @@ module ki_sdram_burst #(
             refresh_wait <= 4'd8;        // tRFC
             state <= S_REFRESH;
           end
-        end else if (pending) begin
-          if (open_valid && (req_row == open_row) && (req_bank == open_bank)) begin
+        end else if (cur_valid) begin
+          if (cur_row_hit) begin
             // ROW HIT: the row is already ACTIVE, so no ACTIVE and no tRCD.
             pending <= 1'b0;
-            SDRAM_BA <= req_bank;
-            col <= req_col;
-            beats_left <= req_burst;
-            beats_out <= req_we ? 5'd0 : req_burst;
-            wr_index <= 2'd0;
-            state <= req_we ? S_WRITE : S_READ;
+            SDRAM_BA <= cur_bank;
+            col <= cur_col;
+            beats_left <= cur_burst;
+            beats_out <= cur_we ? 5'd0 : cur_burst;
+            wr_index <= 4'd0;
+            state <= cur_we ? S_WRITE : S_READ;
           end else if (open_valid) begin
-            // Row miss: close what is open, then come back with pending still
-            // set and take the ACTIVE path below.
-            state <= S_PRECHARGE;
+            // Row change: PRECHARGE on THIS clock, ACTIVE on the next (S_ACTIVE)
+            // and the command on the one after. Each pair is one clock - 20 ns
+            // at 50 MHz against the 18 ns tRP and tRCD floors - where this used
+            // to go S_PRECHARGE, S_RP, S_IDLE, ACTIVE, S_RCD: five clocks before
+            // the command instead of two. The request is held in req_* and
+            // pending (the capture block below keeps an arriving one).
+            open_valid <= 1'b0;
+            command <= CMD_PRECHARGE;
+            SDRAM_A[10] <= 1'b1;             // all banks
+            if (T_RP <= 4'd1) begin
+              state <= S_ACTIVE;
+            end else begin
+              wait_cnt <= T_RP - 4'd1;
+              state <= S_RP;
+            end
           end else begin
+            // Nothing open: ACTIVE now, the command T_RCD clocks later.
             pending <= 1'b0;
             command <= CMD_ACTIVE;
-            SDRAM_A <= req_row;
-            SDRAM_BA <= req_bank;
+            SDRAM_A <= cur_row;
+            SDRAM_BA <= cur_bank;
             open_valid <= 1'b1;
-            open_row <= req_row;
-            open_bank <= req_bank;
-            col <= req_col;
-            beats_left <= req_burst;
-            beats_out <= req_we ? 5'd0 : req_burst;
-            wr_index <= 2'd0;
-            wait_cnt <= T_RCD;
-            state <= S_RCD;
+            open_row <= cur_row;
+            open_bank <= cur_bank;
+            col <= cur_col;
+            beats_left <= cur_burst;
+            beats_out <= cur_we ? 5'd0 : cur_burst;
+            wr_index <= 4'd0;
+            if (T_RCD <= 4'd1) begin
+              state <= cur_we ? S_WRITE : S_READ;
+            end else begin
+              wait_cnt <= T_RCD - 4'd1;
+              state <= S_RCD;
+            end
           end
+        end
+      end
+
+      // One clock after a row change's PRECHARGE (tRP), open the new row from
+      // the held request.
+      S_ACTIVE: begin
+        pending <= 1'b0;
+        command <= CMD_ACTIVE;
+        SDRAM_A <= req_row;
+        SDRAM_BA <= req_bank;
+        open_valid <= 1'b1;
+        open_row <= req_row;
+        open_bank <= req_bank;
+        col <= req_col;
+        beats_left <= req_burst;
+        beats_out <= req_we ? 5'd0 : req_burst;
+        wr_index <= 4'd0;
+        if (T_RCD <= 4'd1) begin
+          state <= req_we ? S_WRITE : S_READ;
+        end else begin
+          wait_cnt <= T_RCD - 4'd1;
+          state <= S_RCD;
         end
       end
 
@@ -252,7 +333,12 @@ module ki_sdram_burst #(
         // start the next burst immediately on a row hit, releasing early lets
         // that last beat land after beats_out has been reloaded, and it is
         // counted into the following burst - the bench saw 2N-2 beats.
-        if (beats_out == 0) begin
+        //
+        // Releasing on the edge that captures the LAST beat is not that: the
+        // capture above takes beats_out to zero on this same edge, so nothing
+        // is left in the pipe, and the next burst cannot load beats_out before
+        // the next edge. It saves the clock spent seeing zero.
+        if ((beats_out == 0) || ((beats_out == 5'd1) && cas_pipe[0])) begin
           ready <= 1'b1;
           state <= S_IDLE;               // row stays open
         end
@@ -324,26 +410,42 @@ module ki_sdram_burst #(
     end
 
     // Edge-detected request capture, matching the stock controller's contract.
+    // A request S_IDLE started on this same edge (take_new) is captured all
+    // the same - S_WRITE needs req_din and req_wtbt, S_RCD req_we - but is not
+    // left pending.
     old_we <= we;
-    if (we && !old_we) begin
+    if (new_we) begin
       req_addr <= addr;
       req_din <= din;
       req_wtbt <= wtbt;
       req_we <= 1'b1;
       req_burst <= (burst == 0) ? 5'd1 :
                    (burst > MAX_WRITE_BURST) ? MAX_WRITE_BURST : burst;
-      pending <= 1'b1;
+      pending <= !take_new;
       ready <= 1'b0;
     end
 
     old_rd <= rd;
-    if (rd && !old_rd) begin
+    if (new_rd) begin
       req_addr <= addr;
       req_we <= 1'b0;
       req_burst <= (burst == 0) ? 5'd1 : burst;
-      pending <= 1'b1;
+      pending <= !take_new;
       ready <= 1'b0;
     end
+
+`ifndef SYNTHESIS
+    // One request at a time: the adapter launches only on `ready`, which the
+    // capture above lowers. A second edge while one is pending would be lost.
+    if (!init && new_req && pending) begin
+      $error("ki_sdram_burst: a request arrived while another was pending");
+      $fatal(1);
+    end
+    if (!init && new_rd && new_we) begin
+      $error("ki_sdram_burst: read and write requested on the same edge");
+      $fatal(1);
+    end
+`endif
   end
 endmodule
 

@@ -28,8 +28,8 @@ module tb_ki_sdram_adapter_burst;
   always @(clk) fork emit_edge(clk, 16.75); join_none
 
   logic [24:0] request_address = 25'd0;
-  logic [63:0] request_write_data = 64'd0;
-  logic  [7:0] request_byte_enable = 8'b0000_0011;
+  logic [255:0] request_write_data = 256'd0;
+  logic  [31:0] request_byte_enable = 32'b0000_0011;
   logic  [4:0] request_burst = 5'd1;
   logic request_read = 1'b0;
   logic request_write = 1'b0;
@@ -47,8 +47,8 @@ module tb_ki_sdram_adapter_burst;
   wire sdram_ready;
 
   wire [24:0] controller_address;
-  wire [63:0] controller_write_data;
-  wire  [7:0] controller_byte_enable;
+  wire [255:0] controller_write_data;
+  wire  [31:0] controller_byte_enable;
   wire  [4:0] controller_burst;
   wire controller_read, controller_write;
   wire [15:0] controller_read_data;

@@ -142,8 +142,93 @@ module ki_sdram_bist #(
     BIST_WAIT_BOOT,
     BIST_SUM_READ,
     BIST_SUM_ACK,
-    BIST_DONE
+    BIST_DONE,
+    BIST_DQM_ISSUE,
+    BIST_DQM_ACK
   } state_t;
+
+  // DQM: does a write with some bytes disabled leave those bytes alone? The
+  // pattern passes write every word with both enables set, so they cannot
+  // tell. The data cache's write-back used to rely on it - a line whose
+  // store-miss fill was skipped went back with its unread qwords masked - and
+  // on hardware that corrupted game data while every simulation passed,
+  // because every SDRAM model honours DQM. Hardware then failed this test:
+  // SD:F, EP 2222, AC AAAA.
+  //
+  // Four sub-tests, each harder than the last, so the FIRST failure says how
+  // far masking works on this board. Each has its own fill and write pattern,
+  // so the expected/actual pair on the page names the sub-test by itself:
+  //
+  //   0  one word, whole word masked        fill 1111, write AAAA -> 1111
+  //   1  one word, high byte masked         fill 2222, write BBBB -> 22BB
+  //   2  four words, same byte masked       fill 3333, write CCCC -> 33CC
+  //   3  four words, mask changing per word fill 1111 2222 3333 4444,
+  //                                         write AAAA -> AAAA 2222 33AA AA44
+  //
+  // Sub-test 3 is what the skipped fill's write-back did. Sub-tests 0-2 are
+  // what an uncached 8- or 16-bit store to SDRAM still does today. Each has
+  // its own four words at the end of the base region's last row, clear of the
+  // pattern sweep.
+  //
+  // A failure clears `pass` without touching error_count, so the page shows
+  // SD:F with EC:00 - which no pattern failure can - and the first wrong
+  // word's expected and actual values.
+  localparam logic [24:0] DQM_BASE_WORD = BASE_WORD + 25'h1C0;
+  localparam logic [63:0] DQM_FILL      = {16'h4444, 16'h3333, 16'h2222, 16'h1111};
+  localparam logic [63:0] DQM_WRITE     = {16'hAAAA, 16'hAAAA, 16'hAAAA, 16'hAAAA};
+  localparam logic  [7:0] DQM_ENABLES   = 8'b10_01_00_11;
+  localparam logic [63:0] DQM_EXPECT    = {16'hAA44, 16'h33AA, 16'h2222, 16'hAAAA};
+  logic [1:0] dqm_case = 2'd0;
+  logic [1:0] dqm_step = 2'd0;
+  logic       dqm_bad  = 1'b0;
+
+  // The active sub-test. A case statement rather than parameter arrays: this
+  // has to elaborate under Quartus 17.0.2 as well as the simulator.
+  // always_comb, not always @*: dqm_case starts at 0 and stays there until
+  // the first sub-test finishes, and an @* block that never sees an event
+  // never runs, which left every constant below X and hung the first write.
+  logic [24:0] dqm_addr;
+  logic  [4:0] dqm_words;
+  logic [63:0] dqm_fill;
+  logic [63:0] dqm_write;
+  logic  [7:0] dqm_enables;
+  logic [63:0] dqm_expect;
+  always_comb begin
+    case (dqm_case)
+      2'd0: begin
+        dqm_addr    = DQM_BASE_WORD;
+        dqm_words   = 5'd1;
+        dqm_fill    = {48'd0, 16'h1111};
+        dqm_write   = {48'd0, 16'hAAAA};
+        dqm_enables = 8'b0000_0000;
+        dqm_expect  = {48'd0, 16'h1111};
+      end
+      2'd1: begin
+        dqm_addr    = DQM_BASE_WORD + 25'd8;
+        dqm_words   = 5'd1;
+        dqm_fill    = {48'd0, 16'h2222};
+        dqm_write   = {48'd0, 16'hBBBB};
+        dqm_enables = 8'b0000_0001;
+        dqm_expect  = {48'd0, 16'h22BB};
+      end
+      2'd2: begin
+        dqm_addr    = DQM_BASE_WORD + 25'd16;
+        dqm_words   = 5'd4;
+        dqm_fill    = {16'h3333, 16'h3333, 16'h3333, 16'h3333};
+        dqm_write   = {16'hCCCC, 16'hCCCC, 16'hCCCC, 16'hCCCC};
+        dqm_enables = 8'b01_01_01_01;
+        dqm_expect  = {16'h33CC, 16'h33CC, 16'h33CC, 16'h33CC};
+      end
+      default: begin
+        dqm_addr    = DQM_BASE_WORD + 25'd24;
+        dqm_words   = 5'd4;
+        dqm_fill    = DQM_FILL;
+        dqm_write   = DQM_WRITE;
+        dqm_enables = DQM_ENABLES;
+        dqm_expect  = DQM_EXPECT;
+      end
+    endcase
+  end
 
   state_t state = BIST_WAIT_READY;
   logic [INDEX_BITS-1:0] index = '0;
@@ -355,12 +440,70 @@ module ki_sdram_bist #(
               watchdog <= '0;
               state <= BIST_WRITE;
             end else begin
-              pass <= (error_count == 16'd0);
-              state <= BIST_WAIT_BOOT;
+              dqm_case <= 2'd0;
+              dqm_step <= 2'd0;
+              dqm_bad <= 1'b0;
+              watchdog <= '0;
+              state <= BIST_DQM_ISSUE;
             end
           end else begin
             invert_pass <= 1'b1;
             state <= BIST_WRITE;
+          end
+        end
+
+        // Fill, masked write, read back, once per sub-test; see DQM_BASE_WORD.
+        BIST_DQM_ISSUE: begin
+          request_address <= dqm_addr;
+          request_burst <= dqm_words;
+          beat <= '0;
+          case (dqm_step)
+            2'd0: begin
+              request_write_data <= dqm_fill;
+              request_byte_enable <= 8'hFF;
+              request_write <= 1'b1;
+            end
+            2'd1: begin
+              request_write_data <= dqm_write;
+              request_byte_enable <= dqm_enables;
+              request_write <= 1'b1;
+            end
+            default: request_read <= 1'b1;
+          endcase
+          state <= BIST_DQM_ACK;
+        end
+
+        BIST_DQM_ACK: begin
+          if (dqm_step == 2'd2 && request_data_valid) begin
+            beat <= beat + 1'b1;
+            if (request_read_data != dqm_expect[{beat[1:0], 4'd0} +: 16]) begin
+              // The first sub-test to fail is the one that says how far
+              // masking works, so only the first mismatch is kept.
+              if (!dqm_bad && error_count == 16'd0) begin
+                first_bad_address <= dqm_addr + beat;
+                first_bad_expected <= dqm_expect[{beat[1:0], 4'd0} +: 16];
+                first_bad_actual <= request_read_data;
+              end
+              dqm_bad <= 1'b1;
+            end
+          end
+          if (request_done) begin
+            if (dqm_step != 2'd2) begin
+              dqm_step <= dqm_step + 2'd1;
+              state <= BIST_DQM_ISSUE;
+            end else if ((beat + (request_data_valid ? 5'd1 : 5'd0)) != dqm_words) begin
+              // The read did not return the words it asked for, which no
+              // count of mismatches would show.
+              pass <= 1'b0;
+              state <= BIST_WAIT_BOOT;
+            end else if (dqm_case != 2'd3) begin
+              dqm_case <= dqm_case + 2'd1;
+              dqm_step <= 2'd0;
+              state <= BIST_DQM_ISSUE;
+            end else begin
+              pass <= (error_count == 16'd0) && !dqm_bad;
+              state <= BIST_WAIT_BOOT;
+            end
           end
         end
 

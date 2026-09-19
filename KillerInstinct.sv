@@ -127,7 +127,8 @@ localparam CONF_STR = {
 `ifdef KI_DEBUG_BUILD
 	"P2,Debug;",
 	"P2O4,Video Output,Game,Debug;",
-	"P2O5,Debug Page,Status,Trace;",
+	"P2O56,Debug Page,Status,Trace,Perf;",
+	"P2O7,Perf Peak,Run,Clear;",
 	"P2O3,FPS Overlay,Off,On;",
 	"-;",
 `endif
@@ -530,6 +531,8 @@ wire cpu_mem_req64;
 wire [2:0] cpu_mem_size;
 wire [7:0] cpu_mem_write_mask;
 wire [63:0] cpu_mem_data_write;
+wire        cpu_mem_line_write;
+wire [255:0] cpu_mem_line_data;
 wire [63:0] cpu_mem_data_read;
 wire cpu_mem_done;
 wire cpu_mem_grant;
@@ -597,6 +600,23 @@ reg [31:0] debug_cpu_ret_count_meta = 32'h0, debug_cpu_ret_count_sync = 32'h0;
 reg [31:0] debug_cpu_pc_meta = 32'h0000_0000;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
 reg [31:0] debug_cpu_pc_sync = 32'h0000_0000;
+// Per-frame stall census. ki_cpu_core latches these once per frame and holds
+// them for the whole of the next one, so they are already stable when this
+// domain samples them - the two flops are for metastability, not coherence.
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+reg [191:0] debug_perf_bus_meta = 192'd0;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+reg [191:0] debug_perf_bus_sync = 192'd0;
+wire [191:0] debug_perf_bus;
+// Per-frame bridge census, counted in clk_core (50 MHz) - one count is two
+// CPU cycles. Crossed into the CPU domain inside ki_cpu_core.
+wire  [15:0] bridge_perf_out;
+wire  [15:0] bridge_perf_burst;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+reg [191:0] debug_perf_worst_meta = 192'd0;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+reg [191:0] debug_perf_worst_sync = 192'd0;
+wire [191:0] debug_perf_worst;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
 reg [31:0] debug_cpu_retired_meta = 32'h0000_0000;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
@@ -648,8 +668,8 @@ wire [7:0] framebuffer_green;
 wire [7:0] framebuffer_blue;
 wire framebuffer_pixel_valid;
 wire [24:0] bridge_sdram_address;
-wire [63:0] bridge_sdram_write_data;
-wire [7:0] bridge_sdram_byte_enable;
+wire [255:0] bridge_sdram_write_data;
+wire [31:0] bridge_sdram_byte_enable;
 wire [4:0] bridge_sdram_burst;
 wire bridge_sdram_read;
 wire bridge_sdram_write;
@@ -657,8 +677,8 @@ wire [15:0] bridge_sdram_read_data;
 wire bridge_sdram_data_valid;
 wire bridge_sdram_done;
 wire [24:0] controller_sdram_address;
-wire [63:0] controller_sdram_write_data;
-wire [7:0] controller_sdram_byte_enable;
+wire [255:0] controller_sdram_write_data;
+wire [31:0] controller_sdram_byte_enable;
 wire [4:0] controller_sdram_burst;
 wire controller_sdram_read;
 wire controller_sdram_write;
@@ -702,6 +722,8 @@ wire        bridge_cpu_req64      = verify_active ? 1'b0  : cpu_mem_req64;
 wire  [2:0] bridge_cpu_size       = verify_active ? 3'd1  : cpu_mem_size;
 wire  [7:0] bridge_cpu_write_mask = verify_active ? 8'd0  : cpu_mem_write_mask;
 wire [63:0] bridge_cpu_data_write = verify_active ? 64'd0 : cpu_mem_data_write;
+wire        bridge_cpu_line_write = verify_active ? 1'b0   : cpu_mem_line_write;
+wire [255:0] bridge_cpu_line_data = verify_active ? 256'd0 : cpu_mem_line_data;
 wire [15:0] bist_sdram_read_data;
 wire bist_sdram_data_valid;
 wire bist_sdram_done;
@@ -907,6 +929,10 @@ end
 always @(posedge clk_core) begin
 	debug_cpu_pc_meta <= debug_cpu_pc;
 	debug_cpu_pc_sync <= debug_cpu_pc_meta;
+	debug_perf_bus_meta <= debug_perf_bus;
+	debug_perf_bus_sync <= debug_perf_bus_meta;
+	debug_perf_worst_meta <= debug_perf_worst;
+	debug_perf_worst_sync <= debug_perf_worst_meta;
 	debug_cpu_retired_meta <= debug_cpu_retired;
 	debug_cpu_retired_sync <= debug_cpu_retired_meta;
 	debug_cpu_irq_count_meta <= debug_cpu_irq_count;
@@ -930,6 +956,10 @@ always @(posedge clk_core) begin
 	if(shell_reset) begin
 		debug_cpu_pc_meta <= 32'h0000_0000;
 		debug_cpu_pc_sync <= 32'h0000_0000;
+		debug_perf_bus_meta <= 192'd0;
+		debug_perf_bus_sync <= 192'd0;
+		debug_perf_worst_meta <= 192'd0;
+		debug_perf_worst_sync <= 192'd0;
 		debug_cpu_retired_meta <= 32'h0000_0000;
 		debug_cpu_retired_sync <= 32'h0000_0000;
 		debug_cpu_irq_count_meta <= 32'h0000_0000;
@@ -996,6 +1026,8 @@ ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 	.mem_size(cpu_mem_size),
 	.mem_writeMask(cpu_mem_write_mask),
 	.mem_dataWrite(cpu_mem_data_write),
+	.mem_line_write(cpu_mem_line_write),
+	.mem_line_data(cpu_mem_line_data),
 	.mem_dataRead(cpu_mem_data_read),
 	.mem_done(cpu_mem_done),
 	.cache_grant(cpu_mem_grant),
@@ -1004,6 +1036,12 @@ ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 	.errors(cpu_errors),
 	.debug_fetch_pc(debug_cpu_pc),
 	.debug_retired(debug_cpu_retired),
+	.perf_frame(frame_start),
+	.perf_clear(status[7]),
+	.perf_bridge_out(bridge_perf_out),
+	.perf_bridge_burst(bridge_perf_burst),
+	.debug_perf_bus(debug_perf_bus),
+	.debug_perf_worst(debug_perf_worst),
 	.debug_gpr_s1(),
 	.debug_irq_count(debug_cpu_irq_count),
 	.debug_t2_reload_count(debug_cpu_t2_reload_count),
@@ -1072,6 +1110,8 @@ ki_memory_bridge memory_bridge
 	.cpu_size(bridge_cpu_size),
 	.cpu_write_mask(bridge_cpu_write_mask),
 	.cpu_data_write(bridge_cpu_data_write),
+	.cpu_line_write(bridge_cpu_line_write),
+	.cpu_line_data(bridge_cpu_line_data),
 	.cpu_data_read(cpu_mem_data_read),
 	.cpu_done(cpu_mem_done),
 	.cpu_grant(cpu_mem_grant),
@@ -1126,6 +1166,9 @@ ki_memory_bridge memory_bridge
 	.fb_write_accept(),
 	.debug_state(),
 	.debug_cpu_pending(),
+	.perf_frame(frame_start),
+	.perf_cpu_outstanding(bridge_perf_out),
+	.perf_cpu_burst(bridge_perf_burst),
 	.debug_last_write_address(),
 	.debug_last_write_data(),
 	.debug_last_write_info(),
@@ -1428,7 +1471,9 @@ generate if (DEBUG_BUILD) begin : g_overlays
 		// Page 1 is the frozen pre-event trace. It is fed from the clk_core
 		// shadow, not from the CPU domain directly, so what is on screen is a
 		// coherent capture rather than a live sample of a 736-bit bus.
-		.page(status[5]),
+		.page(status[6:5]),
+		.perf(debug_perf_bus_sync),
+		.perf_worst(debug_perf_worst_sync),
 		.trace_bus(debug_trace_shadow),
 		.trace_valid(debug_trace_valid),
 		.bist_done(bist_done),

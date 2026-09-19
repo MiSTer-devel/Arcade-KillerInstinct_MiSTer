@@ -8,6 +8,11 @@ module tb_ki_memory_bridge;
   logic reset = 1'b1;
 
   logic cpu_request = 1'b0;
+  // Per-frame performance census. perf_frame is a strobe in the bridge's own
+  // clock, so the bench drives it directly.
+  logic        perf_frame = 1'b0;
+  wire  [15:0] perf_cpu_outstanding;
+  wire  [15:0] perf_cpu_burst;
   logic cpu_rnw = 1'b1;
   logic [31:0] cpu_address = 32'd0;
   logic fb_read_accept;
@@ -16,6 +21,9 @@ module tb_ki_memory_bridge;
   logic [2:0] cpu_size = 3'd1;
   logic [7:0] cpu_write_mask = 8'd0;
   logic [63:0] cpu_data_write = 64'd0;
+  // A whole dirty line in one request; see the line-write test below.
+  logic        cpu_line_write = 1'b0;
+  logic [255:0] cpu_line_data = 256'd0;
   logic [63:0] cpu_data_read;
   logic cpu_done;
   logic cpu_grant;
@@ -54,8 +62,8 @@ module tb_ki_memory_bridge;
   logic [63:0] dcs_rom_data;
 
   logic [24:0] sdram_address;
-  logic [63:0] sdram_write_data;
-  logic [7:0] sdram_byte_enable;
+  logic [255:0] sdram_write_data;
+  logic [31:0] sdram_byte_enable;
   logic [4:0] sdram_burst;
   logic sdram_read;
   logic sdram_write;
@@ -95,8 +103,8 @@ module tb_ki_memory_bridge;
   logic memory_pending = 1'b0;
   logic memory_pending_write = 1'b0;
   logic [24:0] memory_pending_address = 25'd0;
-  logic [63:0] memory_pending_data = 64'd0;
-  logic [7:0] memory_pending_enable = 8'd0;
+  logic [255:0] memory_pending_data = 256'd0;
+  logic [31:0] memory_pending_enable = 32'd0;
   logic [4:0] memory_pending_burst = 5'd1;
   integer written;
   logic memory_read_active = 1'b0;
@@ -166,7 +174,8 @@ module tb_ki_memory_bridge;
   // ki_sdram_adapter + ki_sdram_burst deliver: a read request returns `burst`
   // words as consecutive sdram_data_valid beats in address order, and
   // sdram_done follows strictly after the last beat. A write burst stores up
-  // to four words with one byte-enable pair each and completes at done.
+  // to SIXTEEN words - one 32-byte cache line, gathered by the bridge - with
+  // one byte-enable pair each, and completes at done.
   always @(posedge clk) begin
     sdram_done <= 1'b0;
     sdram_data_valid <= 1'b0;
@@ -179,7 +188,7 @@ module tb_ki_memory_bridge;
         // slot - the controller masks it with DQM - so it must not shift the
         // ones after it.
         written = 0;
-        for (int w = 0; w < 4; w++) begin
+        for (int w = 0; w < 16; w++) begin
           if (w < memory_pending_burst) begin
             if (memory_pending_enable[w * 2])
               sdram_memory[memory_pending_address + w][7:0] =
@@ -225,9 +234,19 @@ module tb_ki_memory_bridge;
       memory_pending_burst <= sdram_burst;
       if (sdram_write) begin
         sdram_write_request_count <= sdram_write_request_count + 1;
-        assert (sdram_burst >= 1 && sdram_burst <= 4)
-          else $fatal(1, "write burst %0d is outside the controller's 1..4 range",
+        assert (sdram_burst >= 1 && sdram_burst <= 16)
+          else $fatal(1, "write burst %0d is outside the controller's 1..16 range",
                       sdram_burst);
+        // NOTHING this bridge writes may depend on the device masking a
+        // byte. Hardware ignores DQM (ki_sdram_bist sub-test 0), so a write
+        // that arrives here with an enable clear would put the store's own
+        // lanes on top of live memory. Partial line write-backs are split
+        // into full-enable bursts and narrow stores are read-modify-write,
+        // so every write must cover every byte of every word it names.
+        assert ((~sdram_byte_enable & ((32'd1 << (2 * sdram_burst)) - 32'd1)) == 32'd0)
+          else $fatal(1,
+              "write of %0d words at 0x%h has byte enables %08x - it is relying on DQM",
+              sdram_burst, sdram_address, sdram_byte_enable);
         assert ((({1'b0, sdram_address[8:0]} + {5'd0, sdram_burst}) <= 10'd512))
           else $fatal(1,
               "write burst of %0d from word 0x%h crosses a 512-word SDRAM row",
@@ -332,6 +351,18 @@ module tb_ki_memory_bridge;
         if (timeout > 800)
           $fatal(1, "CPU transaction timed out");
       end
+    end
+  endtask
+
+  // The bridge holds a full-mask 64-bit write to a 32-byte-aligned address in
+  // its line-gather buffer until something else needs the bus or the buffer
+  // ages out, so a test that inspects SDRAM straight after a store has to wait
+  // for that. Real traffic never does: every other requester flushes it first,
+  // which is what makes the deferral invisible.
+  task automatic flush_write_gather;
+    begin
+      repeat (48) @(posedge clk);
+      #1;
     end
   endtask
 
@@ -676,6 +707,7 @@ module tb_ki_memory_bridge;
       cpu_data_write = 64'hd003_d002_d001_d000;
       issue_cpu_request();
       wait_cpu_done();
+      flush_write_gather();
       assert (sdram_write_request_count - gap_sdram_writes_before == 1)
         else $fatal(1, "page 0 gap store did not use SDRAM");
 
@@ -694,6 +726,7 @@ module tb_ki_memory_bridge;
       cpu_data_write = 64'he003_e002_e001_e000;
       issue_cpu_request();
       wait_cpu_done();
+      flush_write_gather();
       assert (sdram_write_request_count - gap_sdram_writes_before == 1)
         else $fatal(1, "page 1 boundary store did not use SDRAM");
 
@@ -720,6 +753,7 @@ module tb_ki_memory_bridge;
     low_writes_before = debug_low_write_count;
     issue_cpu_request();
     wait_cpu_done();
+    flush_write_gather();
     assert (sdram_memory[25'h0000010] == 16'h7788);
     assert (sdram_memory[25'h0000011] == 16'h5566);
     assert (sdram_memory[25'h0000012] == 16'h3344);
@@ -938,6 +972,387 @@ module tb_ki_memory_bridge;
       assert (io_request_cycle_count - io_count_before == 1)
         else $fatal(1, "one CPU I/O access strobed the peripheral %0d times",
                     io_request_cycle_count - io_count_before);
+    end
+
+    // ---------------------------------------------------------------
+    // Per-frame performance census.
+    //
+    // The exported fields are units of 256 clk cycles, so a single access
+    // rounds to zero - check the raw counter, which is the part that could
+    // silently fail to count at all. That failure mode is not theoretical:
+    // three earlier attempts at these taps measured essentially nothing on
+    // hardware while the CPU sat stalled.
+    // ---------------------------------------------------------------
+    begin
+      integer outstanding_before;
+      perf_frame = 1'b1;
+      @(posedge clk); #1;
+      perf_frame = 1'b0;
+      @(posedge clk); #1;
+      assert (dut.perf_out_cnt == 24'd0)
+        else $fatal(1, "perf_frame did not restart the outstanding counter");
+
+      cpu_rnw = 1'b1;
+      cpu_address = 32'h0000_2000;
+      cpu_req64 = 1'b1;
+      cpu_size = 3'd4;
+      issue_cpu_request();
+      wait_cpu_done();
+      @(posedge clk); #1;
+      outstanding_before = dut.perf_out_cnt;
+      assert (outstanding_before > 0)
+        else $fatal(1, "a CPU read left the outstanding counter at zero");
+      assert (dut.perf_burst_cnt > 0)
+        else $fatal(1, "a CPU SDRAM read left the burst counter at zero");
+      assert (dut.perf_burst_cnt <= outstanding_before)
+        else $fatal(1, "the SDRAM burst cannot outlast the request holding it");
+
+      perf_frame = 1'b1;
+      @(posedge clk); #1;
+      perf_frame = 1'b0;
+      @(posedge clk); #1;
+      assert (dut.perf_out_cnt == 24'd0)
+        else $fatal(1, "perf_frame did not clear the outstanding counter");
+    end
+
+    // ------------------------------------------------------------------
+    // A whole dirty cache line in ONE request (cpu_line_write).
+    //
+    // The CPU used to hand a write-back over as four 64-bit transactions and
+    // the bridge gathered them; now it hands over 32 bytes at once and the
+    // bridge must produce the SAME single 16-word burst. Checks the data, the
+    // address, and that it really is ONE request - four would still store the
+    // right bytes, which is exactly the mistake that would go unnoticed.
+    // ------------------------------------------------------------------
+    begin
+      integer line_writes_before;
+      integer line_words_before;
+      logic [31:0] line_addr;
+      logic [31:0] narrow_addr;
+      logic [255:0] line_payload;
+      integer bad;
+
+      // 32-byte aligned low RAM, mapped to SDRAM words (addr >> 3) << 2 -
+      // the bridge's own active_word_address for a 64-bit access.
+      line_addr = 32'h0000_0040;
+      // Its own qword, clear of the line above and of every other test.
+      narrow_addr = 32'h0000_0080;
+      for (int w = 0; w < 4; w = w + 1)
+        line_payload[w * 64 +: 64] = {32'hc0de_0000 + w[31:0], 32'h5eed_0000 + w[31:0]};
+
+      flush_write_gather();
+      line_writes_before = sdram_write_request_count;
+      line_words_before = sdram_write_count;
+
+      cpu_rnw = 1'b0;
+      cpu_req64 = 1'b1;
+      cpu_size = 3'd1;
+      cpu_write_mask = 8'h0f;         // [3:0]: all four qwords
+      cpu_data_write = 64'hdead_dead_dead_dead;
+      cpu_address = line_addr;
+      cpu_line_write = 1'b1;
+      cpu_line_data = line_payload;
+      issue_cpu_request();
+      wait_cpu_done();
+      cpu_line_write = 1'b0;
+      cpu_write_mask = 8'hff;
+      flush_write_gather();
+
+      assert (sdram_write_request_count - line_writes_before == 1)
+        else $fatal(1, "a 32-byte line write issued %0d SDRAM requests, expected 1",
+                    sdram_write_request_count - line_writes_before);
+      assert (sdram_write_count - line_words_before == 16)
+        else $fatal(1, "a 32-byte line write stored %0d SDRAM words, expected 16",
+                    sdram_write_count - line_words_before);
+
+      bad = 0;
+      for (int w = 0; w < 16; w = w + 1) begin
+        logic [15:0] want;
+        want = line_payload[w * 16 +: 16];
+        if (sdram_memory[((line_addr >> 3) << 2) + w] !== want) begin
+          if (bad < 4)
+            $display("  line word %0d = %04x, expected %04x", w,
+                     sdram_memory[((line_addr >> 3) << 2) + w], want);
+          bad = bad + 1;
+        end
+      end
+      assert (bad == 0)
+        else $fatal(1, "%0d of 16 words of the line write are wrong", bad);
+      $display("tb_ki_memory_bridge: a 32-byte line write is one 16-word burst");
+
+      // The same line again with only qwords 0 and 2 enabled - what a data
+      // cache line whose store-miss fill was skipped sends. It must go out as
+      // one full-enable 4-word burst per enabled qword, never a burst with
+      // masked words (DQM masking inside a write burst corrupted data on
+      // hardware), and qwords 1 and 3 must keep what the first write put there.
+      begin
+        logic [255:0] partial_payload;
+        for (int w = 0; w < 4; w = w + 1)
+          partial_payload[w * 64 +: 64] = {32'h0bad_0000 + w[31:0], 32'h0f00_0000 + w[31:0]};
+        line_writes_before = sdram_write_request_count;
+        line_words_before = sdram_write_count;
+        cpu_rnw = 1'b0;
+        cpu_req64 = 1'b1;
+        cpu_size = 3'd1;
+        cpu_write_mask = 8'h05;
+        cpu_address = line_addr;
+        cpu_line_write = 1'b1;
+        cpu_line_data = partial_payload;
+        issue_cpu_request();
+        wait_cpu_done();
+        cpu_line_write = 1'b0;
+        cpu_write_mask = 8'hff;
+        flush_write_gather();
+
+        assert (sdram_write_request_count - line_writes_before == 2)
+          else $fatal(1, "a line write masked to two qwords issued %0d SDRAM requests, expected 2",
+                      sdram_write_request_count - line_writes_before);
+        assert (sdram_write_count - line_words_before == 8)
+          else $fatal(1, "a line write masked to two qwords spanned %0d SDRAM words, expected 8",
+                      sdram_write_count - line_words_before);
+        bad = 0;
+        for (int w = 0; w < 16; w = w + 1) begin
+          logic [15:0] want;
+          want = ((w / 4) % 2 == 0) ? partial_payload[w * 16 +: 16]
+                                    : line_payload[w * 16 +: 16];
+          if (sdram_memory[((line_addr >> 3) << 2) + w] !== want) begin
+            if (bad < 4)
+              $display("  masked line word %0d = %04x, expected %04x", w,
+                       sdram_memory[((line_addr >> 3) << 2) + w], want);
+            bad = bad + 1;
+          end
+        end
+        assert (bad == 0)
+          else $fatal(1, "%0d of 16 words are wrong after a line write masked to qwords 0 and 2", bad);
+        $display("tb_ki_memory_bridge: a masked line write leaves the disabled qwords alone");
+      end
+
+      // NARROW STORES. An uncached sh or sb covers part of its burst, which
+      // used to go out with the rest masked off by DQM - and this board
+      // ignores DQM, so those bytes would be written with whatever the
+      // store's data register holds in their lanes. Each must now read,
+      // merge and write back: two SDRAM requests, all enables set (the
+      // assertion in the model checks that on every write), the addressed
+      // bytes changed and NOTHING else in the qword touched.
+      begin
+        logic [63:0] seed;
+        int          reqs_before;
+        logic [24:0] w0;
+
+        seed = 64'h7766_5544_3322_1100;
+        w0 = (narrow_addr >> 1);      // 16-bit words, as the model stores them
+
+        // Lay down a known qword with a full-mask 64-bit store.
+        cpu_rnw = 1'b0;
+        cpu_req64 = 1'b1;
+        cpu_size = 3'd1;
+        cpu_write_mask = 8'hff;
+        cpu_address = narrow_addr;
+        cpu_data_write = seed;
+        issue_cpu_request();
+        wait_cpu_done();
+        flush_write_gather();
+
+        // sh into the upper half of the low word pair: mask 0x0c, 32-bit
+        // shape (req64 low, size 0), so the burst is two words and only the
+        // second is written.
+        reqs_before = sdram_write_request_count;
+        cpu_req64 = 1'b0;
+        cpu_size = 3'd0;
+        cpu_write_mask = 8'h0c;
+        cpu_data_write = 64'h0000_0000_beef_0000;
+        issue_cpu_request();
+        wait_cpu_done();
+        flush_write_gather();
+        assert (sdram_write_request_count - reqs_before == 1)
+          else $fatal(1, "a halfword store issued %0d writes, expected 1",
+                      sdram_write_request_count - reqs_before);
+        assert (sdram_read_request_count > 0)
+          else $fatal(1, "a halfword store did not read first");
+        assert (sdram_memory[w0 + 0] === 16'h1100 &&
+                sdram_memory[w0 + 1] === 16'hbeef &&
+                sdram_memory[w0 + 2] === 16'h5544 &&
+                sdram_memory[w0 + 3] === 16'h7766)
+          else $fatal(1, "after sh the qword reads %04x %04x %04x %04x",
+                      sdram_memory[w0 + 0], sdram_memory[w0 + 1],
+                      sdram_memory[w0 + 2], sdram_memory[w0 + 3]);
+
+        // sb into the low byte of the first word: mask 0x01. Its own word's
+        // other byte must survive, and so must the word beside it.
+        cpu_write_mask = 8'h01;
+        cpu_data_write = 64'h0000_0000_0000_0042;
+        issue_cpu_request();
+        wait_cpu_done();
+        flush_write_gather();
+        assert (sdram_memory[w0 + 0] === 16'h1142 &&
+                sdram_memory[w0 + 1] === 16'hbeef &&
+                sdram_memory[w0 + 2] === 16'h5544 &&
+                sdram_memory[w0 + 3] === 16'h7766)
+          else $fatal(1, "after sb the qword reads %04x %04x %04x %04x",
+                      sdram_memory[w0 + 0], sdram_memory[w0 + 1],
+                      sdram_memory[w0 + 2], sdram_memory[w0 + 3]);
+
+        // A 64-bit store that covers only part of the line - what sdl and
+        // sdr produce - takes the same path over four words.
+        cpu_req64 = 1'b1;
+        cpu_size = 3'd1;
+        cpu_write_mask = 8'h3c;
+        cpu_data_write = 64'h0000_cafe_face_0000;
+        issue_cpu_request();
+        wait_cpu_done();
+        flush_write_gather();
+        assert (sdram_memory[w0 + 0] === 16'h1142 &&
+                sdram_memory[w0 + 1] === 16'hface &&
+                sdram_memory[w0 + 2] === 16'hcafe &&
+                sdram_memory[w0 + 3] === 16'h7766)
+          else $fatal(1, "after a partial 64-bit store the qword reads %04x %04x %04x %04x",
+                      sdram_memory[w0 + 0], sdram_memory[w0 + 1],
+                      sdram_memory[w0 + 2], sdram_memory[w0 + 3]);
+
+        // And a full 32-bit store still goes straight out, with no read.
+        reqs_before = sdram_read_request_count;
+        cpu_req64 = 1'b0;
+        cpu_size = 3'd0;
+        cpu_write_mask = 8'h0f;
+        cpu_data_write = 64'h0000_0000_2222_1111;
+        issue_cpu_request();
+        wait_cpu_done();
+        flush_write_gather();
+        assert (sdram_read_request_count == reqs_before)
+          else $fatal(1, "a full 32-bit store read before writing");
+        assert (sdram_memory[w0 + 0] === 16'h1111 &&
+                sdram_memory[w0 + 1] === 16'h2222 &&
+                sdram_memory[w0 + 2] === 16'hcafe &&
+                sdram_memory[w0 + 3] === 16'h7766)
+          else $fatal(1, "after sw the qword reads %04x %04x %04x %04x",
+                      sdram_memory[w0 + 0], sdram_memory[w0 + 1],
+                      sdram_memory[w0 + 2], sdram_memory[w0 + 3]);
+
+        cpu_req64 = 1'b1;
+        cpu_size = 3'd1;
+        cpu_write_mask = 8'hff;
+        $display("tb_ki_memory_bridge: narrow stores read, merge and write back with every enable set");
+      end
+    end
+
+    // ------------------------------------------------------------------
+    // A whole 32-byte FRAMEBUFFER line in one read (64-bit, size 4).
+    //
+    // FB_READ_WAIT walks fb_qwords_left qwords from one request and streams
+    // each on cpu_cache_data_ready, the way a D-cache fill's beats arrive. It
+    // was written when the D-cache covered the framebuffer and has had no
+    // caller since FRAMEBUFFER_UNCACHED; a CPU-side framebuffer line buffer
+    // would be its first. So check it: four beats, in address order, the
+    // right data - a 16-bit pixel store included - done no earlier than the
+    // last beat, M10K only, and at the last line of each page, where a walk
+    // one qword too far would leave the page.
+    // ------------------------------------------------------------------
+    begin
+      logic [31:0] fb_line_bases [0:2];
+      integer single_cycles;
+      integer line_cycles;
+
+      fb_line_bases[0] = 32'h0003_0100;   // page 0
+      fb_line_bases[1] = 32'h0005_57e0;   // page 0, last line
+      fb_line_bases[2] = 32'h0007_d7e0;   // page 1, last line
+      single_cycles = 0;
+      line_cycles = 0;
+
+      for (int l = 0; l < 3; l = l + 1) begin
+        integer fb_reads_before;
+        integer fb_sdram_reads_before;
+        integer fb_sdram_writes_before;
+        integer beat_count;
+        integer cycles;
+        logic   done_before_last_beat;
+        logic [63:0] want [0:3];
+
+        cpu_rnw = 1'b0;
+        cpu_req64 = 1'b1;
+        cpu_size = 3'd1;
+        for (int q = 0; q < 4; q = q + 1) begin
+          want[q] = {16'hf000 + 16'(l), 16'he000 + 16'(q),
+                     16'hd000 + 16'(l), 16'hc000 + 16'(q)};
+          cpu_address = fb_line_bases[l] + 32'(q * 8);
+          cpu_write_mask = 8'hff;
+          cpu_data_write = want[q];
+          issue_cpu_request();
+          wait_cpu_done();
+        end
+        // A 16-bit pixel update to qword 2, as the renderer issues them. The
+        // line read must return the pixel, not the store it overwrote.
+        want[2][31:16] = 16'h7e57;
+        cpu_address = fb_line_bases[l] + 32'd16;
+        cpu_write_mask = 8'h0c;
+        cpu_data_write = 64'h0000_0000_7e57_0000;
+        issue_cpu_request();
+        wait_cpu_done();
+
+        // One qword, for the cost comparison.
+        cpu_rnw = 1'b1;
+        cpu_write_mask = 8'hff;
+        cpu_address = fb_line_bases[l] + 32'd8;
+        cpu_size = 3'd1;
+        cycles = 0;
+        cpu_request = 1'b1;
+        @(posedge clk); #1;
+        cpu_request = 1'b0;
+        while (!cpu_done) begin
+          @(posedge clk); #1;
+          cycles = cycles + 1;
+          if (cycles > 100) $fatal(1, "framebuffer qword read timed out");
+        end
+        assert (cpu_data_read == want[1])
+          else $fatal(1, "framebuffer qword read at %08x returned %016x, expected %016x",
+                      cpu_address, cpu_data_read, want[1]);
+        single_cycles = cycles;
+
+        // The whole line.
+        cpu_address = fb_line_bases[l];
+        cpu_size = 3'd4;
+        fb_reads_before = fb_read_accept_count;
+        fb_sdram_reads_before = sdram_read_request_count;
+        fb_sdram_writes_before = sdram_write_request_count;
+        beat_count = 0;
+        cycles = 0;
+        done_before_last_beat = 1'b0;
+        cpu_request = 1'b1;
+        @(posedge clk); #1;
+        cpu_request = 1'b0;
+        forever begin
+          if (cpu_cache_data_ready) begin
+            if (beat_count > 3)
+              $fatal(1, "framebuffer line read at %08x returned a fifth beat",
+                     fb_line_bases[l]);
+            assert (cpu_cache_data == want[beat_count])
+              else $fatal(1, "framebuffer line %08x beat %0d = %016x, expected %016x",
+                          fb_line_bases[l], beat_count, cpu_cache_data,
+                          want[beat_count]);
+            beat_count = beat_count + 1;
+          end
+          if (cpu_done) begin
+            if (beat_count < 4) done_before_last_beat = 1'b1;
+            break;
+          end
+          @(posedge clk); #1;
+          cycles = cycles + 1;
+          if (cycles > 100) $fatal(1, "framebuffer line read timed out");
+        end
+        cpu_size = 3'd1;
+        assert (!done_before_last_beat)
+          else $fatal(1, "framebuffer line read at %08x completed after %0d of 4 beats",
+                      fb_line_bases[l], beat_count);
+        assert (fb_read_accept_count - fb_reads_before == 1)
+          else $fatal(1, "framebuffer line read was accepted %0d times",
+                      fb_read_accept_count - fb_reads_before);
+        assert (sdram_read_request_count == fb_sdram_reads_before &&
+                sdram_write_request_count == fb_sdram_writes_before)
+          else $fatal(1, "framebuffer line read touched SDRAM");
+        line_cycles = cycles;
+      end
+      $display("tb_ki_memory_bridge: a framebuffer line read returns 4 beats in order, at both page ends");
+      $display("tb_ki_memory_bridge: framebuffer read request-to-done, bridge cycles: qword %0d, line %0d",
+               single_cycles, line_cycles);
     end
 
     $display("tb_ki_memory_bridge: %0d SDRAM words read in %0d requests, longest burst %0d",

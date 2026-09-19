@@ -22,6 +22,10 @@ derive_clock_uncertainty
 #     cpu_datacache fill_line_saved), written only in the clk93 state
 #     machine's IDLE state and frozen from the request until ram_done, which
 #     is itself produced by the response handshake;
+#   - the framebuffer line buffer's fetched line (cpu.vhd fbline_fill_1x),
+#     written in clk1x only while its own fetch is outstanding and copied
+#     into clk93 only when that fetch's completion has crossed the response
+#     mailbox, so it has been still for at least the two synchroniser cycles;
 #   - the first stage of a two-flop synchroniser (irq_meta, trace_trigger_meta,
 #     debug_vblank_cpu_meta, the debug counter mirrors below).
 # Reset was the one exception: the caches' clk1x fill processes were reset by

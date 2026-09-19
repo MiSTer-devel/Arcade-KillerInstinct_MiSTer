@@ -98,6 +98,9 @@ module ki_fps_overlay (
         "7": glyph_bits={5'b11111,5'b00001,5'b00010,5'b00100,5'b01000,5'b01000,5'b01000};
         "8": glyph_bits={5'b01110,5'b10001,5'b10001,5'b01110,5'b10001,5'b10001,5'b01110};
         "9": glyph_bits={5'b01110,5'b10001,5'b10001,5'b01111,5'b00001,5'b00001,5'b01110};
+        "F": glyph_bits={5'b11111,5'b10000,5'b10000,5'b11110,5'b10000,5'b10000,5'b10000};
+        "P": glyph_bits={5'b11110,5'b10001,5'b10001,5'b11110,5'b10000,5'b10000,5'b10000};
+        "S": glyph_bits={5'b01111,5'b10000,5'b10000,5'b01110,5'b00001,5'b00001,5'b11110};
         ":": glyph_bits={5'b00000,5'b00100,5'b00100,5'b00000,5'b00100,5'b00100,5'b00000};
         default: glyph_bits=35'd0;
       endcase
@@ -111,16 +114,17 @@ module ki_fps_overlay (
   logic  [2:0] font_y;
 
   always_comb begin
-    // Six 16x16 cells aligned to the right edge: "nn:30".  The 5x7 font is
+    // Six 16x16 cells aligned to the right edge: "FPS:nn".  The 5x7 font is
     // doubled to 10x14 pixels, matching the existing debug screen's style.
     box_pixel = (h_count >= 10'd224) && (h_count < 10'd320) &&
                 (v_count < 10'd16);
     case (h_count[8:4])
-      5'd15: character = decimal_ascii(fps, 1'b0);
-      5'd16: character = decimal_ascii(fps, 1'b1);
+      5'd14: character = "F";
+      5'd15: character = "P";
+      5'd16: character = "S";
       5'd17: character = ":";
-      5'd18: character = "3";
-      5'd19: character = "0";
+      5'd18: character = decimal_ascii(fps, 1'b0);
+      5'd19: character = decimal_ascii(fps, 1'b1);
       default: character = " ";
     endcase
 

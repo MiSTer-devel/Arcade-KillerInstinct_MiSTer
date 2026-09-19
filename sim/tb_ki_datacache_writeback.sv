@@ -42,21 +42,27 @@ module tb_ki_datacache_writeback;
   // here, which is what made the first attempt at this test report
   // 'cache never requested a fill'.
   localparam logic [31:0] CTX_ALT  = {LINE_TAG2, 12'h800};
-  // A pair that genuinely shares an index, built from the slices the RTL
-  // actually uses rather than from a tag/offset split that happens to look
-  // right. cpu_datacache indexes on addr[13:5] and compares addr[31:14], so
-  // two addresses collide only if their low 14 bits match. LINE_ADDR and
-  // LINE_ADDR2 differ in addr[13:12] - they are 0x234 and 0x567 in the
-  // addr[31:12] field - so they land on DIFFERENT lines, which is the trap
-  // already recorded for CTX_ALT above and which this pair avoids by
-  // construction.
+  // Lines that genuinely share a set, built from the slices the RTL actually
+  // uses rather than from a tag/offset split that happens to look right. The
+  // cache is 2-way: it indexes on addr[12:5] and compares addr[31:13], so two
+  // addresses share a set if their low 13 bits match. LINE_ADDR and LINE_ADDR2
+  // differ in addr[12] - they are 0x234 and 0x567 in the addr[31:12] field -
+  // so they land in DIFFERENT sets, which is the trap already recorded for
+  // CTX_ALT above and which these avoid by construction. All four have
+  // addr[13] clear, which only matters to index ops: that bit names the way.
+  //
+  // Two ways means two lines in a set displace nothing, so displacement takes
+  // a third, and the dirty-on-store test a fourth to start from a line it
+  // brought in itself.
   localparam logic [8:0]  DISP_INDEX = 9'h0C0;
   localparam logic [31:0] DISP_A = {18'h00234, DISP_INDEX, 5'h00};
   localparam logic [31:0] DISP_B = {18'h00567, DISP_INDEX, 5'h00};
-  // A third tag at the same index, so the dirty-on-store test can start from
-  // a line it brought in itself rather than from whatever the displacement
-  // test left resident.
   localparam logic [31:0] DISP_C = {18'h0089A, DISP_INDEX, 5'h00};
+  localparam logic [31:0] DISP_D = {18'h00ABC, DISP_INDEX, 5'h00};
+  // One set, one line per way, placed by index store tag: addr[31:13] is odd
+  // for IDX1 and even for IDX0, so addr[13] puts them in ways 1 and 0.
+  localparam logic [31:0] IDX1_ADDR = {19'h00123, 8'h55, 5'h00};
+  localparam logic [31:0] IDX0_ADDR = {19'h00124, 8'h55, 5'h00};
 
   logic clk1x = 1'b0;
   logic clk93 = 1'b0;
@@ -93,7 +99,13 @@ module tb_ki_datacache_writeback;
   logic        rw_64 = 1'b1;
   wire         read_busy;
   wire         read_done;
-  wire [63:0]  read_data;
+  wire [63:0]  read_data_w;
+  // What the CPU would take: read_data_w in the cycle read_done is high. The
+  // read tasks latch it there. Checking the live output after the task
+  // returns is not the same thing - by then the way prediction has updated
+  // and shows the right way, so a load that returned the WRONG way's data
+  // passed that check.
+  logic [63:0] read_data = 64'd0;
 
   logic        write_ena = 1'b0;
   logic  [7:0] write_be = 8'hff;
@@ -113,7 +125,17 @@ module tb_ki_datacache_writeback;
   wire [21:0]  write_tag_value;
   wire  [3:0]  debug_state;
 
-  cpu_datacache #(.LITTLE_ENDIAN(1'b1)) dut (
+  // Skipped store-miss fills (SKIP_FILL): one set, four lines, so that
+  // evictions can be steered. addr[13] is clear in all four.
+  localparam logic [8:0]  SKIP_INDEX = 9'h0A0;
+  localparam logic [31:0] SK_A = {18'h00234, SKIP_INDEX, 5'h00};
+  localparam logic [31:0] SK_B = {18'h00567, SKIP_INDEX, 5'h00};
+  localparam logic [31:0] SK_C = {18'h0089A, SKIP_INDEX, 5'h00};
+  localparam logic [31:0] SK_D = {18'h00ABC, SKIP_INDEX, 5'h00};
+
+  wire  [3:0]  writeback_mask;
+
+  cpu_datacache #(.LITTLE_ENDIAN(1'b1), .SKIP_FILL(1'b1)) dut (
     .clk1x(clk1x), .clk93(clk93), .clk2x(clk2x),
     // One reset for both domains in the bench; see tb_ki_instrcache.sv.
     .reset_1x(reset_93), .reset_93(reset_93), .ce_93(1'b1),
@@ -123,10 +145,10 @@ module tb_ki_datacache_writeback;
     .ram_active(ram_active), .ram_grant(ram_grant), .ram_done(ram_done),
     .ddr3_DOUT(ddr3_DOUT), .ddr3_DOUT_READY(ddr3_DOUT_READY),
     .writeback_ena(writeback_ena), .writeback_addr(writeback_addr),
-    .writeback_data(writeback_data),
+    .writeback_data(writeback_data), .writeback_mask(writeback_mask),
     .tag_addr(tag_addr),
     .read_ena(read_ena), .RW_addr(rw_addr), .RW_64(rw_64),
-    .read_busy(read_busy), .read_done(read_done), .read_data(read_data),
+    .read_busy(read_busy), .read_done(read_done), .read_data(read_data_w),
     .write_ena(write_ena), .write_be(write_be), .write_data(write_data),
     .write_done(write_done),
     .CacheCommandEna(cache_command_ena), .CacheCommand(cache_command),
@@ -138,19 +160,47 @@ module tb_ki_datacache_writeback;
     .debug_state(debug_state), .SS_reset(ss_reset)
   );
 
-  // Capture the write-back burst.
+  // Capture the write-back burst, and the qword mask the line goes out with.
+  // The mask must hold still across the beats: the CPU takes it once, when
+  // the line is issued after the fourth.
   logic [63:0] wb_data [0:7];
   logic [31:0] wb_addr [0:7];
   integer wb_n = 0;
+  logic [3:0] wb_mask_cap = 4'h0;
+  logic       wb_mask_moved = 1'b0;
   always @(posedge clk93) begin
     if (writeback_ena) begin
       if (wb_n < 8) begin
         wb_data[wb_n] <= writeback_data;
         wb_addr[wb_n] <= writeback_addr;
       end
+      if (wb_n != 0 && writeback_mask !== wb_mask_cap) wb_mask_moved <= 1'b1;
+      wb_mask_cap <= writeback_mask;
       wb_n <= wb_n + 1;
     end
+    if (debug_state == 4'd11 && writeback_mask !== wb_mask_cap && wb_n != 0)   // WRITEBACKDONE
+      wb_mask_moved <= 1'b1;
   end
+
+  // serve_fill clears saw_ram_request once it has served, so a fork cannot
+  // test it afterwards; count the requests instead.
+  integer skip_n = 0, absent_n = 0, ram_req_n = 0;
+  always @(posedge clk93) begin
+    if (ram_request)          ram_req_n <= ram_req_n + 1;
+    if (dut.perf_fill_skip)   skip_n   <= skip_n + 1;
+    if (dut.perf_fill_absent) absent_n <= absent_n + 1;
+  end
+
+  // Cycles in WAYFIX (state 14): one per load that hit in the way the
+  // prediction did not pick.
+  integer wayfix_n = 0;
+  always @(posedge clk93)
+    if (debug_state == 4'd14) wayfix_n <= wayfix_n + 1;
+
+  // Index load tag's answer.
+  logic [21:0] tag_read_back = 22'd0;
+  always @(posedge clk93)
+    if (write_tag_ena) tag_read_back <= write_tag_value;
 
   task automatic step(input int n);
     repeat (n) @(posedge clk93);
@@ -228,9 +278,22 @@ module tb_ki_datacache_writeback;
 
   // Start a read that is expected to MISS, so the fill can be served in
   // parallel. LINE_ADDR2 is a different tag at the same index.
+  // Set while cache_read_miss runs, so the fill split can be observed without
+  // disturbing the sequence it is measuring.
+  integer f1_cycles = 0;
+  integer f2_cycles = 0;
+  integer f3_cycles = 0;
+  integer fill_cycles = 0;
+  integer f_both    = 0;
+
   task automatic cache_read_miss(input int byte_offset);
     integer guard;
     begin
+      f1_cycles = 0;
+      f2_cycles = 0;
+      f3_cycles = 0;
+      fill_cycles = 0;
+      f_both    = 0;
       tag_addr <= LINE_ADDR2 + byte_offset;
       rw_addr  <= LINE_ADDR2 + byte_offset;
       rw_64    <= 1'b1;
@@ -239,7 +302,18 @@ module tb_ki_datacache_writeback;
       guard = 0;
       forever begin
         step(1);
-        if (read_done) break;
+        if (dut.perf_fill_wait) f1_cycles = f1_cycles + 1;
+        if (dut.perf_fill_data) f2_cycles = f2_cycles + 1;
+        if (dut.perf_fill_hold) f3_cycles = f3_cycles + 1;
+        if (dut.state == 2) fill_cycles = fill_cycles + 1;
+        // The three are a partition, so no two may ever be high together.
+        if ((dut.perf_fill_wait && dut.perf_fill_data) ||
+            (dut.perf_fill_wait && dut.perf_fill_hold) ||
+            (dut.perf_fill_data && dut.perf_fill_hold)) f_both = f_both + 1;
+        if (read_done) begin
+          read_data = read_data_w;
+          break;
+        end
         guard = guard + 1;
         if (guard > 400) begin
           $error("fill read never completed");
@@ -265,7 +339,10 @@ module tb_ki_datacache_writeback;
       guard = 0;
       forever begin
         step(1);
-        if (read_done) break;
+        if (read_done) begin
+          read_data = read_data_w;
+          break;
+        end
         guard = guard + 1;
         if (guard > 40) begin
           $error("cached read at +%0d never completed", byte_offset);
@@ -403,7 +480,10 @@ module tb_ki_datacache_writeback;
       guard = 0;
       forever begin
         step(1);
-        if (read_done) break;
+        if (read_done) begin
+          read_data = read_data_w;
+          break;
+        end
         guard = guard + 1;
         if (guard > 40) begin
           $error("read at %08h never completed", addr);
@@ -429,7 +509,10 @@ module tb_ki_datacache_writeback;
       guard = 0;
       forever begin
         step(1);
-        if (read_done) break;
+        if (read_done) begin
+          read_data = read_data_w;
+          break;
+        end
         guard = guard + 1;
         if (guard > 400) begin
           $error("miss read at %08h never completed", addr);
@@ -453,7 +536,10 @@ module tb_ki_datacache_writeback;
       guard = 0;
       forever begin
         step(1);
-        if (read_done) break;
+        if (read_done) begin
+          read_data = read_data_w;
+          break;
+        end
         guard = guard + 1;
         if (guard > 40) begin
           $error("read at %08h never completed", addr);
@@ -466,6 +552,61 @@ module tb_ki_datacache_writeback;
     end
   endtask
 
+  // A store the way the CPU makes one that may MISS: write_ena for the
+  // cache's IDLE cycle only, then stall4 held - so the cache takes the store
+  // from write_data_1 - until write_done. The other store tasks never wait,
+  // which is fine for hits and nothing else.
+  // write_done is combinational and can last less than a clk93 cycle's second
+  // half when ram_done arrives late in it, so count it where the CPU samples
+  // it: at the edge.
+  integer write_done_n = 0;
+  always @(posedge clk93) if (write_done) write_done_n <= write_done_n + 1;
+
+  task automatic store_wait(input logic [31:0] addr, input logic [63:0] value,
+                            input logic [7:0] be, input logic wide);
+    integer guard;
+    integer done_before;
+    begin
+      tag_addr   <= addr;
+      rw_addr    <= addr;
+      write_data <= value;
+      write_be   <= be;
+      rw_64      <= wide;
+      step(2);
+      done_before = write_done_n;
+      write_ena  <= 1'b1;
+      @(posedge clk93);          // the cache's IDLE cycle with the store
+      write_ena  <= 1'b0;
+      #1;
+      if (write_done_n == done_before) begin
+        stall4 <= 1'b1;
+        guard = 0;
+        while (write_done_n == done_before && guard <= 400) begin
+          @(posedge clk93);
+          #1;
+          guard = guard + 1;
+        end
+        if (write_done_n == done_before) begin
+          $error("store at %08h never completed", addr);
+          errors = errors + 1;
+        end
+        stall4 <= 1'b0;
+      end
+      step(3);
+    end
+  endtask
+
+  // Replace one byte of a qword, little-endian.
+  function automatic logic [63:0] with_byte(input logic [63:0] q, input int k,
+                                            input logic [7:0] b);
+    logic [63:0] r;
+    begin
+      r = q;
+      r[k * 8 +: 8] = b;
+      return r;
+    end
+  endfunction
+
   integer i;
   integer k;
   integer bad;
@@ -476,7 +617,7 @@ module tb_ki_datacache_writeback;
     step(4);
     ss_reset = 1'b0;
     reset_93 = 1'b0;
-    step(700);          // CLEARCACHE walks all 512 tags
+    step(700);          // CLEARCACHE walks all 256 sets
 
     $display("");
     $display("cpu_datacache: 32-byte dirty line write-back");
@@ -585,6 +726,41 @@ module tb_ki_datacache_writeback;
       serve_fill();
       cache_read_miss(0);
     join
+
+    // -----------------------------------------------------------------
+    // The fill split actually splits.
+    //
+    // perf_fill_wait / perf_fill_data partition the FILL state either side of
+    // the first data beat. The point of a partition over a proxy is that
+    // neither half can quietly read zero while the time goes elsewhere, so
+    // check exactly that against the real fill just performed. Four earlier
+    // taps on this path measured ~nothing on hardware and no bench caught any
+    // of them; this one is checkable here.
+    // -----------------------------------------------------------------
+    if (f1_cycles == 0) begin
+      $error("perf_fill_wait counted nothing across a whole line fill");
+      errors = errors + 1;
+    end
+    if (f2_cycles == 0) begin
+      $error("perf_fill_data counted nothing across a whole line fill");
+      errors = errors + 1;
+    end
+    if (f_both != 0) begin
+      $error("fill phases overlapped %0d cycles; they partition FILL", f_both);
+      errors = errors + 1;
+    end
+    // The real property: the three phases account for EVERY cycle of FILL.
+    // A tap that stopped counting would break this even if each phase looked
+    // individually plausible. f3 may legitimately be 0 here - this bench's
+    // memory model returns ram_done with the last beat, where hardware waits
+    // for a clk1x-to-clk93 mailbox round trip.
+    if (f1_cycles + f2_cycles + f3_cycles != fill_cycles) begin
+      $error("fill phases summed to %0d but FILL lasted %0d cycles",
+             f1_cycles + f2_cycles + f3_cycles, fill_cycles);
+      errors = errors + 1;
+    end
+    $display("tb_ki_datacache_writeback: fill split %0d wait + %0d data + %0d hold",
+             f1_cycles, f2_cycles, f3_cycles);
 
     read_base = LINE_ADDR2;
     for (i = 0; i < 4; i = i + 1) begin
@@ -744,9 +920,9 @@ module tb_ki_datacache_writeback;
     end
 
     $display("");
-    $display("  displacement write-back (a miss evicts a dirty line)");
+    $display("  two ways: a miss takes the empty way and keeps the dirty line");
 
-    mark_dirty_at(DISP_A);
+    mark_dirty_at(DISP_A);          // addr[13] clear: way 0, valid + dirty
     for (i = 0; i < 4; i = i + 1)
       write_dword_at(DISP_A + i * 8, {32'hDEAD_0000 + i, 32'hBEEF_0000 + i});
 
@@ -758,6 +934,67 @@ module tb_ki_datacache_writeback;
     fork
       serve_fill();
       read_miss_at(DISP_B);
+    join
+    step(40);
+
+    if (wb_n != 0) begin
+      $error("filling DISP_B wrote back %0d beats although the set's other way was empty",
+             wb_n);
+      errors = errors + 1;
+    end
+
+    // Both lines are resident. Each of the next two reads hits in the way the
+    // prediction did NOT pick - the other line was used last - so each takes
+    // one WAYFIX cycle, and must still return its own line's data. A third,
+    // to the line used last, is predicted right and takes none.
+    wayfix_n = 0;
+    saw_ram_request = 1'b0;
+    read_at(DISP_A + 8, 1'b1);
+    if (read_data !== {32'hDEAD_0001, 32'hBEEF_0001}) begin
+      $error("DISP_A read back %016h beside DISP_B, expected DEAD0001BEEF0001",
+             read_data);
+      errors = errors + 1;
+    end
+    read_at(DISP_B + 16, 1'b1);
+    if (read_data !== {32'hFACE_0005, 32'hFACE_0004}) begin
+      $error("DISP_B read back %016h beside DISP_A, expected FACE0005FACE0004",
+             read_data);
+      errors = errors + 1;
+    end
+    if (wayfix_n != 2) begin
+      $error("two reads alternating between the ways took %0d WAYFIX cycles, expected 2",
+             wayfix_n);
+      errors = errors + 1;
+    end
+    wayfix_n = 0;
+    read_at(DISP_B + 24, 1'b1);
+    if (read_data !== {32'hFACE_0007, 32'hFACE_0006}) begin
+      $error("DISP_B read back %016h, expected FACE0007FACE0006", read_data);
+      errors = errors + 1;
+    end
+    if (wayfix_n != 0) begin
+      $error("a hit in the most recently used way took %0d WAYFIX cycles", wayfix_n);
+      errors = errors + 1;
+    end
+    if (saw_ram_request) begin
+      $error("two lines in one set did not both stay resident - a read missed");
+      errors = errors + 1;
+    end
+    if (errors == 0)
+      $display("    both lines resident; mispredicted hits return the right way's data");
+
+    $display("");
+    $display("  displacement write-back (a third line evicts the LRU dirty line)");
+
+    // DISP_B was used last, so DISP_A is least recently used and must go.
+    wb_n = 0;
+    saw_ram_request = 1'b0;
+    for (i = 0; i < 4; i = i + 1)
+      fill_words[i] = {32'hC1C1_0000 + i * 2 + 1, 32'hC1C1_0000 + i * 2};
+
+    fork
+      serve_fill();
+      read_miss_at(DISP_C);
     join
 
     step(40);
@@ -790,11 +1027,26 @@ module tb_ki_datacache_writeback;
         $display("    the dirty line wrote back, 4 beats, at its own address");
     end
 
+    // ...and the line that was used last is the one still resident.
+    saw_ram_request = 1'b0;
+    read_at(DISP_B, 1'b1);
+    if (saw_ram_request) begin
+      $error("DISP_B, the most recently used line, was evicted instead of DISP_A");
+      errors = errors + 1;
+    end else if (read_data !== {32'hFACE_0001, 32'hFACE_0000}) begin
+      $error("DISP_B read back %016h after the eviction, expected FACE0001FACE0000",
+             read_data);
+      errors = errors + 1;
+    end else begin
+      $display("    the most recently used line survived");
+    end
+
     $display("");
     $display("  a store to a clean resident line must mark it dirty");
 
-    // Use a third tag at the shared index so this starts from a known state
-    // rather than from whatever the displacement test left behind.
+    // The set holds DISP_C (clean, least recently used) and DISP_B. Bring in
+    // a fourth tag so this starts from a line it filled itself; it replaces
+    // DISP_C, which is clean, so nothing may be written back.
     wb_n = 0;
     saw_ram_request = 1'b0;
     for (i = 0; i < 4; i = i + 1)
@@ -803,20 +1055,22 @@ module tb_ki_datacache_writeback;
     // 1. Bring the line in by MISSING on it. It is now valid and clean.
     fork
       serve_fill();
-      read_miss_at(DISP_C);
+      read_miss_at(DISP_D);
     join
     step(20);
 
     if (wb_n != 0) begin
-      $error("filling a clean line wrote back %0d beats, expected none", wb_n);
+      $error("filling over a clean line wrote back %0d beats, expected none", wb_n);
       errors = errors + 1;
     end
 
     // 2. Store into it. This hits, and must set the dirty bit.
-    write_dword_at(DISP_C, 64'hFEED_FACE_1234_5678);
+    write_dword_at(DISP_D, 64'hFEED_FACE_1234_5678);
     step(10);
 
-    // 3. Displace it. The store must come back out.
+    // 3. Make it the least recently used line, then displace it. The store
+    //    must come back out.
+    read_at(DISP_B, 1'b1);
     wb_n = 0;
     saw_ram_request = 1'b0;
     for (i = 0; i < 4; i = i + 1)
@@ -847,11 +1101,285 @@ module tb_ki_datacache_writeback;
           errors = errors + 1;
         end
       end
-      if (wb_addr[0][31:5] !== DISP_C[31:5]) begin
+      if (wb_addr[0][31:5] !== DISP_D[31:5]) begin
         $error("write-back went to %08h, expected the line at %08h",
-               wb_addr[0], DISP_C);
+               wb_addr[0], DISP_D);
         errors = errors + 1;
       end
+    end
+
+    $display("");
+    $display("  index ops select their way with address bit 13");
+
+    // Index store tag at an address with bit 13 set writes WAY 1 of the set,
+    // with bit 13 clear way 0 - so two lines placed that way are both
+    // resident, and index ops at each address act on that line alone.
+    mark_dirty_at(IDX1_ADDR);
+    mark_dirty_at(IDX0_ADDR);
+    saw_ram_request = 1'b0;
+    for (i = 0; i < 4; i = i + 1)
+      write_dword_at(IDX1_ADDR + i * 8, {32'h1111_0000 + i, 32'h1111_1000 + i});
+    for (i = 0; i < 4; i = i + 1)
+      write_dword_at(IDX0_ADDR + i * 8, {32'h0000_A000 + i, 32'h0000_B000 + i});
+    if (saw_ram_request) begin
+      $error("a store to a line placed by index store tag missed");
+      errors = errors + 1;
+    end
+
+    // Index load tag: valid & dirty & addr[31:12] of whichever line is there.
+    for (k = 0; k < 2; k = k + 1) begin
+      tag_read_back = 22'd0;
+      tag_addr <= (k == 0) ? IDX0_ADDR : IDX1_ADDR;
+      rw_addr  <= (k == 0) ? IDX0_ADDR : IDX1_ADDR;
+      cache_command <= 5'h05;        // dcache index load tag
+      step(3);
+      cache_command_ena <= 1'b1;
+      step(1);
+      cache_command_ena <= 1'b0;
+      step(6);
+      if (tag_read_back !== {2'b11, ((k == 0) ? IDX0_ADDR[31:12] : IDX1_ADDR[31:12])}) begin
+        $error("index load tag for way %0d returned %06h, expected %06h", k,
+               tag_read_back, {2'b11, ((k == 0) ? IDX0_ADDR[31:12] : IDX1_ADDR[31:12])});
+        errors = errors + 1;
+      end
+    end
+
+    // Index write back invalidate at IDX1_ADDR writes back way 1's line.
+    wb_n = 0;
+    tag_addr <= IDX1_ADDR;
+    rw_addr  <= IDX1_ADDR;
+    cache_command <= 5'h01;
+    step(3);
+    cache_command_ena <= 1'b1;
+    step(1);
+    cache_command_ena <= 1'b0;
+    step(40);
+    if (wb_n != 4) begin
+      $error("index write back invalidate on way 1 produced %0d beats, expected 4", wb_n);
+      errors = errors + 1;
+    end else begin
+      for (i = 0; i < 4; i = i + 1) begin
+        expect_word = {32'h1111_0000 + i, 32'h1111_1000 + i};
+        if (wb_data[i] !== expect_word || wb_addr[i][31:5] !== IDX1_ADDR[31:5]) begin
+          $error("way 1 write-back beat %0d = %016h at %08h, expected %016h at %08h",
+                 i, wb_data[i], wb_addr[i], expect_word, IDX1_ADDR);
+          errors = errors + 1;
+        end
+      end
+    end
+
+    // Way 0 is untouched and still hits.
+    saw_ram_request = 1'b0;
+    read_at(IDX0_ADDR + 8, 1'b1);
+    if (saw_ram_request || read_data !== {32'h0000_A001, 32'h0000_B001}) begin
+      $error("way 0's line after invalidating way 1: %s, read %016h, expected 0000A0010000B001",
+             saw_ram_request ? "MISSED" : "hit", read_data);
+      errors = errors + 1;
+    end
+    if (errors == 0)
+      $display("    index ops act on the way addr[13] names, and only on it");
+
+    // -----------------------------------------------------------------
+    // SKIP_FILL: a 64-bit store that misses takes its line without a fill.
+    //
+    // Everything a skipped fill leaves behind has to hold: the store's own
+    // qword reads back; a load of an absent qword fills ONLY the absent
+    // qwords, around the stored one; a 64-bit store into an absent qword needs
+    // no fill; a narrower one does, and lands on top of it; a write-back
+    // names only the qwords the line really holds, and holds that mask still
+    // until the line is taken; an index op writes back with the same mask.
+    // -----------------------------------------------------------------
+    $display("");
+    $display("  skipped store-miss fills");
+    begin
+      logic [63:0] fa [0:3], fb [0:3], fc [0:3], fd [0:3];
+      int errors_before, skips_before, absents_before, way_c, req_before;
+      errors_before  = errors;
+      for (i = 0; i < 4; i = i + 1) begin
+        fa[i] = {32'hA0A0_0000 + i, 32'h0000_0A00 + i};
+        fb[i] = {32'hB0B0_0000 + i, 32'h0000_0B00 + i};
+        fc[i] = {32'hC0C0_0000 + i, 32'h0000_0C00 + i};
+        fd[i] = {32'hD0D0_0000 + i, 32'h0000_0D00 + i};
+      end
+
+      // A and B in by load misses; A dirtied and left least recently used.
+      for (i = 0; i < 4; i = i + 1) fill_words[i] = fa[i];
+      fork serve_fill(); read_miss_at(SK_A); join
+      for (i = 0; i < 4; i = i + 1) fill_words[i] = fb[i];
+      fork serve_fill(); read_miss_at(SK_B); join
+      store_wait(SK_A + 8, 64'h1111_2222_3333_4444, 8'hff, 1'b1);
+      read_at(SK_B, 1'b1);
+      step(4);
+      skips_before   = skip_n;
+      absents_before = absent_n;
+
+      // 1. C's qword 2 by a 64-bit store miss: A goes back whole, C is not read.
+      wb_n = 0;
+      wb_mask_moved = 1'b0;
+      saw_ram_request = 1'b0;
+      store_wait(SK_C + 16, 64'hC2C2_C2C2_0000_0002, 8'hff, 1'b1);
+      step(10);
+      if (saw_ram_request) begin
+        $error("a 64-bit store miss requested a fill");
+        errors = errors + 1;
+      end
+      if (wb_n != 4 || wb_mask_cap !== 4'b1111 || wb_addr[0][31:5] !== SK_A[31:5]) begin
+        $error("evicting A for C wrote %0d beats, mask %b, at %08h - expected 4, 1111, A",
+               wb_n, wb_mask_cap, wb_addr[0]);
+        errors = errors + 1;
+      end
+      read_at(SK_C + 16, 1'b1);
+      if (saw_ram_request || read_data !== 64'hC2C2_C2C2_0000_0002) begin
+        $error("C's stored qword read back %016h%s", read_data,
+               saw_ram_request ? " after a fill" : "");
+        errors = errors + 1;
+      end
+
+      // 2. A load of an absent qword fills the line around the stored one.
+      for (i = 0; i < 4; i = i + 1) fill_words[i] = fc[i];
+      req_before = ram_req_n;
+      fork serve_fill(); read_miss_at(SK_C); join
+      if (ram_req_n - req_before != 1) begin
+        $error("a load of C's absent qword 0 made %0d fill requests, expected 1",
+               ram_req_n - req_before);
+        errors = errors + 1;
+      end
+      if (read_data !== fc[0]) begin
+        $error("C's filled qword 0 read %016h, expected %016h", read_data, fc[0]);
+        errors = errors + 1;
+      end
+      saw_ram_request = 1'b0;
+      read_at(SK_C + 16, 1'b1);
+      if (read_data !== 64'hC2C2_C2C2_0000_0002) begin
+        $error("the fill overwrote C's stored qword 2: %016h", read_data);
+        errors = errors + 1;
+      end
+      read_at(SK_C + 8, 1'b1);
+      if (read_data !== fc[1]) begin
+        $error("C's filled qword 1 read %016h, expected %016h", read_data, fc[1]);
+        errors = errors + 1;
+      end
+      read_at(SK_C + 24, 1'b1);
+      if (read_data !== fc[3]) begin
+        $error("C's filled qword 3 read %016h, expected %016h", read_data, fc[3]);
+        errors = errors + 1;
+      end
+      if (saw_ram_request) begin
+        $error("C was filled twice");
+        errors = errors + 1;
+      end
+
+      // 3. D by a store miss over B (clean: nothing written back), then a
+      //    64-bit store into its absent qword 3, which needs no fill.
+      wb_n = 0;
+      saw_ram_request = 1'b0;
+      store_wait(SK_D + 8, 64'hD1D1_D1D1_0000_0001, 8'hff, 1'b1);
+      store_wait(SK_D + 24, 64'hD3D3_D3D3_0000_0003, 8'hff, 1'b1);
+      step(10);
+      if (saw_ram_request || wb_n != 0) begin
+        $error("D by two 64-bit stores took %0d fill request(s) and %0d write-back beats",
+               saw_ram_request, wb_n);
+        errors = errors + 1;
+      end
+      read_at(SK_D + 24, 1'b1);
+      if (read_data !== 64'hD3D3_D3D3_0000_0003) begin
+        $error("D's qword 3 read %016h after a store into it while absent", read_data);
+        errors = errors + 1;
+      end
+
+      // 4. D goes back holding qwords 1 and 3 only.
+      read_at(SK_C + 8, 1'b1);                 // C most recent, D least
+      wb_n = 0;
+      wb_mask_moved = 1'b0;
+      for (i = 0; i < 4; i = i + 1) fill_words[i] = fa[i];
+      fork serve_fill(); read_miss_at(SK_A); join
+      step(10);
+      if (wb_n != 4 || wb_addr[0][31:5] !== SK_D[31:5]) begin
+        $error("evicting D wrote %0d beats at %08h", wb_n, wb_addr[0]);
+        errors = errors + 1;
+      end else begin
+        if (wb_mask_cap !== 4'b1010) begin
+          $error("D went back with mask %b, expected 1010 - only qwords 1 and 3 were ever in it",
+                 wb_mask_cap);
+          errors = errors + 1;
+        end
+        if (wb_data[1] !== 64'hD1D1_D1D1_0000_0001 || wb_data[3] !== 64'hD3D3_D3D3_0000_0003) begin
+          $error("D's present qwords went back as %016h and %016h", wb_data[1], wb_data[3]);
+          errors = errors + 1;
+        end
+      end
+      if (wb_mask_moved) begin
+        $error("writeback_mask changed while D's line was going out");
+        errors = errors + 1;
+      end
+
+      // 5. A narrower store into an absent qword: B by a 64-bit store miss
+      //    over C (dirty, whole), then a byte into B's absent qword 2. That
+      //    fills B's absent qwords and puts the byte on top.
+      wb_n = 0;
+      store_wait(SK_B + 8, 64'hB1B1_B1B1_0000_0001, 8'hff, 1'b1);
+      step(10);
+      if (wb_n != 4 || wb_mask_cap !== 4'b1111 || wb_addr[0][31:5] !== SK_C[31:5]) begin
+        $error("evicting C for B wrote %0d beats, mask %b, at %08h - expected 4, 1111, C",
+               wb_n, wb_mask_cap, wb_addr[0]);
+        errors = errors + 1;
+      end
+      for (i = 0; i < 4; i = i + 1) fill_words[i] = fb[i];
+      req_before = ram_req_n;
+      fork
+        serve_fill();
+        store_wait(SK_B + 19, 64'h0000_0000_5A00_0000, 8'h08, 1'b0);
+      join
+      if (ram_req_n - req_before != 1) begin
+        $error("a byte store into an absent qword did not fill it first");
+        errors = errors + 1;
+      end
+      read_at(SK_B + 16, 1'b1);
+      if (read_data !== with_byte(fb[2], 3, 8'h5A)) begin
+        $error("B's qword 2 read %016h, expected the fill with the stored byte, %016h",
+               read_data, with_byte(fb[2], 3, 8'h5A));
+        errors = errors + 1;
+      end
+      read_at(SK_B + 8, 1'b1);
+      if (read_data !== 64'hB1B1_B1B1_0000_0001) begin
+        $error("the fill for B's byte store overwrote its stored qword 1: %016h", read_data);
+        errors = errors + 1;
+      end
+      read_at(SK_B + 0, 1'b1);
+      if (read_data !== fb[0]) begin
+        $error("B's filled qword 0 read %016h, expected %016h", read_data, fb[0]);
+        errors = errors + 1;
+      end
+
+      // 6. Index write back invalidate names the way; the line goes back with
+      //    its mask. C by a 64-bit store miss over A (clean), qword 0 only.
+      wb_n = 0;
+      store_wait(SK_C + 0, 64'hC0C0_C0C0_0000_0000, 8'hff, 1'b1);
+      way_c = dut.data_way;
+      step(4);
+      wb_n = 0;
+      wb_mask_moved = 1'b0;
+      tag_addr <= {SK_C[31:14], way_c[0], SK_C[12:0]};
+      rw_addr  <= {SK_C[31:14], way_c[0], SK_C[12:0]};
+      cache_command <= 5'h01;
+      step(3);
+      cache_command_ena <= 1'b1;
+      step(1);
+      cache_command_ena <= 1'b0;
+      step(40);
+      if (wb_n != 4 || wb_mask_cap !== 4'b0001 || wb_data[0] !== 64'hC0C0_C0C0_0000_0000) begin
+        $error("index write back of C (way %0d) wrote %0d beats, mask %b, qword 0 %016h - expected 4, 0001, C0C0C0C000000000",
+               way_c, wb_n, wb_mask_cap, wb_data[0]);
+        errors = errors + 1;
+      end
+
+      if (skip_n - skips_before != 4 || absent_n - absents_before != 2) begin
+        $error("counted %0d skipped fills and %0d absent-qword fills, expected 4 and 2",
+               skip_n - skips_before, absent_n - absents_before);
+        errors = errors + 1;
+      end
+      if (errors == errors_before)
+        $display("    skipped fills: stored qwords survive fills, write-backs carry only what the line holds");
     end
 
     $display("");

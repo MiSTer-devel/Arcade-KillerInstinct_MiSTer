@@ -9,8 +9,11 @@ module ki_sdram_adapter (
   // Word address (16-bit words); only [23:0] reach the 25-bit byte-addressed
   // controller.
   input  wire  [24:0] request_address,
-  input  wire  [63:0] request_write_data,
-  input  wire   [7:0] request_byte_enable,
+  // Up to 16 words - one 32-byte cache line - so a dirty line goes out as a
+  // single burst instead of four. aux stays 64-bit: the BIST never bursts
+  // more than four words, and is zero-extended onto the controller below.
+  input  wire [255:0] request_write_data,
+  input  wire  [31:0] request_byte_enable,
   // Words to transfer: 1..16 on a read, 1..4 on a write (the controller
   // clamps writes to the width of its 4-word payload).
   input  wire   [4:0] request_burst,
@@ -44,17 +47,27 @@ module ki_sdram_adapter (
   output logic        sdram_ready,
 
   output logic [24:0] controller_address,
-  output logic [63:0] controller_write_data,
-  output logic  [7:0] controller_byte_enable,
+  output logic [255:0] controller_write_data,
+  output logic  [31:0] controller_byte_enable,
   output logic  [4:0] controller_burst,
   output logic        controller_read,
   output logic        controller_write,
   input  wire  [15:0] controller_read_data,
   // A controller without per-beat validity may tie this low; single-word read
-  // data is then captured from the completion handshake.
+  // data is then taken at the completion handshake.
   input  wire         controller_dout_valid,
   input  wire         controller_ready
 );
+  // Returned words pass straight through to the port that owns the
+  // transaction: ki_sdram_burst already registers each one as it captures DQ,
+  // and a second register here cost a clock on every word of every read. The
+  // data holds between captures, so a single-word requester can still take it
+  // at done.
+  logic owner = 1'b0;   // 0 = primary owns the in-flight transaction, 1 = auxiliary
+  assign request_read_data  = controller_read_data;
+  assign request_data_valid = controller_dout_valid && !owner;
+  assign aux_read_data      = controller_read_data;
+  assign aux_data_valid     = controller_dout_valid && owner;
   typedef enum logic [1:0] {
     ADAPTER_IDLE,
     ADAPTER_SETTLE,
@@ -68,8 +81,8 @@ module ki_sdram_adapter (
   logic req_pending = 1'b0;
   logic req_pending_write = 1'b0;
   logic [24:0] req_pending_address = 25'd0;
-  logic [63:0] req_pending_write_data = 64'd0;
-  logic  [7:0] req_pending_byte_enable = 8'h00;
+  logic [255:0] req_pending_write_data = 256'd0;
+  logic  [31:0] req_pending_byte_enable = 32'h0000_0000;
   logic  [4:0] req_pending_burst = 5'd1;
 
   logic aux_pending = 1'b0;
@@ -79,43 +92,33 @@ module ki_sdram_adapter (
   logic  [7:0] aux_pending_byte_enable = 8'h00;
   logic  [4:0] aux_pending_burst = 5'd1;
 
-  // 0 = primary owns the in-flight transaction, 1 = auxiliary owns it.
-  logic owner = 1'b0;
-
   localparam integer AUX_STARVE_LIMIT = 32;
   logic [5:0] aux_wait = '0;
   wire aux_starved = (aux_wait >= AUX_STARVE_LIMIT[5:0]);
 
   assign sdram_ready = startup_done;
 
+  // A primary request arriving while nothing is queued and the controller is
+  // free goes straight out on this clock. It used to be captured into
+  // req_pending first and launched from there on the next - a clock on every
+  // SDRAM operation. A request that arrives while one is queued, or while the
+  // adapter is busy, still queues.
+  wire request_now = request_read || request_write;
+  wire launch_direct = (state == ADAPTER_IDLE) && controller_ready && startup_done &&
+                       !req_pending && request_now && !(aux_pending && aux_starved);
+
   always_ff @(posedge clk) begin
     request_done <= 1'b0;
-    request_data_valid <= 1'b0;
     aux_done <= 1'b0;
-    aux_data_valid <= 1'b0;
     controller_read <= 1'b0;
     controller_write <= 1'b0;
-
-    // Stream burst beats straight through to whichever port owns the
-    // transaction. Harmless when the controller never asserts it.
-    if (controller_dout_valid) begin
-      if (owner) begin
-        aux_read_data <= controller_read_data;
-        aux_data_valid <= 1'b1;
-      end else begin
-        request_read_data <= controller_read_data;
-        request_data_valid <= 1'b1;
-      end
-    end
 
     if (reset) begin
       state <= ADAPTER_IDLE;
       startup_done <= 1'b0;
-      request_read_data <= 16'd0;
-      aux_read_data <= 16'd0;
       controller_address <= 25'd0;
-      controller_write_data <= 64'd0;
-      controller_byte_enable <= 8'h00;
+      controller_write_data <= 256'd0;
+      controller_byte_enable <= 32'h0000_0000;
       controller_burst <= 5'd1;
       req_pending <= 1'b0;
       req_pending_burst <= 5'd1;
@@ -134,7 +137,16 @@ module ki_sdram_adapter (
 
       case (state)
         ADAPTER_IDLE: begin
-          if (controller_ready && startup_done) begin
+          if (launch_direct) begin
+            controller_address <= {request_address[23:0], 1'b0};
+            controller_write_data <= request_write_data;
+            controller_byte_enable <= request_byte_enable;
+            controller_burst <= (request_burst == 0) ? 5'd1 : request_burst;
+            controller_read <= !request_write;
+            controller_write <= request_write;
+            owner <= 1'b0;
+            state <= ADAPTER_SETTLE;
+          end else if (controller_ready && startup_done) begin
             if (req_pending && !(aux_pending && aux_starved)) begin
               controller_address <= {req_pending_address[23:0], 1'b0};
               controller_write_data <= req_pending_write_data;
@@ -147,8 +159,8 @@ module ki_sdram_adapter (
               state <= ADAPTER_SETTLE;
             end else if (aux_pending) begin
               controller_address <= {aux_pending_address[23:0], 1'b0};
-              controller_write_data <= aux_pending_write_data;
-              controller_byte_enable <= aux_pending_byte_enable;
+              controller_write_data <= {192'd0, aux_pending_write_data};
+              controller_byte_enable <= {24'd0, aux_pending_byte_enable};
               controller_burst <= aux_pending_burst;
               controller_read <= !aux_pending_write;
               controller_write <= aux_pending_write;
@@ -168,10 +180,8 @@ module ki_sdram_adapter (
         ADAPTER_WAIT: begin
           if (controller_ready) begin
             if (owner) begin
-              aux_read_data <= controller_read_data;
               aux_done <= 1'b1;
             end else begin
-              request_read_data <= controller_read_data;
               request_done <= 1'b1;
             end
             state <= ADAPTER_ACK;
@@ -181,8 +191,9 @@ module ki_sdram_adapter (
         ADAPTER_ACK: state <= ADAPTER_IDLE;
       endcase
 
-      // Sequenced last on purpose: see rule 1 in the header comment.
-      if (request_read || request_write) begin
+      // Sequenced last on purpose: see rule 1 in the header comment. A
+      // request launched directly above is not queued as well.
+      if (request_now && !launch_direct) begin
         req_pending <= 1'b1;
         req_pending_write <= request_write;
         req_pending_address <= request_address;
