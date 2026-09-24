@@ -1,6 +1,6 @@
 <misterromdescription>
   <name>Killer Instinct (proto v4.7)</name>
-  <mratimestamp>20260825</mratimestamp>
+  <mratimestamp>20260924</mratimestamp>
   <mameversion>0287</mameversion>
   <setname>kinst</setname>
   <year>1994</year>
@@ -28,7 +28,12 @@
     chdman.
   </remark>
 
-  <rom index="0"><part>00</part></rom>
+  <!-- Game selector: 00 = Killer Instinct -->
+  <rom index="0">
+    <part>00</part>
+  </rom>
+
+  <!-- Combined 4.5 MiB ROM image -->
   <rom index="1" zip="kinst.zip">
     <part name="ki-p47.u98"  crc="05e67bcb"/>
     <part name="u10-l1"      crc="b6cc155f"/>
