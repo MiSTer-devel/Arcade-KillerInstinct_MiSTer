@@ -1,6 +1,6 @@
 <misterromdescription>
   <name>Killer Instinct 2 (v1.1)</name>
-  <mratimestamp>20260825</mratimestamp>
+  <mratimestamp>20260924</mratimestamp>
   <mameversion>0287</mameversion>
   <setname>kinst2</setname>
   <year>1996</year>
@@ -27,7 +27,12 @@
     .img with chdman.
   </remark>
 
-  <rom index="0"><part>01</part></rom>
+  <!-- Game selector: 01 = Killer Instinct 2 -->
+  <rom index="0">
+    <part>01</part>
+  </rom>
+
+  <!-- Combined 4.5 MiB ROM image -->
   <rom index="1" zip="kinst2.zip">
     <part name="ki2-l11.u98" crc="0cb8de1e"/>
     <part name="ki2_l1.u10" crc="fdf6ed51"/>
