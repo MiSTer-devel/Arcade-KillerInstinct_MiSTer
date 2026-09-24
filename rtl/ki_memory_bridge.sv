@@ -410,15 +410,43 @@ module ki_memory_bridge (
   } ddr_service_state_t;
   ddr_service_state_t ddr_service_state = DDR_SERVICE_IDLE;
 
-  wire boot_download = ioctl_download && (ioctl_index == 16'h0001);
-  wire sound_download = ioctl_download &&
-      (ioctl_index >= 16'h0002) && (ioctl_index <= 16'h0009);
-  wire rom_download = boot_download || sound_download;
-  wire [27:0] sound_bank_offset =
-      (({12'h000, ioctl_index} - 28'd2) << 19);
-  wire [27:0] incoming_download_address = boot_download ?
-      (STORE_BOOT + ioctl_addr) :
-      (STORE_DCS + sound_bank_offset + ioctl_addr);
+  // Combined MRA ROM image:
+  //
+  //   000000-07FFFF  R4600 boot ROM
+  //   080000-0FFFFF  U10
+  //   100000-17FFFF  U11
+  //   180000-1FFFFF  U12
+  //   200000-27FFFF  U13
+  //   280000-2FFFFF  U33
+  //   300000-37FFFF  U34
+  //   380000-3FFFFF  U35
+  //   400000-47FFFF  U36
+  //
+  // Index 1 is therefore one 0x480000-byte ROM image.
+
+  localparam logic [26:0] BOOT_DOWNLOAD_BYTES = 27'h0080000;
+  localparam logic [26:0] ROM_DOWNLOAD_BYTES  = 27'h0480000;
+
+  wire rom_download =
+      ioctl_download &&
+      (ioctl_index == 16'h0001) &&
+      (ioctl_addr < ROM_DOWNLOAD_BYTES);
+
+  wire boot_download =
+      rom_download &&
+      (ioctl_addr < BOOT_DOWNLOAD_BYTES);
+
+  wire sound_download =
+      rom_download &&
+      (ioctl_addr >= BOOT_DOWNLOAD_BYTES);
+
+  wire [26:0] sound_download_address =
+      ioctl_addr - BOOT_DOWNLOAD_BYTES;
+
+  wire [27:0] incoming_download_address =
+      boot_download ?
+          (STORE_BOOT + ioctl_addr) :
+          (STORE_DCS + sound_download_address);
   wire download_accept = rom_download && ioctl_wr && !ioctl_wait;
   wire download_push =
       download_accept && (incoming_download_address[2:1] == 2'd3);

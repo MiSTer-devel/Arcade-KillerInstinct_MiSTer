@@ -7,7 +7,7 @@ module ki_startup_osd_button
 #(
 	parameter [25:0] WAIT_CYCLES = 26'd05000000,
 	parameter [25:0] END_CYCLES  = 26'd15000000,
-	parameter [15:0] LAST_ROM_INDEX = 16'd9
+	parameter [15:0] LAST_ROM_INDEX = 16'd1
 )
 (
 	input  wire clk_i,
