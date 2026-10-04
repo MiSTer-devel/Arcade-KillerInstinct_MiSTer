@@ -11,8 +11,8 @@ entity cpu_TLB_data is
       -- executeMemAddress: four entries, each testing TLB_AddrIn(39 downto 12)
       -- against a stored VPN and TLB_AddrIn(63 downto 62) against a stored
       -- region - 30 bits per entry, resolved as a priority chain, which fits
-      -- as five levels of logic. Across 36 fits, executeMemAddress and the
-      -- COP0 capture it feeds are the two largest critical clusters.
+      -- as five levels of logic. executeMemAddress and the COP0 capture it
+      -- feeds are the two largest critical clusters.
       --
       -- With 32-bit addressing every address is a sign-extension of bit 31, so
       -- bits 39 downto 32 and 63 downto 62 carry no information: they are the

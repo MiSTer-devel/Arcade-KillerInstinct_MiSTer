@@ -20,7 +20,7 @@ implements:
 
 ### Known issue
 
-Game slowdown - CPU is ~90 MHz and should be 100 MHz
+Occasional slowdown
 
 ## Media
 

@@ -143,6 +143,23 @@ set_instance_assignment -name CURRENT_STRENGTH_NEW "MAXIMUM CURRENT" -to SDRAM_*
 set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to SDRAM_*
 set_instance_assignment -name FAST_OUTPUT_ENABLE_REGISTER ON -to SDRAM_DQ[*]
 set_instance_assignment -name FAST_INPUT_REGISTER ON -to SDRAM_DQ[*]
+
+# clk_sdram_ctl MUST be a global clock, not the regional network Quartus picks
+# for it by default. Auto Global Clock gave outclk_wire[4] RCLK78, which
+# reaches one quadrant: of the sixteen SDRAM_DQ pins only the six inside it
+# (AH13, AH14, AG14, AD23, AE23, AE24) could take their I/O registers, and the
+# other ten fell into the fabric behind feeder LUTs - 19.7 ns on the capture
+# path and clk_sdram_ctl failing by 4.908 ns. SDRAM_A lost 5 of 13 the same way.
+#
+# All three registers of a bidirectional DQ cell - input, output and output
+# enable - must pack together, which is why dout, dq_out and dq_oe all read
+# exactly 6 of 16. clk_core reaches all of them at 50 MHz because it is GLOBAL
+# (GCLK6); this asks for the same treatment. 11 of 16 globals were in use.
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|pll:pll|pll_0002:pll_inst|altera_pll:altera_pll_i|outclk_wire[4]"
+# clk_sdram_cap needs a global for the same reason clk_sdram_ctl does: a
+# regional network reaches one quadrant, and the SDRAM_DQ pins are spread
+# across banks. Without it only part of the bus can take its I/O register.
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|pll:pll|pll_0002:pll_inst|altera_pll:altera_pll_i|outclk_wire[5]"
 set_instance_assignment -name ALLOW_SYNCH_CTRL_USAGE OFF -to *|SDRAM_*
 set_location_assignment PIN_AE15 -to SD_SPI_CS
 set_location_assignment PIN_AH8 -to SD_SPI_MISO

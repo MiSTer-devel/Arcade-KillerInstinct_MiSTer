@@ -8,7 +8,7 @@ module emu
 (
 	input         CLK_50M,
 	input         RESET,
-	inout  [48:0] HPS_BUS,
+	inout  [45:0] HPS_BUS,
 
 	output        CLK_VIDEO,
 	output        CE_PIXEL,
@@ -127,7 +127,7 @@ localparam CONF_STR = {
 `ifdef KI_DEBUG_BUILD
 	"P2,Debug;",
 	"P2O4,Video Output,Game,Debug;",
-	"P2O56,Debug Page,Status,Trace,Perf;",
+	"P2O56,Debug Page,Status,Trace,Perf,Prof;",
 	"P2O7,Perf Peak,Run,Clear;",
 	"P2O3,FPS Overlay,Off,On;",
 	"-;",
@@ -164,10 +164,42 @@ wire [15:0] sd_buff_dout;
 wire [15:0] sd_buff_din;
 wire sd_buff_wr;
 
+// Every clock in the core, and what each one is FOR. None of these names
+// carries a frequency.
+//
+//   wire              PLL out   freq     phase   purpose
+//   clk_core          0         50 MHz   0       video, I/O, bridge, debug
+//   clk_cpu           1         100 MHz  0       the MIPS core. RELATED to
+//                                                clk_core at 2:1 and timed
+//                                                against it (SYNC_CROSSING);
+//                                                see KillerInstinct.sdc.
+//   clk_ddr           2         100 MHz  0       DDRAM_CLK and the bridge's
+//                                                DDR side
+//   clk_sdram_pin     3         100 MHz  6750ps  leaves the chip as SDRAM_CLK
+//   clk_sdram_ctl     4         100 MHz  500ps   ki_sdram_burst's logic
+//   clk_sdram_cap     5         100 MHz  1500ps  captures SDRAM_DQ in the
+//                                                device's data eye
+//
+// clk_cpu and clk_ddr are configured identically, so Quartus MERGES them onto
+// one network - general[2] does not appear in the STA clock list at all. They
+// are kept as two wires because they have two unrelated jobs, and because the
+// merge is the fitter's decision to make, not this file's.
+//
+// Inside the CPU, clk_cpu arrives as clk93 and clk_core as clk1x. Those names
+// come from the N64 core this CPU is derived from (93.75 and 62.5 MHz) and are
+// wrong here - but the `_93` and `_1x` SUFFIXES on ~28 signals below them are
+// a domain tag that CDC code depends on, so renaming the clocks without
+// renaming every suffix would be worse than leaving both. This table is the
+// mapping.
+//
+// The SDRAM phases above cannot be derived from nominal timing;
+// rtl/pll/pll_0002.v records why.
 wire clk_core;
-wire clk_cpu_75;
-wire clk_cpu_100;
-wire clk_sdram_shifted;
+wire clk_cpu;
+wire clk_ddr;
+wire clk_sdram_pin;
+wire clk_sdram_ctl;
+wire clk_sdram_cap;
 wire pll_locked;
 
 // Keep this instance name aligned with sys/sys_top.sdc's core clock group.
@@ -176,9 +208,11 @@ pll pll
 	.refclk(CLK_50M),
 	.rst(1'b0),
 	.outclk_0(clk_core),
-	.outclk_1(clk_cpu_75),
-	.outclk_2(clk_cpu_100),
-	.outclk_3(clk_sdram_shifted),
+	.outclk_1(clk_cpu),
+	.outclk_2(clk_ddr),
+	.outclk_3(clk_sdram_pin),
+	.outclk_4(clk_sdram_ctl),
+	.outclk_5(clk_sdram_cap),
 	.locked(pll_locked)
 );
 
@@ -278,23 +312,16 @@ wire core_reset = shell_reset | ioctl_download | img_reset;
 
 wire boot_loaded;
 wire sdram_ready;
-// Declared here rather than beside their instances because cpu_reset below
-// uses all four. boot_loaded and sdram_ready were already hoisted for that
-// reason; bist_busy and verify_active were not, and verify_pending needs
-// bist_done and verify_done as well. Quartus tolerates the forward
-// reference, but relying on that for a term that gates the CPU reset is not
-// worth the risk.
+// Declared here rather than beside their instance because cpu_reset below
+// uses them. Quartus tolerates the forward reference, but relying on that for
+// a term that gates the CPU reset is not worth the risk.
 wire bist_busy;
 wire bist_done;
-wire verify_active;
-wire verify_done;
-// Hold the CPU continuously while the SDRAM self-test and boot verification
-// own the memory path. verify_pending bridges the registered handoff into
-// verify_active so reset cannot deassert for one cycle between the two phases.
-wire verify_pending = boot_loaded & bist_done & ~bist_busy &
-                      ~verify_active & ~verify_done;
-wire cpu_reset = core_reset | ~boot_loaded | ~sdram_ready | bist_busy |
-                 verify_active | verify_pending;
+// Hold the CPU until the SDRAM self test has finished with the memory path.
+// The test is built only into the debug build; the release build ties
+// bist_done high. done, not busy: done latches when the test completes, so
+// there is no cycle between the test starting and the CPU being released.
+wire cpu_reset = core_reset | ~boot_loaded | ~sdram_ready | ~bist_done;
 wire [9:0] h_count;
 wire [9:0] v_count;
 
@@ -307,8 +334,8 @@ wire [9:0] video_max_v_count;
 // ---------------------------------------------------------------------------
 // Video timing selection.
 //
-// Native Killer Instinct timing, as documented by MAME and the original
-// board, is 50 MHz / 8 = 6.25 MHz with 406 clocks/line and 261 lines/frame:
+// Native Killer Instinct timing, matching the original board, is
+// 50 MHz / 8 = 6.25 MHz with 406 clocks/line and 261 lines/frame:
 //
 //     H = 6.25 MHz / 406       = 15.394 kHz
 //     V = 6.25 MHz / 406 / 261 = 58.981 Hz
@@ -431,8 +458,7 @@ assign video_vblank_count = crt_60hz ? crt_vblank_count : native_vblank_count;
 assign video_vblank_seen = crt_60hz ? crt_vblank_seen : native_vblank_seen;
 assign video_max_v_count = crt_60hz ? CRT_V_TOTAL-1 : native_max_v_count;
 
-// Board input bits, taken from MAME's own ioport definitions for kinst
-// (tools/mame_inputs_probe.lua) rather than inferred:
+// Board input bits:
 //
 //   0 High Quick   1 High Medium   2 High Fierce
 //   3 Low Quick    4 Low Medium    5 Low Fierce
@@ -447,8 +473,8 @@ assign video_max_v_count = crt_60hz ? CRT_V_TOTAL-1 : native_max_v_count;
 // order from bit 4: High Quick, High Medium, High Fierce, Low Quick,
 // Low Medium, Low Fierce, Start, Coin, Service, Test.
 //
-// Merge MAME's default arcade keyboard controls with the matching MiSTer
-// joystick bits before translating them to the board's active-low ports.
+// Merge the arcade keyboard controls with the matching MiSTer joystick bits
+// before translating them to the board's active-low ports.
 wire [12:0] keyboard_p1;
 wire [12:0] keyboard_p2;
 
@@ -481,10 +507,9 @@ wire [31:0] input_p1 = {
 	~controls_p1[5],   //     1 High Medium
 	~controls_p1[4]    //     0 High Quick
 };
-// P2 differs above bit 11: bit 12 is TILT, not Service Mode. Driving it from
-// player 2's Service button tilted the game. Player 2's Service now goes to
-// bit 13, Service 1, which is the genuine service input on this port, and Tilt
-// is left inactive because nothing should assert it.
+// P2 differs above bit 11: bit 12 is TILT, not Service Mode. Player 2's
+// Service goes to bit 13, Service 1, which is the genuine service input on
+// this port, and Tilt is left inactive because nothing should assert it.
 wire [31:0] input_p2 = {
 	16'hffff,          // 31:16 unused
 	2'b11,             // 15:14 Banknote 1 inactive
@@ -504,9 +529,8 @@ wire [31:0] input_p2 = {
 	~controls_p2[4]    //     0 High Quick
 };
 
-// The CONF_STR advertises a Test button that was wired to nothing. The test
-// switch is DSW bit 15 (MAME :DSW mask 00008000), active low like the rest, so
-// pressing Test on either pad clears it.
+// The test switch is DSW bit 15 (mask 00008000), active low like the rest, so
+// pressing the CONF_STR Test button on either pad clears it.
 wire test_pressed = joystick_0[13] | joystick_1[13];
 wire [15:0] dip_switches_live =
 	dip_switches & {~test_pressed, 15'h7fff};
@@ -533,6 +557,7 @@ wire [7:0] cpu_mem_write_mask;
 wire [63:0] cpu_mem_data_write;
 wire        cpu_mem_line_write;
 wire [255:0] cpu_mem_line_data;
+wire  [31:0] cpu_mem_line_bytes;
 wire [63:0] cpu_mem_data_read;
 wire cpu_mem_done;
 wire cpu_mem_grant;
@@ -565,9 +590,6 @@ wire [31:0] debug_cpu_t2_reload_count;
 localparam int DEBUG_TRACE_SETTLE = 16;
 wire [895:0] debug_cpu_trace_bus;
 wire debug_cpu_trace_frozen;
-// D-cache pressure census, {line fills, writebacks} per fixed clk93 window.
-// Peak over the run and the last completed window. Slow-changing, so the
-// ordinary per-bit sync is fine.
 // State at the last eret before the trace froze. Held inside the CPU from the
 // freeze onward, so these are stable by the time the video domain samples them
 // - the same treatment the other frozen CPU counters get.
@@ -604,19 +626,33 @@ reg [31:0] debug_cpu_pc_sync = 32'h0000_0000;
 // them for the whole of the next one, so they are already stable when this
 // domain samples them - the two flops are for metastability, not coherence.
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
-reg [191:0] debug_perf_bus_meta = 192'd0;
+reg [223:0] debug_perf_bus_meta = 224'd0;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
-reg [191:0] debug_perf_bus_sync = 192'd0;
-wire [191:0] debug_perf_bus;
+reg [223:0] debug_perf_bus_sync = 224'd0;
+wire [223:0] debug_perf_bus;
 // Per-frame bridge census, counted in clk_core (50 MHz) - one count is two
 // CPU cycles. Crossed into the CPU domain inside ki_cpu_core.
 wire  [15:0] bridge_perf_out;
 wire  [15:0] bridge_perf_burst;
+// WHERE the frame's instructions retired, nine 16-bit fields of 256. Same
+// per-bit sync as the other perf buses: latched once a frame in the CPU
+// domain, so it has been still for thousands of cycles by the time the video
+// domain samples it.
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
-reg [191:0] debug_perf_worst_meta = 192'd0;
+reg [271:0] debug_perf_prof_meta = 272'd0;
+reg [2:0]   debug_prof_fine_meta = 3'd0;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
-reg [191:0] debug_perf_worst_sync = 192'd0;
-wire [191:0] debug_perf_worst;
+reg [271:0] debug_perf_prof_sync = 272'd0;
+reg [2:0]   debug_prof_fine_sync = 3'd0;
+wire [271:0] debug_perf_prof;
+// Which coarse bucket F0..F7 cover. It travels with the prof bus because it
+// is latched with it, so the two cannot disagree about which frame they show.
+wire [2:0]  debug_prof_fine;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+reg [223:0] debug_perf_worst_meta = 224'd0;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+reg [223:0] debug_perf_worst_sync = 224'd0;
+wire [223:0] debug_perf_worst;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
 reg [31:0] debug_cpu_retired_meta = 32'h0000_0000;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
@@ -641,6 +677,7 @@ localparam DEBUG_BUILD = 1;
 localparam DEBUG_BUILD = 0;
 `endif
 
+
 // Build the CPU's pre-event execution trace.
 //
 // Set to 0 for builds where CPU Fmax is what matters. It removes the 896-bit
@@ -648,7 +685,7 @@ localparam DEBUG_BUILD = 0;
 // and - by leaving them unread - the trace capture registers inside the CPU.
 // The SDC false-paths all of it so none of it appears in a timing report, but
 // it is ~900 wires pulling CPU registers toward the debug screen, and this
-// design's CPU paths are 61-78% interconnect.
+// design's CPU paths are dominated by interconnect.
 //
 // The debug screen itself stays either way. Only its trace rows go blank.
 // Separate from DEBUG_BUILD so the trace - which is the part that anchors CPU
@@ -666,14 +703,14 @@ wire framebuffer_memory_done;
 wire [7:0] framebuffer_red;
 wire [7:0] framebuffer_green;
 wire [7:0] framebuffer_blue;
-wire framebuffer_pixel_valid;
 wire [24:0] bridge_sdram_address;
 wire [255:0] bridge_sdram_write_data;
 wire [31:0] bridge_sdram_byte_enable;
 wire [4:0] bridge_sdram_burst;
 wire bridge_sdram_read;
 wire bridge_sdram_write;
-wire [15:0] bridge_sdram_read_data;
+wire [31:0] bridge_sdram_read_data;
+wire  [1:0] bridge_sdram_read_be;
 wire bridge_sdram_data_valid;
 wire bridge_sdram_done;
 wire [24:0] controller_sdram_address;
@@ -696,45 +733,23 @@ wire bist_sdram_read;
 wire bist_sdram_write;
 wire bist_pass;
 wire [15:0] bist_error_count;
-wire [24:0] bist_first_bad_address;
 wire [15:0] bist_first_bad_expected;
 wire [15:0] bist_first_bad_actual;
 
 // The BIST is a second requester on the adapter's auxiliary port, NOT a mux in
 // front of the primary one. Steering the request lines by ownership discards
 // whichever single-shot pulse is in flight when ownership changes, which
-// deadlocked the ROM download.
-// Boot-table write snoop, straight off the bridge's existing write path.
-wire [31:0] bist_rom_checksum;
+// would deadlock the ROM download.
 
-// Boot-ROM checksum taken through the CPU's own read path - the M10K mirror
-// and the line buffer, neither of which the BIST's auxiliary port touches.
-wire [31:0] verify_checksum;
-wire verify_request;
-wire [31:0] verify_address;
-// Safe because the CPU is held in reset for the whole time verify_active is
-// high, so cpu_mem_request is idle and nothing is in flight when ownership
-// changes.
-wire        bridge_cpu_request    = verify_active ? verify_request : cpu_mem_request;
-wire [31:0] bridge_cpu_address    = verify_active ? verify_address : cpu_mem_address;
-wire        bridge_cpu_rnw        = verify_active ? 1'b1  : cpu_mem_rnw;
-wire        bridge_cpu_req64      = verify_active ? 1'b0  : cpu_mem_req64;
-wire  [2:0] bridge_cpu_size       = verify_active ? 3'd1  : cpu_mem_size;
-wire  [7:0] bridge_cpu_write_mask = verify_active ? 8'd0  : cpu_mem_write_mask;
-wire [63:0] bridge_cpu_data_write = verify_active ? 64'd0 : cpu_mem_data_write;
-wire        bridge_cpu_line_write = verify_active ? 1'b0   : cpu_mem_line_write;
-wire [255:0] bridge_cpu_line_data = verify_active ? 256'd0 : cpu_mem_line_data;
-wire [15:0] bist_sdram_read_data;
+wire [31:0] bist_sdram_read_data;
+wire  [1:0] bist_sdram_read_be;
 wire bist_sdram_data_valid;
 wire bist_sdram_done;
 wire sound_reset;
 wire [31:0] sound_data;
 wire sound_data_strobe;
-wire [31:0] coin_control;
 
-// DCS audio board, merged from KillerInstinct_MiSTer-audio. The RTL under
-// rtl/dcs was already identical in both trees and only the wiring was missing:
-// AUDIO_L/R were tied to zero and ki_dcs_audio was never instantiated.
+// DCS audio board.
 //
 // host_reset is asserted while the core is in reset OR while the game holds
 // the sound board reset low, so sound_reset is active-low here.
@@ -752,8 +767,7 @@ reg debug_vblank_cpu_seen = 1'b0;
 reg debug_cpu_reset_d = 1'b1;
 reg debug_ioctl_download_d = 1'b0;
 // Reset provenance is retained across the resets it records:
-//   verify_rises  rising edges of verify_active over the WHOLE run. Boot is 1.
-//                 2 or more would mean it really did re-trigger.
+//   (top digit)   always 0.
 //   total_resets  rising edges of cpu_reset over the whole run.
 //   late_resets   resets after the CPU has been continuously OUT of reset for
 //                 2^24 core clocks, about a third of a second - far past any
@@ -762,18 +776,16 @@ reg debug_ioctl_download_d = 1'b0;
 //   mask          cause terms, sampled only at late resets.
 //
 // These counters use only their initial value so reset provenance survives.
-reg [3:0]  debug_rs_verify = 4'd0;
 reg [3:0]  debug_rs_total = 4'd0;
 reg [7:0]  debug_rs_count = 8'd0;
 reg [7:0]  debug_rs_pulse_count = 8'd0;
 reg [15:0] debug_rs_mask = 16'd0;
 reg        debug_rs_armed = 1'b0;
 reg [24:0] debug_rs_settle = 25'd0;
-reg        debug_verify_active_d = 1'b0;
 // Digits 2-3 are the debounced pulse count. A difference between the raw and
 // debounced totals identifies a stuttering reset source.
 wire [31:0] debug_reset_info =
-    {debug_rs_verify, debug_rs_total, debug_rs_pulse_count, debug_rs_mask};
+    {4'd0, debug_rs_total, debug_rs_pulse_count, debug_rs_mask};
 // The sticky mask ORs every late reset together, so one OSD reset by the
 // operator contaminates it permanently and hides which term caused the FIRST
 // one. This freezes the first SPONTANEOUS late reset's terms on their own.
@@ -794,12 +806,9 @@ wire [31:0] debug_reset_info =
 // pulse has many more chances to catch it than one clock edge does.
 //
 // The pulse is DEBOUNCED: it is over only once cpu_reset has been continuously
-// low for 2^20 core clocks, about 21 ms. The bist/verify glitch above is one
-// cycle and any other term that stutters will be similar, while the events this
-// has to separate - an operator reset at the start of a run and a failure
-// minutes later - are seconds apart. Belt and braces with verify_pending: the
-// glitch is fixed at source, and a new one cannot silently re-create the same
-// wrong reading.
+// low for 2^20 core clocks, about 21 ms. A term that stutters glitches for a
+// cycle or so, while the events this has to separate - an operator reset at
+// the start of a run and a failure minutes later - are seconds apart.
 localparam int RS_GAP_BITS = 20;
 reg [15:0] debug_rs_first_mask = 16'd0;
 reg        debug_rs_first_done = 1'b0;
@@ -840,10 +849,6 @@ wire [31:0] debug_reset_first =
 always @(posedge clk_core) begin
 	debug_cpu_reset_d <= cpu_reset;
 	debug_ioctl_download_d <= ioctl_download;
-	// Every verify_active rise, over the whole run. Boot contributes exactly 1.
-	debug_verify_active_d <= verify_active;
-	if(verify_active && !debug_verify_active_d && debug_rs_verify != 4'hf)
-		debug_rs_verify <= debug_rs_verify + 1'b1;
 	// Every cpu_reset rise, over the whole run.
 	if(cpu_reset && !debug_cpu_reset_d && debug_rs_total != 4'hf)
 		debug_rs_total <= debug_rs_total + 1'b1;
@@ -869,7 +874,6 @@ always @(posedge clk_core) begin
 			debug_rs_pulse_mask[2] <= debug_rs_pulse_mask[2] | ~boot_loaded;
 			debug_rs_pulse_mask[3] <= debug_rs_pulse_mask[3] | ~sdram_ready;
 			debug_rs_pulse_mask[4] <= debug_rs_pulse_mask[4] | bist_busy;
-			debug_rs_pulse_mask[5] <= debug_rs_pulse_mask[5] | verify_active;
 			debug_rs_pulse_mask[6] <= debug_rs_pulse_mask[6] | ~pll_locked;
 			debug_rs_pulse_mask[7] <= debug_rs_pulse_mask[7] | status[0];
 			debug_rs_pulse_mask[8] <= debug_rs_pulse_mask[8] | RESET;
@@ -901,7 +905,6 @@ always @(posedge clk_core) begin
 		debug_rs_mask[2] <= debug_rs_mask[2] | ~boot_loaded;
 		debug_rs_mask[3] <= debug_rs_mask[3] | ~sdram_ready;
 		debug_rs_mask[4] <= debug_rs_mask[4] | bist_busy;
-		debug_rs_mask[5] <= debug_rs_mask[5] | verify_active;
 		debug_rs_mask[6] <= debug_rs_mask[6] | ~pll_locked;
 		debug_rs_mask[7] <= debug_rs_mask[7] | status[0];
 		debug_rs_mask[8] <= debug_rs_mask[8] | RESET;
@@ -913,7 +916,7 @@ end
 
 // Mirror the CPU wrapper's vblank synchronizer for diagnostics. The sampled
 // value is sticky so the 50 MHz debug page can report a pulse seen by CPU time.
-always @(posedge clk_cpu_75) begin
+always @(posedge clk_cpu) begin
 	if(cpu_reset) begin
 		debug_vblank_cpu_meta <= 1'b0;
 		debug_vblank_cpu_sync <= 1'b0;
@@ -933,6 +936,10 @@ always @(posedge clk_core) begin
 	debug_perf_bus_sync <= debug_perf_bus_meta;
 	debug_perf_worst_meta <= debug_perf_worst;
 	debug_perf_worst_sync <= debug_perf_worst_meta;
+	debug_perf_prof_meta <= debug_perf_prof;
+	debug_perf_prof_sync <= debug_perf_prof_meta;
+	debug_prof_fine_meta <= debug_prof_fine;
+	debug_prof_fine_sync <= debug_prof_fine_meta;
 	debug_cpu_retired_meta <= debug_cpu_retired;
 	debug_cpu_retired_sync <= debug_cpu_retired_meta;
 	debug_cpu_irq_count_meta <= debug_cpu_irq_count;
@@ -958,6 +965,10 @@ always @(posedge clk_core) begin
 		debug_cpu_pc_sync <= 32'h0000_0000;
 		debug_perf_bus_meta <= 192'd0;
 		debug_perf_bus_sync <= 192'd0;
+		debug_perf_prof_meta <= 272'd0;
+		debug_perf_prof_sync <= 272'd0;
+		debug_prof_fine_meta <= 3'd0;
+		debug_prof_fine_sync <= 3'd0;
 		debug_perf_worst_meta <= 192'd0;
 		debug_perf_worst_sync <= 192'd0;
 		debug_cpu_retired_meta <= 32'h0000_0000;
@@ -997,7 +1008,7 @@ end
 // Disk init issues 0x91 twice per startup, so the third invocation is the first
 // one that can indicate a restart.
 reg  [7:0] ata_init_count = 8'd0;
-// The THIRD disk init. Exactly two per startup in both games, measured, so the
+// The THIRD disk init. Startup issues exactly two in both games, so the
 // third belongs to the restart. Counted rather than gated: the CPU's
 // end-of-boot flag opens before the first handoff and cannot be used here.
 wire ata_restart_seen = (ata_init_count >= 8'd3);
@@ -1015,8 +1026,7 @@ end
 ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 (
 	.clk1x(clk_core),
-	.clk93(clk_cpu_75),
-	.clk2x(clk_cpu_100),
+	.clk93(clk_cpu),
 	.reset(cpu_reset),
 	.irq(cpu_irq),
 	.mem_request(cpu_mem_request),
@@ -1028,6 +1038,7 @@ ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 	.mem_dataWrite(cpu_mem_data_write),
 	.mem_line_write(cpu_mem_line_write),
 	.mem_line_data(cpu_mem_line_data),
+	.mem_line_bytes(cpu_mem_line_bytes),
 	.mem_dataRead(cpu_mem_data_read),
 	.mem_done(cpu_mem_done),
 	.cache_grant(cpu_mem_grant),
@@ -1042,6 +1053,8 @@ ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 	.perf_bridge_burst(bridge_perf_burst),
 	.debug_perf_bus(debug_perf_bus),
 	.debug_perf_worst(debug_perf_worst),
+	.debug_perf_prof(debug_perf_prof),
+	.debug_prof_fine(debug_prof_fine),
 	.debug_gpr_s1(),
 	.debug_irq_count(debug_cpu_irq_count),
 	.debug_t2_reload_count(debug_cpu_t2_reload_count),
@@ -1101,17 +1114,18 @@ end endgenerate
 ki_memory_bridge memory_bridge
 (
 	.clk(clk_core),
-	.ddr_clk(clk_cpu_100),
+	.ddr_clk(clk_ddr),
 	.reset(shell_reset),
-	.cpu_request(bridge_cpu_request),
-	.cpu_rnw(bridge_cpu_rnw),
-	.cpu_address(bridge_cpu_address),
-	.cpu_req64(bridge_cpu_req64),
-	.cpu_size(bridge_cpu_size),
-	.cpu_write_mask(bridge_cpu_write_mask),
-	.cpu_data_write(bridge_cpu_data_write),
-	.cpu_line_write(bridge_cpu_line_write),
-	.cpu_line_data(bridge_cpu_line_data),
+	.cpu_request(cpu_mem_request),
+	.cpu_rnw(cpu_mem_rnw),
+	.cpu_address(cpu_mem_address),
+	.cpu_req64(cpu_mem_req64),
+	.cpu_size(cpu_mem_size),
+	.cpu_write_mask(cpu_mem_write_mask),
+	.cpu_data_write(cpu_mem_data_write),
+	.cpu_line_write(cpu_mem_line_write),
+	.cpu_line_data(cpu_mem_line_data),
+	.cpu_line_bytes(cpu_mem_line_bytes),
 	.cpu_data_read(cpu_mem_data_read),
 	.cpu_done(cpu_mem_done),
 	.cpu_grant(cpu_mem_grant),
@@ -1148,6 +1162,7 @@ ki_memory_bridge memory_bridge
 	.sdram_read(bridge_sdram_read),
 	.sdram_write(bridge_sdram_write),
 	.sdram_read_data(bridge_sdram_read_data),
+	.sdram_read_be(bridge_sdram_read_be),
 	.sdram_data_valid(bridge_sdram_data_valid),
 	.sdram_done(bridge_sdram_done),
 	.sdram_ready(sdram_ready),
@@ -1160,34 +1175,19 @@ ki_memory_bridge memory_bridge
 	.ddram_din(DDRAM_DIN),
 	.ddram_be(DDRAM_BE),
 	.ddram_we(DDRAM_WE),
-	.debug_fill_b0(),
-	.debug_fill_b1(),
 	.fb_read_accept(),
 	.fb_write_accept(),
-	.debug_state(),
-	.debug_cpu_pending(),
 	.perf_frame(frame_start),
 	.perf_cpu_outstanding(bridge_perf_out),
 	.perf_cpu_burst(bridge_perf_burst),
-	.debug_last_write_address(),
-	.debug_last_write_data(),
-	.debug_last_write_info(),
 	.debug_write_count(),
 	.debug_low_write_count(),
-	.debug_main_write_count(),
-	.debug_main_write0(),
-	.debug_main_write1(),
-	.debug_main_write2(),
-	.debug_table_write_count(),
-	.debug_table_write_address(),
-	.debug_table_write_data()
+	.debug_main_write_count()
 );
 
-// 256 words per pass. Hardware reported a stall at transaction 2517 of the
-// 4096-word sweep (EP:49D5 AC:09D5 = WRITE_ACK, index 2517). A short sweep
-// completes well inside that and finally exercises the READ-BACK path, which
-// is the phase question we have been trying to answer. The long-sweep stall
-// is tracked separately as a real arbitration/handshake defect.
+`ifdef KI_DEBUG_BUILD
+// 256 words per pass. A short sweep finishes quickly and still exercises the
+// READ-BACK path. Built only into the debug build, which shows its result.
 ki_sdram_bist #(.WORDS(256)) sdram_bist
 (
 	.clk(clk_core),
@@ -1201,37 +1201,42 @@ ki_sdram_bist #(.WORDS(256)) sdram_bist
 	.request_read(bist_sdram_read),
 	.request_write(bist_sdram_write),
 	.request_read_data(bist_sdram_read_data),
+	.request_read_be(bist_sdram_read_be),
 	.request_data_valid(bist_sdram_data_valid),
 	.request_done(bist_sdram_done),
-	.rom_checksum(bist_rom_checksum),
+	.rom_checksum(),
 	.busy(bist_busy),
 	.done(bist_done),
 	.pass(bist_pass),
 	.error_count(bist_error_count),
-	.first_bad_address(bist_first_bad_address),
+	.first_bad_address(),
 	.first_bad_expected(bist_first_bad_expected),
 	.first_bad_actual(bist_first_bad_actual)
 );
+`else
+// No self test: the CPU starts as soon as the ROM is loaded and the SDRAM is
+// ready, and the adapter's auxiliary port stays idle.
+assign bist_busy = 1'b0;
+assign bist_done = 1'b1;
+assign bist_pass = 1'b0;
+assign bist_error_count = 16'd0;
+assign bist_first_bad_expected = 16'd0;
+assign bist_first_bad_actual = 16'd0;
+assign bist_sdram_address = 25'd0;
+assign bist_sdram_write_data = 64'd0;
+assign bist_sdram_byte_enable = 8'd0;
+assign bist_sdram_burst = 5'd0;
+assign bist_sdram_read = 1'b0;
+assign bist_sdram_write = 1'b0;
+`endif
 
-// Runs once, after the ROM is loaded and the SDRAM self test has released the
-// memory port, while the CPU is still held in reset.
-ki_boot_verify boot_verify
-(
-	.clk(clk_core),
-	.reset(shell_reset),
-	.start(boot_loaded & bist_done & ~bist_busy),
-	.active(verify_active),
-	.done(verify_done),
-	.checksum(verify_checksum),
-	.cpu_request(verify_request),
-	.cpu_address(verify_address),
-	.cpu_data_read(cpu_mem_data_read),
-	.cpu_done(cpu_mem_done)
-);
-
+// ki_sdram_x2 lives inside the adapter and packs the controller's 16-bit beats
+// into the 32 bits clk_core expects. clk_sdram_ctl runs at twice clk_core, so
+// a 32-bit beat comes out every clk_core cycle.
 ki_sdram_adapter sdram_adapter
 (
 	.clk(clk_core),
+	.clk2x(clk_sdram_ctl),
 	.reset(~pll_locked),
 	.request_address(bridge_sdram_address),
 	.request_write_data(bridge_sdram_write_data),
@@ -1240,6 +1245,7 @@ ki_sdram_adapter sdram_adapter
 	.request_read(bridge_sdram_read),
 	.request_write(bridge_sdram_write),
 	.request_read_data(bridge_sdram_read_data),
+	.request_read_be(bridge_sdram_read_be),
 	.request_data_valid(bridge_sdram_data_valid),
 	.request_done(bridge_sdram_done),
 	.aux_address(bist_sdram_address),
@@ -1249,6 +1255,7 @@ ki_sdram_adapter sdram_adapter
 	.aux_read(bist_sdram_read),
 	.aux_write(bist_sdram_write),
 	.aux_read_data(bist_sdram_read_data),
+	.aux_read_be(bist_sdram_read_be),
 	.aux_data_valid(bist_sdram_data_valid),
 	.aux_done(bist_sdram_done),
 	.sdram_ready(sdram_ready),
@@ -1267,10 +1274,16 @@ ki_sdram_adapter sdram_adapter
 // share a row and a burst is a sequence of back-to-back column accesses.
 // SDRAM contents are transient because the ROM download repopulates memory on
 // every core load.
-ki_sdram_burst sdram_controller
+// 100 MHz floors: tRP 18->2, tRCD 18->2, tRAS 42->5, tRC 7, tRFC 66->7,
+// tWR 15->2. CL2 is in spec for a -75 part at 100 MHz.
+ki_sdram_burst #(
+	.T_RP(4'd2), .T_RCD(4'd2), .T_RAS(5'd5), .T_RC(5'd7),
+	.T_RFC(4'd7), .T_WR(4'd2), .CAS_LATENCY(3'd2),
+	.STARTUP_CYCLES(15'd12000), .REFRESH_PERIOD(13'd730)
+) sdram_controller
 (
 	.init(~pll_locked),
-	.clk(clk_core),
+	.clk(clk_sdram_ctl), .clk_cap(clk_sdram_cap),
 	.SDRAM_DQ(SDRAM_DQ),
 	.SDRAM_A(SDRAM_A),
 	.SDRAM_DQML(SDRAM_DQML),
@@ -1309,7 +1322,7 @@ ki_framebuffer framebuffer
 	.red(framebuffer_red),
 	.green(framebuffer_green),
 	.blue(framebuffer_blue),
-	.pixel_valid(framebuffer_pixel_valid)
+	.pixel_valid()
 );
 
 ki_board_io board_io
@@ -1327,8 +1340,7 @@ ki_board_io board_io
 	.input_p1(input_p1),
 	.input_p2(input_p2),
 	// Bit 1 is the sound board's "ready" line back to the game, taken from the
-	// DCS host status. It read all-ones while audio was stubbed out; the game
-	// polls it, so it has to reflect the real board now that one exists.
+	// DCS host status. The game polls it, so it has to reflect the real board.
 	.input_volume({30'h3fff_ffff, dcs_host_status[11], 1'b1}),
 	.input_dip({16'hffff, dip_switches_live}),
 	.input_unused(32'hffff_ffff),
@@ -1338,8 +1350,7 @@ ki_board_io board_io
 	.framebuffer_base(framebuffer_base),
 	.sound_reset(sound_reset),
 	.sound_data(sound_data),
-	.sound_data_strobe(sound_data_strobe),
-	.coin_control(coin_control)
+	.sound_data_strobe(sound_data_strobe)
 );
 
 ki_dcs_audio dcs_audio_board
@@ -1391,15 +1402,13 @@ ki_ata ata
 	.debug_info(debug_ata_info),
 	.debug_read_lba(),
 	.debug_write_lba(),
-	.debug_write_info(),
-	.debug_dataport_info(),
 	.debug_state(debug_ata_state),
 	.debug_status(debug_ata_status),
 	.debug_error(debug_ata_error),
 	.debug_image_ready(debug_ata_image_ready)
 );
 
-// RC, repacked so all three restart shapes fit one row:
+// RC packs all three restart shapes into one row:
 //
 //   digits 0-1  executions of 0x88000000, the entry point. Boot is 1.
 //   digits 2-3  ATA INITIALIZE DEVICE PARAMETERS commands. Boot is 1.
@@ -1474,6 +1483,8 @@ generate if (DEBUG_BUILD) begin : g_overlays
 		.page(status[6:5]),
 		.perf(debug_perf_bus_sync),
 		.perf_worst(debug_perf_worst_sync),
+		.perf_prof(debug_perf_prof_sync),
+		.prof_fine_base(debug_prof_fine_sync),
 		.trace_bus(debug_trace_shadow),
 		.trace_valid(debug_trace_valid),
 		.bist_done(bist_done),
@@ -1550,15 +1561,15 @@ assign AUDIO_MIX = 2'b00;
 assign ADC_BUS = 4'bzzzz;
 assign {SD_SCK, SD_MOSI, SD_CS} = 3'bzzz;
 
-assign DDRAM_CLK = clk_cpu_100;
+assign DDRAM_CLK = clk_ddr;
 
-assign SDRAM_CLK = clk_sdram_shifted;
+assign SDRAM_CLK = clk_sdram_pin;
 
 assign {UART_RTS, UART_TXD, UART_DTR} = 3'b000;
 assign USER_OUT = 7'h7f;
 
 `ifdef MISTER_FB
-// The framebuffer now resides in physical SDRAM, so use the FPGA scanout
+// The framebuffer is in on-chip block RAM, not DDR3, so use the FPGA scanout
 // path rather than MiSTer's DDR3-only direct-framebuffer path.
 assign FB_EN = 1'b0;
 assign FB_FORMAT = 5'b11100;

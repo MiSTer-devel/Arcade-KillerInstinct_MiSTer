@@ -15,9 +15,8 @@ module ki_dcs_audio #(
     parameter integer CLK_HZ = 50000000,
     // dcs_ce advances the multi-state HDL engine; it is not the ADSP clock.
     // A 35.75 MHz enable cadence provides approximately 10 MIPS and keeps the
-    // real-ROM boot timing aligned with the 10 MHz ADSP-2105 modeled by MAME.
+    // real-ROM boot timing aligned with the 10 MHz ADSP-2105.
     parameter integer DCS_ENGINE_HZ = 35750000,
-    parameter DCS_PMFILE = "pm.hex",
     // The 2048-sample FIFO holds a complete autobuffer half-burst plus samples
     // that remain queued while the 31.25 kHz output drains.
     parameter integer PCM_AW = 11,
@@ -63,15 +62,14 @@ module ki_dcs_audio #(
     logic [7:0]  dcs_src_op;
     logic [7:0]  dcs_rom_unstable;
     logic [11:0] dcs_rom_bankdelta;
-    logic [11:0] dcs_bank_writes;
     logic [7:0]  dcs_cmd_lost;
     logic        dcs_cmd_read;
     logic [15:0] dcs_status;
 
     // The physical ADSP-2105 is clocked at 10 MHz. This instruction-atomic HDL
-    // engine needs about 3.05 fabric enables per emulated instruction. The
-    // configured DCS_ENGINE_HZ cadence reproduces the DSP's approximately
-    // 10 MIPS throughput from the core-wide 50 MHz clock.
+    // engine needs several fabric enables per emulated instruction, so the
+    // configured DCS_ENGINE_HZ cadence is what reproduces the DSP's
+    // approximately 10 MIPS throughput from the core-wide 50 MHz clock.
     localparam integer DCS_PHASE_W = $clog2(CLK_HZ);
     localparam logic [DCS_PHASE_W:0] DCS_PHASE_STEP = DCS_ENGINE_HZ;
     localparam logic [DCS_PHASE_W:0] DCS_PHASE_MOD = CLK_HZ;
@@ -110,19 +108,14 @@ module ki_dcs_audio #(
     // ADSP enable slot, then expose exactly one aligned write to the mailbox.
     logic        cmd_pending;
     logic [15:0] cmd_pending_data;
-    // The single-entry pending register matches the board mailbox semantics.
-    // A new host write replaces an unconsumed command and increments the
-    // saturating diagnostic counter.
-    logic [7:0]  cmd_dropped;
+    // The single-entry pending register matches the board mailbox semantics:
+    // a new host write replaces an unconsumed command.
     always_ff @(posedge clk) begin
         if (rst || host_reset) begin
             cmd_pending <= 1'b0;
             cmd_pending_data <= 16'h0000;
-            cmd_dropped <= 8'h0;
         end else begin
             if (host_cmd_wr) begin
-                if (cmd_pending && (cmd_dropped != 8'hFF))
-                    cmd_dropped <= cmd_dropped + 8'd1;
                 cmd_pending <= 1'b1;
                 cmd_pending_data <= host_cmd_data;
             end else if (cmd_pending && dcs_ce) begin
@@ -170,13 +163,7 @@ module ki_dcs_audio #(
         end
     end
 
-    adsp2105 #(
-        .PMFILE(DCS_PMFILE),
-        .EXT_ROM(1),
-        .KI_ROM_MAP(1),
-        .CORE_CE_EN(1),
-        .PCM_STREAM(1)
-    ) u_adsp (
+    adsp2105 u_adsp (
         .clk(clk),
         .rst(rst),
         .core_ce(dcs_ce),
@@ -204,7 +191,6 @@ module ki_dcs_audio #(
         .dbg_src_op(dcs_src_op),
         .dbg_rom_unstable_o(dcs_rom_unstable),
         .dbg_rom_bankdelta_o(dcs_rom_bankdelta),
-        .dbg_bank_writes_o(dcs_bank_writes),
         .dbg_cmd_lost(dcs_cmd_lost),
         .dbg_cmd_read(dcs_cmd_read)
     );
@@ -253,9 +239,7 @@ module ki_dcs_audio #(
 
     // Count source and output sample steps larger than half the signed PCM
     // range. Matching counts show that a discontinuity entered through the DSP
-    // sample stream rather than being introduced by the FIFO. Current KI1
-    // evidence shows the peak-volume crackle at the DSP output with no FIFO
-    // drops or underruns.
+    // sample stream rather than being introduced by the FIFO.
     logic signed [15:0] au_src_prev;
     logic [15:0] au_src_discont;
     wire signed [16:0] au_src_step = $signed({dcs_sample[15], dcs_sample}) -
