@@ -3,20 +3,12 @@
 // The framebuffer store: two compact 19200 x 64-bit pages with byte enables.
 //
 // This is an EXPLICIT altsyncram instantiation rather than an inferred array,
-// because Quartus 17.0 would not infer this memory in any form tried:
-//
-//   1. one 64-bit array written by eight conditional byte part-selects
-//   2. eight byte-wide arrays, one per lane, each with a plain write enable
-//   3. the same eight arrays carrying (* ramstyle = "M10K, no_rw_check" *)
-//
-// All three built registers instead. The failure is silent - synthesis reports
-// "Inferred 9 megafunctions", every one of them ascal's, and never mentions
-// this file. Even the ramstyle attribute drew no complaint, though the same
-// compile warns eight times about an unrecognised ASYNC_REG a few lines above,
-// so the attribute was accepted and simply did not change the outcome. The cost
-// of the silent failure is not subtle: Analysis & Synthesis ran 58 minutes at
-// 14.8 GB against a normal 3:48 at 5.9 GB, building 2.6 Mbit as flip-flops, and
-// the result could never have fitted.
+// because Quartus 17.0 does not infer this memory in any form - not as one
+// 64-bit array written by byte part-selects, nor as eight byte-wide arrays,
+// with or without (* ramstyle = "M10K, no_rw_check" *). It builds registers
+// instead, and silently: synthesis reports nothing about this file, and the
+// ramstyle attribute is accepted without changing the outcome. A memory this
+// size in flip-flops can never fit.
 //
 // Every other memory in this design is explicit for the same reason -
 // rtl/cpu/RamMLAB.vhd and rtl/cpu/dpram.vhd both instantiate the primitive
@@ -36,23 +28,20 @@
 // Port A belongs to the CPU and does both its reads and its writes. Port B
 // belongs to scanout and only ever reads. Neither waits for the other.
 //
-// The first version was DUAL_PORT - one write port, one read port - and then
-// routed BOTH requesters through the bridge's single state machine anyway, so
-// the second port bought nothing: scanout took its turn against the CPU through
-// the same video_won_last arbitration that existed only because SDRAM has one
-// port. An M10K does not have that constraint. Giving scanout its own port
+// Scanout has its own port rather than going through the bridge's single state
+// machine. Sharing one path would make it take its turn against the CPU through
+// the same video_won_last arbitration that exists only because SDRAM has one
+// port. An M10K does not have that constraint, so giving scanout its own port
 // deletes the arbitration rather than adding to it.
 //
 // Keep every 16-bit pixel in a separate physical memory. Killer Instinct's
-// shadow and translucency paths issue many masked pixel updates. Splitting the
-// original 64-bit memory into two 32-bit memories did not remove the hardware
-// corruption because each physical word still coupled two adjacent pixels.
-// Four banks isolate every pixel update while retaining the same capacity,
-// addresses, and one-cycle read latency.
+// shadow and translucency paths issue many masked pixel updates, and a physical
+// word wider than one pixel would couple adjacent pixels. Four banks isolate
+// every pixel update while retaining the same capacity, addresses, and
+// one-cycle read latency.
 //
-// Each bank contains one quarter of the original framebuffer bits. The
-// expected aggregate cost is the same 320 M10Ks as the previous 64-bit and
-// two-bank 32-bit implementations; the next Quartus fit must confirm packing.
+// Each bank contains one quarter of the framebuffer bits. The expected
+// aggregate cost is 320 M10Ks.
 module ki_fb_ram #(
   parameter integer WORDS = 38400
 ) (

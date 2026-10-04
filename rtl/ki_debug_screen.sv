@@ -16,8 +16,6 @@ module ki_debug_screen (
   input  wire  [31:0] cpu_pc,
   input  wire  [31:0] cpu_retired,
   input  wire  [31:0] cpu_irq_count,
-  // The bitstream reader's ROM source pointer. Its sawtooth - walk the ROM,
-  // drop back, walk again - is the restart signature.
   // Sticky first-failure read ownership scoreboard. RT packs mismatch causes,
   // expected/actual class and sequence tags; RA/RE are returned/expected
   // physical addresses. All remain zero when every response owns its request.
@@ -66,10 +64,14 @@ module ki_debug_screen (
   input  wire   [1:0] page,
   // Per-frame stall census from ki_cpu_core; ten 16-bit fields, each counting
   // units of 256 CPU cycles. See debug_perf_bus there for the field order.
-  input  wire [191:0] perf,
+  input  wire [223:0] perf,
   // The worst frame since the last clear, same ten fields. Gameplay slowdowns
   // are occasional, so the live row usually shows a good frame.
-  input  wire [191:0] perf_worst,
+  input  wire [223:0] perf_worst,
+  input  wire [271:0] perf_prof,
+  // Which coarse bucket F0..F7 cover. Latched with perf_prof in the CPU, so
+  // the header digit always describes the frame the numbers came from.
+  input  wire   [2:0] prof_fine_base,
   input  wire [895:0] trace_bus,
   input  wire         trace_valid,
 
@@ -198,24 +200,87 @@ module ki_debug_screen (
     end
   endfunction
 
+  // WHERE the frame's instructions retired - the profile page.
+  //
+  // Every other counter in this core says how much time went somewhere. This
+  // one says which CODE ran. Nothing on the other pages could show that,
+  // because spinning RETIRES instructions and so reads as healthy work.
+  //
+  // TWO maps of the same frame. B0..B7/OT are eight 32 KB buckets over
+  // 0x88000000 plus one for everything else; F0..F7 are eight 4 KB buckets
+  // inside the hottest coarse bucket, because 32 KB is too wide to name a
+  // loop.
+  //
+  // This is the SAME frame as the Perf page's worst block - the one that lost
+  // the most cycles outside stage 4 since the last Clear - so SUM(B)/CY is a
+  // real check. It is the worst frame of ANY scene since Clear: on KI2 that
+  // is the FMV player if a video played, so Clear during the scene you want.
+  function automatic [7:0] prof_char(
+    input logic  [3:0] row,
+    input logic  [4:0] column,
+    input logic [271:0] p,
+    input logic   [2:0] fb
+  );
+    logic [15:0] f [0:16];
+    integer i;
+    begin
+      for (i = 0; i < 17; i = i + 1)
+        f[i] = p[i*16 +: 16];
+      prof_char = " ";
+      case (row)
+        0: case (column)
+          0: prof_char="K"; 1: prof_char="I"; 3: prof_char="P";
+          4: prof_char="R"; 5: prof_char="O"; 6: prof_char="F";
+          default: prof_char=" ";
+        endcase
+        1: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "B", "0", f[0])
+                                       : perf_field(column, 5'd8, "B", "1", f[1]);
+        2: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "B", "2", f[2])
+                                       : perf_field(column, 5'd8, "B", "3", f[3]);
+        3: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "B", "4", f[4])
+                                       : perf_field(column, 5'd8, "B", "5", f[5]);
+        4: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "B", "6", f[6])
+                                       : perf_field(column, 5'd8, "B", "7", f[7]);
+        5: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "O", "T", f[8])
+                                       : " ";
+        // The fine map, 4 KB a bucket, of whichever coarse bucket was hottest
+        // in the frame these counts came from.
+        6: case (column)
+          0: prof_char="B"; 1: prof_char=hex_ascii({1'b0, fb});
+          3: prof_char="4"; 4: prof_char="K";
+          default: prof_char=" ";
+        endcase
+        7: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "0", f[9])
+                                       : perf_field(column, 5'd8, "F", "1", f[10]);
+        8: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "2", f[11])
+                                       : perf_field(column, 5'd8, "F", "3", f[12]);
+        9: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "4", f[13])
+                                       : perf_field(column, 5'd8, "F", "5", f[14]);
+        10: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "6", f[15])
+                                        : perf_field(column, 5'd8, "F", "7", f[16]);
+        default: prof_char = " ";
+      endcase
+    end
+  endfunction
+
   // Where the CPU's cycles went in the frame just finished. Effective speed is
-  // clock x IPC; the DSE work only ever moved the clock, and this is the other
-  // half. CY is the frame length, so every other field is read against it -
-  // a full 100 MHz frame is about 1970 hex units of 256 cycles.
+  // clock x IPC, and this is the IPC half. CY is the frame length, so every
+  // other field is read against it - a full 100 MHz frame is about 1970 hex
+  // units of 256 cycles.
   function automatic [7:0] perf_char(
     input logic  [3:0] row,
     input logic  [4:0] column,
-    input logic [191:0] p,
-    input logic [191:0] w
+    input logic [223:0] p,
+    input logic [223:0] w
   );
-    logic [15:0] f [0:11];
+    logic [15:0] f [0:13];
     logic  [3:0] r;
     integer i;
     begin
       // Rows 8-13 repeat the same six rows for the worst frame, so one
       // renderer serves both blocks and they cannot drift apart.
       r = (row >= 4'd8) ? (row - 4'd7) : row;
-      for (i = 0; i < 12; i = i + 1)
+      for (i = 0; i < 14; i = i + 1)
         f[i] = (row >= 4'd8) ? w[i*16 +: 16] : p[i*16 +: 16];
       perf_char = " ";
       case (r)
@@ -229,41 +294,101 @@ module ki_debug_screen (
         // the limit.
         1: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "C", "Y", f[0])
                                        : perf_field(column, 5'd8, "R", "T", f[1]);
-        // Stage 4 stalled on memory, and the cached part of it. S4 - DC is
-        // the uncached part, which UW, UF and UO split exactly: S4 = DC + UW +
-        // UF + UO, give or take rounding. A remainder that is not near zero is
-        // a stall that is not a memory access at all.
+        // THE LOST-CYCLE CENSUS: every cycle retires (RT) or is lost to one
+        // cause, so CY - RT = S4 + MD + S3 + S1 + LB, give or take
+        // rounding. S4 is stage 4 waiting on memory; DC is its cached part.
         2: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "S", "4", f[4])
                                        : perf_field(column, 5'd8, "D", "C", f[7]);
-        // UW is a store the full write FIFO will not take yet. UF is a load
-        // from the framebuffer pages, which are uncached for scanout.
+        // UW is a store the full write FIFO will not take yet. UF is an
+        // uncached load from the framebuffer pages. UO (row 6) is the rest:
+        // S4 = DC + UW + UF + UO.
         3: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "U", "W", f[3])
                                        : perf_field(column, 5'd8, "U", "F", f[5]);
-        // COUNTS: framebuffer loads (FL) and the ones the line buffer answered
-        // from the line it held (FH). FL - FH fetched; UF / FL is cycles per
-        // framebuffer load.
-        4: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "L", f[8])
-                                       : perf_field(column, 5'd8, "F", "H", f[9]);
-        // UO is every other uncached load - I/O, boot ROM, RAM through KSEG1.
-        // FR is a COUNT: fetches of a line the buffer held within the last
-        // three lines before - what a four-line buffer would have hit.
-        5: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "U", "O", f[6])
-                                       : perf_field(column, 5'd8, "F", "R", f[2]);
-        // COUNTS: fetches of the line next to the held one (FA), and of the
-        // line one pixel row - 640 bytes - from it (FV).
-        6: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "A", f[10])
-                                       : perf_field(column, 5'd8, "N", "S", f[11]);
+        // Stage 3 frozen on a multiply or divide (MD).
+        //
+        // LM: of MC's misses, the ones that landed BELOW 0x0008_0000 - the
+        // 512 KiB the board builds from 20ns SRAM, which this core serves
+        // from SDRAM like everything else. MC - LM is the DRAM region's
+        // share. A count, not cycles, like MC.
+        //
+        // S3 has no field here; row 14 shows it for both frames. Its bit
+        // still feeds nm_cnt and the CY - RT identity.
+        4: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "M", "D", f[8])
+                                       : perf_field(column, 5'd8, "L", "M", f[12]);
+        // S1: stage 1 waiting for an instruction (an instruction cache miss).
+        // LB: a load's stage-3 hold, and the empty slot it leaves.
+        5: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "S", "1", f[10])
+                                       : perf_field(column, 5'd8, "L", "B", f[11]);
+        // UO: every other uncached load - I/O (the disk's data port), boot
+        // ROM, RAM through KSEG1.
+        //
+        // MC: a COUNT of D-cache misses, not a cycle count. MC and LM are the
+        // two fields on the page NOT scaled by 256 - they carry the count
+        // itself, because scaling by 256 would round a light frame to zero;
+        // DI, on row 7, is cycles and IS scaled. Every other field here is
+        // units of 256 cycles.
+        //
+        // DC / MC is CYCLES A MISS, which nothing else on any page could give:
+        // the two self-checks below are about where cycles GO, and cannot say
+        // whether a frame is bound by the number of misses or by the cost of
+        // each.
+        6: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "U", "O", f[6])
+                                       : perf_field(column, 5'd8, "M", "C", f[2]);
         default: perf_char = " ";
       endcase
       // Row 7 labels the second block, and the field its frame was chosen by;
       // row 0 keeps the page title.
+      // Columns 0-7 of row 7 are the only free field on a page whose every
+      // other row is full (rows 1-6 and 8-13 carry two fields each, row 14
+      // carries S3, and there is no third column because H_VISIBLE 320 shows
+      // only columns 0-19). The field goes at the LEFT so it lines up with the
+      // live block's own first column directly above it, and the header sits
+      // to its right rather than the field sitting under the word WORST and
+      // being read as part of it.
+      //
+      // DI - the LIVE frame's recoverable load bubbles, in units of 256 cycles
+      // like LB beside it, so DI/LB is the share of the load bubble that an
+      // interlock paying only on a real dependency would give back. The real
+      // R4600 does exactly that: 1.03 cycles for an independent cached load,
+      // 2.01 in a dependent chain, measured on the board; LOAD_INTERLOCK
+      // (cpu.vhd) gives this core the same behavior. DI counts only a bubble
+      // taken that need not have been, and should read about zero. It is the
+      // LIVE frame on purpose: the worst-NM frame can be an outlier (an FMV
+      // frame, an idle frame), and the question is what a TYPICAL fight frame
+      // would gain. DI <= LB always.
       if (row == 4'd7) begin
-        case (column)
-          0: perf_char="W"; 1: perf_char="O"; 2: perf_char="R";
-          3: perf_char="S"; 4: perf_char="T";
-          6: perf_char="U"; 7: perf_char="F";
-          default: perf_char=" ";
-        endcase
+        if (column < 5'd8) begin
+          perf_char = perf_field(column, 5'd0, "D", "I", f[13]);
+        end else begin
+          case (column)
+            8: perf_char="W"; 9: perf_char="O"; 10: perf_char="R";
+            11: perf_char="S"; 12: perf_char="T";
+            14: perf_char="N"; 15: perf_char="M";
+            default: perf_char=" ";
+          endcase
+        end
+      end
+      // Row 14 - v_count 224-239, the LAST row inside V_VISIBLE 240. There is
+      // no row 15 and no third column (H_VISIBLE 320 shows columns 0-19), so
+      // this is the only slot left on the page.
+      //
+      // S3 is stage 3 frozen on something other than a multiply or divide:
+      // the FPU, a TLB probe. It is a term of the CY - RT = S4 + MD + S3 + S1
+      // + LB identity.
+      //
+      // It is FRAME-DEPENDENT: do not conclude anything here from a single
+      // frame.
+      //
+      // It shows BOTH frames rather than following the block layout, because
+      // nm_cnt - which picks the worst frame - is MD or S3 or S1 or LB, so
+      // the worst block is where an S3 spike would appear first and the
+      // comparison against the live frame is the point. 3L is live, 3W worst.
+      // It is the one row reading p and w at once, hence the direct indexing
+      // instead of f[].
+      if (row == 4'd14) begin
+        perf_char = (column < 5'd8)
+                  ? perf_field(column, 5'd0, "3", "L", p[9*16 +: 16])
+                  : perf_field(column, 5'd8, "3", "W", w[9*16 +: 16]);
       end
     end
   endfunction
@@ -447,25 +572,14 @@ module ki_debug_screen (
             else if (column == 11) screen_char="E";
             else if (column == 12) screen_char="C";
             else if (column == 13) screen_char=":";
-            // ALL FOUR digits. This rendered `column-8`, i.e. nibbles 6 and 7 -
-            // the LOW BYTE of a 16-bit error_count, which is `single_errors`.
-            // error_count is {burst_errors, single_errors}, so the burst half
-            // was discarded and a burst-only failure displayed as EC:00 and
-            // looked clean. That is the exact case ki_sdram_bist's own header
-            // warns about - "EC:xx00 is burst only ... a phase that is marginal
-            // will fail the burst read first, and without the burst pass that
-            // shows up as a PASS here" - and burst reads are the
-            // scanout-shaped access the low-RAM sweep exists to ask about.
-            // TWO columns is all there is: 16-19 are taken by SD:P earlier in
-            // this chain and 19 is the last visible column, so the previous
-            // attempt to widen this to four digits could never render and the
-            // field still showed only single_errors.
-            //
-            // error_count is {burst_errors, single_errors} and the burst half
-            // is the one that goes non-zero first when the path is marginal -
-            // tb_ki_sdram_bist measures single=0 burst=254 at a bad phase - so
-            // showing the single byte was showing the wrong one. Encode
-            // PRESENCE of each half instead, which fits and keeps both:
+            // error_count is {burst_errors, single_errors}, and the burst half
+            // is the one that goes non-zero first when the path is marginal: a
+            // marginal phase fails the burst read first, and showing only the
+            // single byte would display that as a clean PASS. Burst reads are
+            // the scanout-shaped access the low-RAM sweep exists to ask about.
+            // Only two columns are free - 16-19 are taken by SD:P earlier in
+            // this chain and 19 is the last visible column - so encode
+            // PRESENCE of each half, which fits and keeps both:
             //
             //   00 clean   10 burst only   01 single only   11 both
             //
@@ -503,16 +617,8 @@ module ki_debug_screen (
         // DO: the opcode fetched at the DEPARTURE address in RL, which is the
         // instruction that sends control to the boot ROM.
         //
-        // OP is retired because it was answering the wrong question. It read
-        // 0BF000E2 every time, and that value is at boot ROM offset 0 - it is
-        // `j BFC00388`, the stub at the reset vector - so OP was showing the
-        // instruction at the LANDING site, one stage later than intended.
-        // h1_op is the value that pairs with the departure pc.
-        //
-        // RL has read 8800C61C and 8800C610 on successive builds, twelve bytes
-        // apart, so the restart always leaves from the same routine. DO names
-        // the instruction: a jr/j is the game rebooting itself deliberately,
-        // which is what an error or watchdog path looks like.
+        // DO names that instruction: a jr/j is the game rebooting itself
+        // deliberately, which is what an error or watchdog path looks like.
         //
         // RF isolates the first reset the operator did NOT cause, which the
         // sticky mask in RS cannot do - every test run contains one deliberate
@@ -544,11 +650,6 @@ module ki_debug_screen (
         // ErrorEPC the same way cpu_cop0 selects eretPC. Captured rather than
         // inferred so ERL does not have to be trusted to reconstruct it.
         //
-        // If ET is 88032288 (KI1) or 8802F028 (KI2) then eret really did
-        // resume on the delay slot and EE says which register supplied it. If
-        // ET is something else, the trace's eret source tag was misleading.
-        //
-        // DL is retired with DF above.
         // AU shows first-audio time and the saturating discontinuity count.
         11: begin
           if (column == 0) screen_char="E";
@@ -563,13 +664,13 @@ module ki_debug_screen (
           else if (column >= 15 && column <= 19)
             screen_char=hex32_ascii(d_pcm_health, column-12);
         end
-        // RC now carries BOTH restart shapes, because they are mutually
+        // RC carries BOTH restart shapes, because they are mutually
         // exclusive explanations of the same symptom:
         //
         //   digits 0-1  executions of 0x88000000, the address the boot ROM
         //               hands control to. Boot is exactly 1; 2 or more is the
         //               game restarting ITSELF, which leaves no reset and no
-        //               boot-ROM transition and was invisible before.
+        //               boot-ROM transition.
         //   digits 2-3  ATA INITIALIZE DEVICE PARAMETERS commands. Only the
         //               disk-init routine issues one and only startup calls
         //               it, so this is the same question asked a second way -
@@ -585,7 +686,7 @@ module ki_debug_screen (
           else if (column >= 3 && column <= 10)
             screen_char=hex32_ascii(d_cpu_ret_count, column-3);
         end
-        // The disk, on the two rows the retired probes freed.
+        // The disk.
         //
         // AT is the ATA state machine, SR the status register, ER the error
         // register - note ER reads 01 out of RESET (ki_ata.sv:287), so 01 is
@@ -707,7 +808,7 @@ module ki_debug_screen (
             trace_char=hex32_ascii(trace[863:832], column-3);
         end
         // TX: the translation-exception census, so "this was the first TLB
-        // exception the game ever took" is measured rather than assumed.
+        // exception the game ever took" can be checked rather than assumed.
         //
         //   digits 0-2  data-read TLB exceptions
         //   digits 3-4  data-write
@@ -790,6 +891,7 @@ module ki_debug_screen (
       2'd1: character = trace_char(v_count[7:4], h_count[8:4],
                                    trace_bus, trace_valid);
       2'd2: character = perf_char(v_count[7:4], h_count[8:4], perf, perf_worst);
+      2'd3: character = prof_char(v_count[7:4], h_count[8:4], perf_prof, prof_fine_base);
       default: character = screen_char(v_count[7:4], h_count[8:4],
                                        diagnostic_snapshot, bist_snapshot);
     endcase

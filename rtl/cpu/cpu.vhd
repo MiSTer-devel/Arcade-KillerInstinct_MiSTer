@@ -10,39 +10,43 @@ entity cpu is
    generic
    (
       LITTLE_ENDIAN         : boolean := false;
-      FRAMEBUFFER_UNCACHED  : boolean := false;
-      -- A one-line read buffer for the uncached framebuffer pages: a load in
-      -- the buffered 32-byte line completes in two stall cycles instead of a
-      -- ~20-cycle round trip through the bridge, and a load outside it fetches
-      -- the whole line in one request. The CPU's own stores keep it current,
-      -- and they still go straight to the framebuffer, so scanout sees exactly
-      -- what it did before. Needs FRAMEBUFFER_UNCACHED: a cached store would
-      -- reach the framebuffer late and the buffer never.
-      --
-      -- Why a LINE: KI2's heaviest frame touches the framebuffer at an 8-byte
-      -- stride, so no load shares a qword with the access before it but three
-      -- in four share its line. See docs/OPTIMIZATION-HISTORY.md, "Design: the
-      -- framebuffer line buffer".
-      FBLINE_BUFFER         : boolean := false;
-      -- How many lines that buffer holds, replaced round-robin. Hardware found
-      -- one line enough for KI1's heavy frame (74% hits) and useless for KI2's
-      -- (0 hits, and 94% of its loads in the last four lines fetched): two
-      -- interleaved read streams evict each other in a single-line buffer.
-      FBLINE_WAYS           : integer := 1;
-      -- Fetch the NEXT line as well, in the background, after a load has had
-      -- to fetch its own. Hardware found both games' framebuffer misses are
-      -- mostly the line after one already held - KI1 20 of 23, KI2 29 of 34 -
-      -- which four lines cannot help with: those lines have never been read.
-      -- The prefetch is dropped if a store lands in it while it is in flight,
-      -- and it never delays a demand access: it is the lowest priority in the
-      -- scheduler and only one framebuffer fetch is ever outstanding.
-      FBLINE_PREFETCH       : boolean := false;
+      -- The data cache reads the line after a load's line ahead, into a
+      -- staging register a miss on it fills from. See cpu_datacache.vhd,
+      -- "READING AHEAD". The request travels as a line fetch (bit 117) with
+      -- bit 107 set, and clk1x captures its four qwords into line_fill_1x.
+      DCACHE_READ_AHEAD     : boolean := false;
       -- A 64-bit store that misses the data cache takes its line without
       -- reading it from SDRAM; the cache tracks which qwords it holds and
-      -- fills the rest only if they are wanted. Hardware found 97% of the
-      -- heavy frames' store-miss fills never read. See cpu_datacache.vhd,
-      -- "SKIPPING THE STORE-MISS FILL".
+      -- fills the rest only if they are wanted. The heavy frames' store-miss
+      -- fills are almost never read. See cpu_datacache.vhd, "SKIPPING THE
+      -- STORE-MISS FILL".
       DCACHE_SKIP_FILL      : boolean := false;
+      -- And a PARTIAL store to a framebuffer line, its written bytes tracked
+      -- beside the tag. See cpu_datacache.vhd, "PARTIAL FRAMEBUFFER STORES".
+      DCACHE_FB_PARTIAL     : boolean := false;
+      -- A write-back followed by an ALLOC does not wait for the line to cross;
+      -- see cpu_datacache.vhd's WB_EARLY.
+      DCACHE_WB_EARLY       : boolean := false;
+      -- The load-delay bubble only when the instruction behind the load reads
+      -- the loaded register, as on the R4600; otherwise every load bubbles.
+      -- See load_use.
+      LOAD_INTERLOCK        : boolean := false;
+      -- A store that hits parks in a one-entry buffer and is written to the
+      -- data RAMs when the port is free; see cpu_datacache.vhd's STORE_BUFFER.
+      DCACHE_STORE_BUFFER   : boolean := false;
+      -- The crossing to the bridge as a SYNCHRONOUS 2:1 handshake: clk1x reads
+      -- the mailbox's request, and clk93 its acknowledge, the write-back line
+      -- release and the response FIFO's write pointer, straight from the
+      -- other domain's register instead of through two synchroniser flops. The
+      -- handshakes themselves do not change. Sound only when clk1x and clk93
+      -- are phase-aligned outputs of one PLL at an integer ratio AND the SDC
+      -- times the paths between them - see KillerInstinct.sdc and "THE
+      -- CROSSING" below.
+      SYNC_CROSSING         : boolean := false;
+      -- An LWL, LWR, LDL or LDR straight behind a load of its rt register
+      -- takes no load-delay bubble, as on the R4600, and merges into that
+      -- load's result in stage 4. Needs LOAD_INTERLOCK. See merge_bypass.
+      LOAD_MERGE_BYPASS     : boolean := false;
       -- Narrow the COP0 exception-address capture to the 32-bit KI contract.
       ADDR32_ONLY           : boolean := false;
       -- Drop trap instructions from the exception logic while retaining the
@@ -58,7 +62,7 @@ entity cpu is
       -- it; the SDC false-paths all of it, so it never shows up in a timing
       -- report, but it is still ~900 real wires anchoring stage-2 and stage-4
       -- registers toward the debug screen. The CPU domain's critical paths are
-      -- 61-78% interconnect, so what the fitter can and cannot pack tightly is
+      -- mostly interconnect, so what the fitter can and cannot pack tightly is
       -- exactly what bounds Fmax here.
       --
       -- Only the EXPORT is gated. The capture registers are written in the same
@@ -77,7 +81,7 @@ entity cpu is
       -- before the first restart: the game reaches FMV about 4 to 5 s after
       -- reset and can restart within a second of playback starting.
       --
-      -- 2^24 is about 0.4 s at the measured 42 MIPS - two orders of magnitude
+      -- 2^24 is about 0.4 s at about 42 MIPS - two orders of magnitude
       -- longer than a boot trampoline, and comfortably inside that window. G
       -- on the trace page reports whether it actually armed, so a wrong choice
       -- is visible rather than silent. Simulation overrides it so a dozen
@@ -88,7 +92,6 @@ entity cpu is
    (
       clk1x                 : in  std_logic;
       clk93                 : in  std_logic;
-      clk2x                 : in  std_logic;
       ce_1x                 : in  std_logic;
       ce_93                 : in  std_logic;
       reset_1x              : in  std_logic;
@@ -117,6 +120,13 @@ entity cpu is
       error_TLB             : out std_logic := '0';
       debug_fetch_pc        : out std_logic_vector(31 downto 0) := (others => '0');
       debug_retired         : out std_logic_vector(31 downto 0) := (others => '0');
+      -- The PC of the instruction retiring THIS cycle, and its strobe. Where
+      -- the retired count says how much ran, these say WHAT ran - and the two
+      -- have to be driven off the same condition or a profile built from them
+      -- will not sum to RT. Bucketing them is the caller's business: which
+      -- address ranges matter is a property of the game, not of the CPU.
+      debug_prof_pc         : out std_logic_vector(31 downto 0) := (others => '0');
+      debug_prof_valid      : out std_logic := '0';
       -- Bitstream reader source pointer used by the frozen fault trace.
       debug_gpr_s1          : out std_logic_vector(31 downto 0) := (others => '0');
       debug_irq_count       : out std_logic_vector(31 downto 0) := (others => '0');
@@ -136,8 +146,8 @@ entity cpu is
       debug_retire_opcode   : out std_logic_vector(31 downto 0) := (others => '0');
       debug_trace_bus         : out std_logic_vector(895 downto 0) := (others => '0');
       -- Live COP0 Cause and EPC, not the frozen copies in the trace bus.
-      -- sim/tb_ki_cpu_delayslot_irq.sv needs to read EPC the cycle after an
-      -- interrupt is taken, which is long before any trace trigger fires.
+      -- Simulation needs to read EPC the cycle after an interrupt is taken,
+      -- which is long before any trace trigger fires.
       debug_cop0_cause_live   : out std_logic_vector(31 downto 0) := (others => '0');
       debug_cop0_epc_live     : out std_logic_vector(31 downto 0) := (others => '0');
       -- State at the LAST ERET BEFORE THE FREEZE. cpu_cop0 captures each eret;
@@ -151,49 +161,64 @@ entity cpu is
       -- reset may fire no trace trigger at all, and these must still be
       -- readable off the screen at any moment.
       debug_ds_count          : out std_logic_vector(31 downto 0) := (others => '0');
-      -- Raw per-cycle stall causes for the performance counters in
-      -- ki_cpu_core. Mostly taps; the uncached split adds perf-only registers
-      -- (perf_st4_read, perf_st4_region). Nothing reads this bus but
-      -- ki_cpu_core's counters, so a build without them prunes all of it,
-      -- registers included.
+      -- Raw per-cycle causes for the performance counters in ki_cpu_core.
+      -- Nothing reads this bus but those counters, so a build without them
+      -- prunes all of it, the perf-only registers included.
       --
-      --   0 FB fetch, recent line      FR   5 stall4, CACHED access      DC
-      --   1 stall4, uncached STORE     UW   6 FB LOAD                    FL
-      --   2 stall4, memory stalled     S4   7 FB line buffer HIT         FH
-      --   3 stall4, uncached FB load   UF   8 FB fetch, adjacent line    FA
-      --   4 stall4, other uncached load UO  9 FB fetch, one pixel row    FV
+      -- THE LOST-CYCLE CENSUS. An instruction retires in a cycle where
+      -- stall4Masked = 0 and writebackNew = 1. Every other cycle is lost, and
+      -- bits 0, 2 and 6-9 give each lost cycle exactly one cause, so
+      -- CY - RT = S4 + MD + S3 + S1 + LB + FL, less paused cycles. FL is off
+      -- the page for DI (below), so the check holds to within FL:
       --
-      -- Bits 5, 1, 3 and 4 PARTITION stall4 (bit 2) by what holds stage 4. DC
-      -- is a cached access, keyed on writeback_UseCache as before. The rest
-      -- are uncached: a store the full write FIFO will not take yet
-      -- (writebackMemWrite), or a load waiting on mem_finished_read, split by
-      -- the region of its address - the framebuffer, or anything else (I/O,
-      -- boot ROM, RAM through KSEG1, which were UI, UB and UM until they read
-      -- zero in every gameplay capture). They are mutually exclusive by
-      -- construction, so bit 2 minus the four is what is left - stalls that are
-      -- not memory accesses, such as a TLB probe - and should read about zero.
+      --   0 a D-cache miss (a COUNT, not a cycle)                MC
+      --   1 stall4, uncached STORE (part of S4)                 UW
+      --   2 stall4: stage 4 waiting on memory                   S4
+      --   3 stall4, uncached FB load (part of S4)               UF
+      --   4 stall4, other uncached load (part of S4)            UO
+      --   5 stall4, CACHED access (part of S4)                  DC
+      --   6 stall3 frozen on a multiply or divide               MD
+      --   7 stall3 frozen on anything else (FPU, TLB)           S3
+      --   8 stall1 or stall2: fetch waiting (instruction cache) S1
+      --   9 a load: stall3 held for it, or the empty slot it left LB
+      --  10 a D-cache miss below 0x0008_0000 (a COUNT)           LM
+      --  11 a load whose bubble could be recovered              DI
       --
-      -- FL, FH, FR, FA and FV are COUNTS: the framebuffer load census. FL is
-      -- every framebuffer load, FH the ones the line buffer answers from the
-      -- line it holds, and FL - FH the ones that fetched. FR, FA and FV say
-      -- what a fetch's line was: one of the three held before (a bigger
-      -- buffer's hit), the next line either side, or one pixel row away. See
-      -- perf_fb_load. UF / FL is cycles per framebuffer load. They replaced
-      -- F1, SK, AF, MC and WB, which measured the skipped store-miss fill -
-      -- 110.6 -> 51 cycles per miss in KI1's heavy frame on hardware.
+      -- (This table is the only description of the
+      -- bus in one place, so keep it true.)
       --
-      -- Why split it: KI2 gameplay spent 31% of a frame stalled on uncached
-      -- accesses with nothing saying which kind, and the kinds have different
-      -- fixes. Framebuffer loads could be cached write-through; boot-ROM loads
-      -- are SLOW ON PURPOSE, since the bridge models the real EPROM's access
-      -- time; I/O loads are the game polling hardware; a blocked store is the
-      -- write FIFO backing up.
+      -- S4 = DC + UW + UF + UO: UO is I/O (the disk's data port
+      -- among it), boot ROM and RAM through KSEG1.
       --
-      -- Earlier taps here were chosen by plausibility and read ~zero while
-      -- stall4 sat at 50-98%: first deferral latches, then fragments of the
-      -- wait. A partition with a sum check is what finally worked. Keep it
+      -- Stages 1-3 advance only when the whole stall vector is zero, so a
+      -- fetch stall or a multiply freezes the pipeline and costs exactly its
+      -- own cycles: those classes are read straight off the stall bits, in
+      -- priority S4, stall3, stall1. Stage 4 advances on stall4Masked, which
+      -- ignores the stall3 a load raises, so stage 3 can hand it an EMPTY
+      -- slot - and an empty slot retires nothing when it reaches the end. A
+      -- load's slot is tagged where it is made (perf_ex_ld, perf_wb_ld) and
+      -- the tag travels with it, so LB charges the load rather than the stage
+      -- where the loss shows. Every other empty slot is FL. ("Stage 1 had
+      -- nothing ready" occurs only in the empty pipeline out of reset.)
+      --
+      -- DI is not a lost cycle but a COUNT, of the lost cycles that removing
+      -- the load-delay bubble could give back: a cached load that hit in the
+      -- predicted way - so its bubble is the only cost it paid - and whose
+      -- next instruction does not use the value, so it need not have waited.
+      -- The comparison is the one the forwarding decision already makes
+      -- (resultTarget against decodeSource1/2, the instruction behind the load
+      -- while the load is in stage 4). A load that misses is excluded: the
+      -- pipeline is stalled on the miss anyway.
+      -- With LOAD_INTERLOCK, only a load that TOOK its bubble counts, so DI
+      -- reads what the dependency test failed to give back.
+      --
+      -- The D-cache fields (MC SK WB F1 SH RA) are still computed for
+      -- simulation; synthesis drops them with nothing reading them.
+      --
+      -- The classes partition the cycles: each running cycle retires or is
+      -- lost to exactly one class, so together they sum to the total. Keep it
       -- that way.
-      debug_perf_events       : out std_logic_vector(9 downto 0);
+      debug_perf_events       : out std_logic_vector(11 downto 0);
       debug_ds_first          : out std_logic_vector(31 downto 0) := (others => '0');
       debug_trace_frozen      : out std_logic := '0';
       debug_trace_trigger     : in  std_logic := '0';
@@ -209,15 +234,17 @@ entity cpu is
       -- with mem_request while mem_line_write is high, for the bridge to send
       -- as a single 16-word burst.
       --
-      -- Worth ~22 CPU cycles per dirty miss. The line used to cross the write
-      -- CDC as four separate transactions at 7.2 cycles each - measured, with
-      -- the fill's own request queued behind all four. See
-      -- docs/OPTIMIZATION-HISTORY.md, "Send a dirty line back as ONE CPU
-      -- transaction". mem_writeMask(3 downto 0) is which qwords to write, bit
+      -- As four separate transactions the line would cross the write CDC four
+      -- times, with the fill's own request queued behind all four.
+      -- mem_writeMask(3 downto 0) is which qwords to write, bit
       -- i for the qword at offset 8i: a line whose store-miss fill was skipped
       -- holds nothing for the qwords it never stored.
       mem_line_write        : out std_logic := '0';
       mem_line_data         : out std_logic_vector(255 downto 0) := (others => '0');
+      -- Which BYTES of mem_line_data to write, bit 8i+j for byte j of qword
+      -- i, valid with it. Every byte of a qword mem_writeMask names, except
+      -- in a framebuffer line with partially stored qwords (DCACHE_FB_PARTIAL).
+      mem_line_bytes        : out std_logic_vector(31 downto 0) := (others => '1');
       mem_dataRead          : in  std_logic_vector(63 downto 0); 
       mem_done              : in  std_logic;
       rdram_granted2x       : in  std_logic;
@@ -413,9 +440,9 @@ architecture arch of cpu is
    -- How many decodes have happened since reset, saturating at 2. One is not
    -- enough: the pc reported by the FIRST post-reset decode comes from a
    -- register the reset does not own, so the comparison must not run until two
-   -- genuine decodes are in hand. Stage 1 and stage 2 now clear those registers
-   -- as well; this is the independent guard, because the failure it prevents
-   -- cost several hardware builds and must not depend on one assignment.
+   -- genuine decodes are in hand. Stage 1 and stage 2 clear those registers
+   -- as well; this is the independent guard, so the failure it prevents does
+   -- not depend on one assignment.
    signal dep_valid                    : unsigned(1 downto 0) := (others => '0');
    signal hist_op1                     : std_logic_vector(31 downto 0) := (others => '0');
    signal debug_h1_op_r                : std_logic_vector(31 downto 0) := (others => '0');
@@ -473,11 +500,10 @@ architecture arch of cpu is
    --
    -- When a branch sits in another branch's delay slot the hardware marks the
    -- first branch's TARGET as a delay slot too, and cop0 records
-   -- EPC = target - 4. Measured directly: the interrupt is recognised with
-   -- PCold1 = the target and executeBranchdelaySlot = 1. eret then resumes at
-   -- target - 4 and falls THROUGH the target instead of entering it via the
-   -- branch. That is the KI FMV restart - KI1 880322D4/880322D8,
-   -- KI2 8802F074/8802F078, both recording EPC = target - 4 on hardware.
+   -- EPC = target - 4: the interrupt is recognised with PCold1 = the target
+   -- and executeBranchdelaySlot = 1. eret then resumes at target - 4 and
+   -- falls THROUGH the target instead of entering it via the branch. That is
+   -- the KI FMV restart.
    --
    -- ds_prev_pc advances on decodeNewPulse, one pulse per genuinely new
    -- decode, so it is aligned with PCold1 - which is exactly what cop0 pairs
@@ -553,15 +579,14 @@ architecture arch of cpu is
    signal datacache_wb_fifo            : t_datacache_wb_fifo :=
                                            (others => (others => '0'));
    signal datacache_wb_fifo_wrptr      : unsigned(1 downto 0) := (others => '0');
-   signal datacache_wb_fifo_rdptr      : unsigned(1 downto 0) := (others => '0');
    signal datacache_wb_fifo_count      : integer range 0 to 4 := 0;
-   signal datacache_wb_fifo_pop        : std_logic;
    signal writefifo_issue_pending      : std_logic := '0';
    signal writefifo_issue_wb           : std_logic := '0';
    -- A whole-line write-back leaves its four words in the staging queue for
    -- the clk1x side to read, so the queue may only be released once that side
-   -- has handed them to the bridge. Toggle in clk1x, two flops into clk93 -
-   -- the same bundled-data discipline as the write mailbox below.
+   -- has handed them to the bridge. Toggle in clk1x, read in clk93 through two
+   -- flops or, under SYNC_CROSSING, directly - the same bundled-data
+   -- discipline as the write mailbox below.
    signal wb_line_done_1x              : std_logic := '0';
    signal wb_line_done_meta_93         : std_logic := '0';
    signal wb_line_done_sync_93         : std_logic := '0';
@@ -569,17 +594,21 @@ architecture arch of cpu is
    signal wb_line_release              : std_logic;
    -- The line's one transaction has been accepted by the write FIFO but its
    -- words are still held for clk1x. The fill's request must be free to follow
-   -- it immediately - queueing behind the release is the serialization this
-   -- whole change exists to remove - so this marks "issued, do not re-issue"
-   -- without blocking the scheduler.
+   -- it immediately - queueing behind the release is the serialization the
+   -- one-transaction line exists to remove - so this marks "issued, do not
+   -- re-issue" without blocking the scheduler.
    signal wb_line_issued               : std_logic := '0';
    signal datacache_wb_busy            : std_logic;
-   signal datacache_debug_state        : std_logic_vector(3 downto 0);
+   -- The part of datacache_wb_busy during which the write-back still OWNS the
+   -- scheduler: words being staged, the whole line staged but not yet issued,
+   -- or its issue pending. See the request-preserving blocks.
+   signal datacache_wb_sched           : std_logic;
+   signal datacache_debug_state        : std_logic_vector(4 downto 0);
           
    -- The transaction FIFO belongs entirely to clk93.  Transfer its wide
    -- payload to clk1x through a bundled-data request/acknowledge mailbox so
    -- address, data and control bits can never be sampled from different FIFO
-   -- entries while the clocks drift relative to one another.
+   -- entries, whatever the two clocks' phase.
    signal write_cdc_data_93            : std_logic_vector(117 downto 0) := (others => '0');
    signal write_cdc_req_93             : std_logic := '0';
    signal write_cdc_busy_93            : std_logic := '0';
@@ -589,23 +618,77 @@ architecture arch of cpu is
    signal write_cdc_req_meta_1x        : std_logic := '0';
    signal write_cdc_req_sync_1x        : std_logic := '0';
    signal write_cdc_req_seen_1x        : std_logic := '0';
+   -- THE CROSSING. What each side acts on: the other side's register itself
+   -- under SYNC_CROSSING, its synchroniser's output otherwise.
+   --
+   -- Everything these expose is bundled data, and the rule that makes that
+   -- safe is the same in both modes: the data a flag exposes is written no
+   -- later than the flag, and holds until the flag's answer comes back. The
+   -- synchronisers only ever ADDED margin to it. Under SYNC_CROSSING the
+   -- margin is one clock edge, and timing analysis, not a flop count, is what
+   -- guarantees the data has arrived:
+   --   - write_cdc_data_93 is loaded on the edge that toggles
+   --     write_cdc_req_93, and holds until the acknowledge returns;
+   --   - the write-back line's words sit in datacache_wb_fifo from before its
+   --     request is issued until wb_line_done_1x releases them, and clk1x
+   --     copies them into mem_line_data on the edge that toggles it;
+   --   - a response's payload is written into the FIFO on the edge that
+   --     advances its write pointer;
+   --   - line_fill_1x's last beat is captured no later than mem_done, the
+   --     edge the completion enters the FIFO, and clk93 copies it on the
+   --     edge it takes that completion - which is also the edge clk1x's next
+   --     line fetch waits for (resp_fifo_wempty);
+   --   - a fill's beats are in the cache a clk1x cycle before mem_done.
+   signal write_cdc_req_in_1x          : std_logic;
+   signal write_cdc_ack_in_93          : std_logic;
+   signal wb_line_done_in_93           : std_logic;
 
-   -- Read-response mailbox from the memory clock domain to the CPU clock
-   -- domain. The payload remains stable until the CPU acknowledges it.
-   -- Bit 105 marks the completion of a framebuffer LINE fetch, whose data is
-   -- in fbline_fill_1x rather than this payload.
-   signal response_cdc_data_1x         : std_logic_vector(105 downto 0) := (others => '0');
-   signal response_cdc_req_1x          : std_logic := '0';
-   signal response_cdc_busy_1x         : std_logic := '0';
-   signal response_cdc_ack_93          : std_logic := '0';
-   signal response_cdc_ack_meta_1x     : std_logic := '0';
-   signal response_cdc_ack_sync_1x     : std_logic := '0';
-   signal response_cdc_req_meta_93     : std_logic := '0';
-   signal response_cdc_req_sync_93     : std_logic := '0';
-   signal response_cdc_req_seen_93     : std_logic := '0';
+   -- Read responses from the memory clock domain to the CPU clock domain,
+   -- through a DUAL-CLOCK FIFO (cpu_cdc_fifo.vhd).
+   --
+   -- Unlike a one-transaction mailbox, it does not make the bridge wait for
+   -- an acknowledge to cross back before it starts the NEXT transaction,
+   -- although nothing is waiting on that acknowledge - the CPU has already
+   -- taken the data. That matters only when there IS a next transaction:
+   -- not on a clean miss, where the CPU is stalled on the fill and has
+   -- nothing else to ask for, but on a dirty one, where the victim's
+   -- write-back follows the previous fill straight down the same path.
+   --
+   -- Two entries is enough: the consumer below takes a response in a handful
+   -- of clk93 cycles and a bridge transaction is tens of them, so the bridge
+   -- never sees the FIFO full.
+   --
+   -- Bit 105 marks the completion of a LINE fetch - the data cache's
+   -- read-ahead - whose data is in line_fill_1x rather than this payload.
+   -- Bit 106 marks the completion of a DATA CACHE fill, whose data went into
+   -- the cache as beats. It completes to the cache alone (datacache_fill_done),
+   -- never to stage 4: a fill need not be the only data transaction
+   -- outstanding once the cache can read ahead in the background, and an
+   -- uncached load waiting in stage 4 must not take a fill's completion as its
+   -- own.
+   signal resp_fifo_din                : std_logic_vector(106 downto 0);
+   signal resp_fifo_wr                 : std_logic;
+   signal resp_fifo_full               : std_logic;
+   -- '1' when clk93 has consumed every response written. The one thing the
+   -- deeper crossing has to be told: line_fill_1x is a SINGLE buffer in
+   -- clk1x that a line fetch overwrites, and its completion does not
+   -- acknowledge before the next transaction may start. So clk1x refuses to
+   -- take another LINE fetch until this reads '1'. It never actually delays
+   -- one - clk93 cannot even build the next line request until it has
+   -- consumed the previous completion - but it makes that a local rule of
+   -- this crossing rather than an argument about the whole design.
+   signal resp_fifo_wempty             : std_logic;
+   signal resp_fifo_dout               : std_logic_vector(106 downto 0);
+   signal resp_fifo_rd                 : std_logic;
+   signal resp_fifo_empty              : std_logic;
+   -- The one cycle in which clk93 takes the head of that FIFO. Used as the
+   -- FIFO's read strobe AND as the scoreboard's pop, so the two can never
+   -- disagree about which cycle a response was consumed in.
+   signal resp_take                    : std_logic;
    signal response_cdc_pending_93      : std_logic := '0';
    signal response_cdc_deliver_93      : std_logic := '0';
-   signal response_cdc_class_93        : std_logic := '0';
+   -- The data cache's own completion; see bit 106 above. Its ram_done.
+   signal datacache_fill_done          : std_logic := '0';
 
    -- Independent clk93-domain ownership scoreboard. The main transaction
    -- FIFO carries a sequence tag to clk1x and back; this queue records what
@@ -633,129 +716,20 @@ architecture arch of cpu is
    signal memory_read_tag_1x          : std_logic_vector(7 downto 0) := (others => '0');
    signal memory_read_address_1x      : std_logic_vector(31 downto 0) := (others => '0');
 
-   -- Framebuffer line buffer (FBLINE_BUFFER). FBLINE_WAYS 32-byte lines of
-   -- the uncached framebuffer pages, each in the bridge's own 64-bit word
-   -- format - qword k of the line in bits 64k+63 downto 64k - so a load
-   -- reduces one exactly as ki_memory_bridge's FB_READ_WAIT reduces fb_q.
-   -- A fetch replaces the lines round-robin, which is the replacement the
-   -- hardware census measured: FR counted loads landing in one of the lines
-   -- the buffer had most recently thrown away.
-   --
-   -- A framebuffer load no longer issues a request at the stage 3 -> 4
-   -- advance. It holds stage 4 as before and enters CHECK:
-   --   hit   the answer is written through read4_uncachedData and completes
-   --         with mem_finished_read, like any uncached load - two stall cycles
-   --   miss  FETCH issues one 64-bit, size-4 read of the line (FIFO bit 117);
-   --         clk1x captures the four beats into fbline_fill_1x; WAIT takes
-   --         the completion (response bit 105) without delivering it, copies
-   --         the capture into the buffer, and returns to CHECK, which hits.
-   --
-   -- Stores keep it current where they enter the write FIFO; see
-   -- fbl_store_hit. They are still sent to the framebuffer unchanged.
-   constant FBL_ON : boolean := FBLINE_BUFFER and FRAMEBUFFER_UNCACHED;
-   constant FBL_WAYS : integer := FBLINE_WAYS;
-   constant FBL_PF : boolean := FBL_ON and FBLINE_PREFETCH;
-   type t_fblstate is (FBL_IDLE, FBL_CHECK, FBL_FETCH, FBL_WAIT);
-   signal fbl_state                   : t_fblstate := FBL_IDLE;
-   signal fbl_start                   : std_logic;
-   -- The load's address as the bridge would have received it - mem4_address,
-   -- low bits already masked by load type - and its width.
-   signal fbl_addr                    : unsigned(31 downto 0) := (others => '0');
-   signal fbl_req64                   : std_logic := '0';
-   -- The lookup is done where the load's address is latched, so the line it
-   -- hit is a REGISTER by the time CHECK answers: the data path out of the
-   -- buffer is then a mux with a registered select, not a tag compare. With
-   -- one way this is the same two-cycle hit the single-line buffer had.
-   signal fbl_look_hit                : std_logic;
-   signal fbl_look_way                : integer range 0 to FBL_WAYS - 1;
-   signal fbl_hit                     : std_logic := '0';
-   signal fbl_way                     : integer range 0 to FBL_WAYS - 1 := 0;
-   -- Next line to replace, and the line a fetch in flight is replacing.
-   signal fbl_repl                    : integer range 0 to FBL_WAYS - 1 := 0;
-   -- Read-ahead (FBLINE_PREFETCH). A load that had to fetch asks for the next
-   -- line too; that request waits in fbl_pf_req, is issued at the bottom of
-   -- the scheduler's priority, and is outstanding while fbl_pf_busy. Only one
-   -- framebuffer fetch is in flight at a time, so a demand miss waits for the
-   -- read-ahead rather than racing it, and the completion belongs to whichever
-   -- of the two is outstanding. A store into the line while it is in flight
-   -- poisons it: the data coming back predates that store.
-   signal fbl_pf_req                  : std_logic := '0';
-   signal fbl_pf_busy                 : std_logic := '0';
-   signal fbl_pf_poison               : std_logic := '0';
-   signal fbl_pf_tag                  : unsigned(26 downto 0) := (others => '0');
-   signal fbl_pf_start                : std_logic;
-   signal fbl_pf_next                 : unsigned(31 downto 0);
-   signal fbl_pf_useful               : std_logic;
-   -- Whether the line a read-ahead is waiting to ask for has arrived some
-   -- other way since it was asked for - a demand load fetching it first. It
-   -- must then be dropped: two ways holding one line would take a store into
-   -- only one of them.
-   signal fbl_pf_held                 : std_logic;
-   -- Where a landing read-ahead goes, and whether it is kept. The round-robin
-   -- victim may be the very line a load is about to be answered from - one
-   -- sitting in CHECK, or one looking it up this cycle - and overwriting that
-   -- line served a pixel from the NEXT line (hardware: faint wrong pixels on
-   -- the KI2 title screen). Such a way is pinned and the next one taken. A
-   -- store into the read-ahead's line in the cycle it lands also drops it:
-   -- the poison flag it would set is a cycle late, and the line is not yet
-   -- held, so the store would update nothing.
-   signal fbl_pf_victim               : integer range 0 to FBL_WAYS - 1;
-   signal fbl_pf_drop                 : std_logic;
-   -- One read-ahead per line held, so a walk keeps asking for the line after
-   -- the one it has just reached while a scattered access asks once and
-   -- stops. Cleared for a way when a new line is written into it.
-   signal fbl_pf_done                 : std_logic_vector(FBL_WAYS - 1 downto 0)
-                                        := (others => '0');
-   signal fbl_chain_idle              : std_logic;
-   signal fbl_store_pending           : std_logic;
-   signal fbl_serve                   : std_logic;
-   -- This load fetched its line, so its answer is not a hit. Perf only.
-   signal fbl_fetched                 : std_logic := '0';
-   signal perf_fb_hit                 : std_logic;
-   -- Framebuffer load census, perf only. Every framebuffer load, and for each
-   -- load the buffer misses, what the fetched line was to the buffer:
-   --   perf_fb_load    one pulse per framebuffer load entering stage 4, with
-   --                   or without the buffer
-   --   perf_fb_recent  the line is one of the FBL_WAYS the buffer threw away
-   --                   most recently - a buffer of twice the size would have
-   --                   hit
-   --   perf_fb_adj     the line next to one it holds, either side - a stride
-   --                   of 32 bytes or more, or a read-ahead's case
-   -- The last two are registered a cycle after the miss is decided, and may
-   -- overlap. A fetch in neither is a scattered one.
-   signal perf_fb_load                : std_logic;
-   signal perf_fb_recent              : std_logic := '0';
-   signal perf_fb_adj                 : std_logic := '0';
+   constant DCRA_ON : boolean := DCACHE_READ_AHEAD;
    -- NS: one pulse per uncached store to SDRAM that does not write every
    -- byte of the words it covers - an sh, an sb, or a partial sdl/sdr. The
-   -- board ignores DQM, so ki_memory_bridge now reads, merges and writes
-   -- those back rather than masking, and this says how often the game makes
-   -- one. It replaced FV, which read 0-4 in every capture.
+   -- board ignores DQM, so ki_memory_bridge reads, merges and writes those
+   -- back rather than masking.
    signal perf_uc_narrow              : std_logic;
-   type t_fbl_hist is array(1 to FBL_WAYS) of unsigned(26 downto 0);
-   signal fbl_hist_tag                : t_fbl_hist := (others => (others => '0'));
-   signal fbl_hist_valid              : std_logic_vector(1 to FBL_WAYS) := (others => '0');
-   signal fbl_line                    : std_logic_vector(255 downto 0);
-   signal fbl_qword                   : std_logic_vector(63 downto 0);
-   signal fbl_word                    : std_logic_vector(63 downto 0);
-   signal fbl_store_hit               : std_logic;
-   signal fbl_store_match             : std_logic;
-   signal fbl_store_way               : integer range 0 to FBL_WAYS - 1;
-   signal fbl_store_data              : std_logic_vector(63 downto 0);
-   signal fbl_store_be                : std_logic_vector(7 downto 0);
-   type t_fbbuf_data is array(0 to FBL_WAYS - 1) of std_logic_vector(255 downto 0);
-   type t_fbbuf_tag is array(0 to FBL_WAYS - 1) of unsigned(26 downto 0);
-   signal fbbuf_data                  : t_fbbuf_data := (others => (others => '0'));
-   signal fbbuf_tag                   : t_fbbuf_tag := (others => (others => '0'));
-   signal fbbuf_valid                 : std_logic_vector(FBL_WAYS - 1 downto 0) := (others => '0');
-   -- clk1x side of a fetch. Written only while its own transaction is
-   -- outstanding, and read in clk93 only when that transaction's completion
-   -- has crossed the response mailbox: bundled data, like the mailbox itself.
-   signal fbline_active_1x            : std_logic := '0';
-   signal fbline_beat_1x              : unsigned(1 downto 0) := (others => '0');
-   signal fbline_fill_1x              : std_logic_vector(255 downto 0) := (others => '0');
+   -- clk1x side of a line fetch - the data cache's read-ahead. Written only
+   -- while its own transaction is outstanding, and read in clk93 only when
+   -- that transaction's completion has crossed the response mailbox: bundled
+   -- data, like the mailbox itself.
+   signal line_active_1x              : std_logic := '0';
+   signal line_beat_1x                : unsigned(1 downto 0) := (others => '0');
+   signal line_fill_1x                : std_logic_vector(255 downto 0) := (others => '0');
    signal executeMemFB                : std_logic;
-   signal read4_uncachedSrc           : std_logic_vector(63 downto 0);
           
    -- common   
    type t_memstate is
@@ -800,10 +774,20 @@ architecture arch of cpu is
    signal opcode2                      : unsigned(31 downto 0) := (others => '0');
    signal opcode3                      : unsigned(31 downto 0) := (others => '0');
    signal opcode4                      : unsigned(31 downto 0) := (others => '0');
+   -- LOAD_MERGE_BYPASS's check: stage 4 held a load, leaving, on the edge the
+   -- instruction now in stage 4 entered it.
+   signal executeMergeBehind           : std_logic := '0';
 -- synthesis translate_on  
   
    signal PCold0                       : unsigned(63 downto 0) := (others => '0');
    signal PCold1                       : unsigned(63 downto 0) := (others => '0');
+   -- The profile's own copy of the PC pipeline's last two stages. PCold2 and
+   -- PCold3 below sit inside "synthesis translate_off", so they exist only in
+   -- simulation - which a vcom check cannot tell you, because ModelSim
+   -- compiles that region too and only Quartus refuses it. These mirror them
+   -- under exactly the same enables, and cost 64 flops.
+   signal prof_pc2                     : std_logic_vector(31 downto 0) := (others => '0');
+   signal prof_pc3                     : std_logic_vector(31 downto 0) := (others => '0');
    
 -- synthesis translate_off
    signal PCold2                       : unsigned(63 downto 0) := (others => '0');
@@ -836,10 +820,9 @@ architecture arch of cpu is
    -- chosen. The binding path in the CPU domain at 100 MHz is
    --   resultWriteEnable -> value1 (3-way forward mux) -> FetchAddr1 (5-way
    --   fetch mux) -> itagram1 -> rd_mux -> read_hit -> stall1
-   -- at 10.99 ns, 61% of it interconnect. Two of those hops exist only because
-   -- the forwarding mux and the fetch mux are separate signals that have to be
-   -- routed between: 1.56 ns from value1 to FetchAddr1, then 1.22 ns on to the
-   -- RAM.
+   -- and most of it is interconnect. Two of those hops exist only because the
+   -- forwarding mux and the fetch mux are separate signals that have to be
+   -- routed between: from value1 to FetchAddr1, then on to the RAM.
    --
    -- Only bits 13 downto 2 reach the RAMs - 9 for the tag index, 12 for the
    -- data address - so a private flattened copy of just those costs 12 bits of
@@ -870,6 +853,10 @@ architecture arch of cpu is
    
    -- regs           
    signal fetchReady                   : std_logic := '0';
+   -- Out of reset, stage 1 holds the reset vector until the data cache has
+   -- cleared its tags; see BOOT_HOLD in the stage 1 process.
+   signal boot_hold                    : std_logic := '1';
+   signal datacache_clear_busy         : std_logic;
    
    -- wires   
    signal mem1_request                 : std_logic := '0';
@@ -1107,7 +1094,6 @@ architecture arch of cpu is
    signal executeMem64Bit              : std_logic := '0';
    signal executeMemWriteEnable        : std_logic := '0';
    signal executeMemUseCache           : std_logic := '0';
-   signal executeMemUseCacheEffective  : std_logic := '0';
    signal executeMemWriteData          : unsigned(63 downto 0) := (others => '0');
    signal executeMemWriteMask          : std_logic_vector(7 downto 0) := (others => '0');
    signal executeMemAddress            : unsigned(31 downto 0) := (others => '0');
@@ -1197,9 +1183,8 @@ architecture arch of cpu is
    -- That branch is a cascade of roughly 26 chained 64-bit magnitude compares
    -- on value1 - the forwarded register at the head of the critical path - and
    -- it feeds BOTH dominant path clusters: the region decode below
-   -- (executeMemAddress, 59% of the 300 worst endpoints) and TLB_instrMapped
-   -- above (stall1, 17%). The 32-bit branch it is replaced by is three compares
-   -- on calcMemAddr(31 downto 29).
+   -- (executeMemAddress) and TLB_instrMapped above (stall1). The 32-bit branch
+   -- it is replaced by is three compares on calcMemAddr(31 downto 29).
    --
    -- The KI wrapper enables ADDR32_ONLY because both supported games execute
    -- with 32-bit virtual addresses and keep Status.KX/SX/UX clear.
@@ -1255,6 +1240,15 @@ architecture arch of cpu is
    -- reg      
    signal writebackNew                 : std_logic := '0';
    signal writebackStallFromMEM        : std_logic := '0';
+   signal load_use                     : std_logic;
+   -- LOAD_MERGE_BYPASS: the instruction in stage 2 is a merge load of the rt
+   -- the load in stage 3 writes, and takes no bubble (merge_bypass); it
+   -- carries that into stage 3 (decodeMergeFwd) and stage 4
+   -- (executeMergeFwd), where it merges into writebackData.
+   signal merge_bypass                 : std_logic;
+   signal decodeMergeFwd               : std_logic := '0';
+   signal executeMergeFwd              : std_logic := '0';
+   signal datacache_next_load          : std_logic;
    signal writebackTarget              : unsigned(4 downto 0) := (others => '0');
    signal writebackData                : unsigned(63 downto 0) := (others => '0');
    signal writebackWriteEnable         : std_logic := '0';
@@ -1269,6 +1263,18 @@ architecture arch of cpu is
    -- Perf-only: what the access holding stage 4 is, for the uncached split in
    -- debug_perf_events. Pruned along with the counters.
    signal perf_st4_read                : std_logic := '0';
+   -- Perf-only: an empty pipeline slot a load left, carried from stage 3 into
+   -- stage 4 with the slot (see debug_perf_events).
+   signal perf_ex_ld                   : std_logic := '0';
+   signal perf_wb_ld                   : std_logic := '0';
+   signal perf_lost_md                 : std_logic;
+   signal perf_lost_s3                 : std_logic;
+   signal perf_lost_s1                 : std_logic;
+   signal perf_lost_lb                 : std_logic;
+   signal perf_lost_fl                 : std_logic;
+   -- Not on the debug page, but simulation taps this signal
+   -- directly for the DI directed test, so it stays. Synthesis strips it.
+   signal perf_ld_indep                : std_logic;
    signal perf_st4_region              : std_logic_vector(1 downto 0) := "00";
    signal perf_exec_region             : std_logic_vector(1 downto 0);
    signal perf_uc                      : std_logic;
@@ -1328,24 +1334,32 @@ architecture arch of cpu is
    signal datacache_writedone          : std_logic;
    signal datacache_CmdStall           : std_logic;
    signal datacache_perf_miss          : std_logic;
+   signal datacache_perf_miss_low      : std_logic;
    signal datacache_perf_fill_wait     : std_logic;
-   signal datacache_perf_fill_data     : std_logic;
-   signal datacache_perf_fill_hold     : std_logic;
-   signal datacache_perf_req_denied    : std_logic;
-   signal datacache_perf_writeback     : std_logic;
    signal datacache_perf_stride_hit    : std_logic;
-   signal datacache_perf_way_slow      : std_logic;
-   signal datacache_perf_delta_hit     : std_logic;
    signal datacache_perf_wb_line       : std_logic;
    signal datacache_perf_fill_store    : std_logic;
    signal datacache_perf_fill_skip     : std_logic;
    signal datacache_perf_fill_absent   : std_logic;
+   -- The data cache's read-ahead: its request (a pulse), held until the
+   -- scheduler issues it; its completion; the staged line; and which memory
+   -- transaction in flight is one.
+   signal datacache_ra_request         : std_logic;
+   signal datacache_ra_addr            : unsigned(31 downto 0);
+   signal datacache_ra_pending         : std_logic := '0';
+   signal datacache_ra_done            : std_logic := '0';
+   signal datacache_ra_data            : std_logic_vector(255 downto 0) := (others => '0');
+   signal datacache_ra_store           : std_logic;
    signal datacache_CmdDone            : std_logic;
    
    signal datacache_wb_ena             : std_logic;
    signal datacache_wb_addr            : unsigned(31 downto 0);
    signal datacache_wb_data            : std_logic_vector(63 downto 0);
    signal datacache_wb_mask            : std_logic_vector(3 downto 0);
+   signal datacache_wb_bytes           : std_logic_vector(31 downto 0);
+   -- The issued line's bytes, held with its words in the staging queue.
+   signal wb_line_bytes_93             : std_logic_vector(31 downto 0) := (others => '1');
+   signal wb_line_mask_93              : std_logic_vector(3 downto 0) := (others => '1');
    
    -- savestates
    type t_ssarray is array(0 to 31) of std_logic_vector(63 downto 0);
@@ -1398,6 +1412,10 @@ begin
 
    debug_fetch_pc <= debug_fetch_pc_register;
    debug_retired  <= std_logic_vector(debug_retired_count);
+   -- Exactly the condition that increments debug_retired_count below, so the
+   -- profile's buckets sum to RT by construction.
+   debug_prof_valid <= '1' when (stall4Masked = 0 and writebackNew = '1') else '0';
+   debug_prof_pc    <= prof_pc3;
    debug_gpr_s1       <= debug_gpr_s1_register;
    debug_retire_pc <= debug_retire_pc_register;
    debug_retire_opcode <= debug_retire_opcode_register;
@@ -1506,8 +1524,7 @@ begin
                   trace_tlb_census <= fault_census;
                -- Same widened test as the counter above. This fires BEFORE
                -- the handoff to 0x88000000, so rows 1-7 hold the game code
-               -- that jumped into the ROM - the departure this investigation
-               -- has been trying to name.
+               -- that jumped into the ROM - the departure.
                elsif (dep_valid = 2 and debug_entry_count_register >= 1 and
                    (PCold1(31 downto 20) = x"9FC" or
                     PCold1(31 downto 20) = x"BFC") and
@@ -1531,7 +1548,7 @@ begin
                   trace_s2         <= debug_gpr_s2_register;
                   trace_tlb_census <= std_logic_vector(cop0_debug_tlb_census);
                -- Also counted rather than gated - see ram_reentry. The board
-               -- side now fires on the THIRD disk init: exactly two per startup
+               -- side fires on the THIRD disk init: exactly two per startup
                -- in both games, so the third is the restart's first.
                elsif (trace_trigger_sync = '1') then
                   trace_frozen     <= '1';
@@ -1602,7 +1619,7 @@ begin
    -- previous decode is the second branch and suppression applies.
    --
    -- DS on the status page counts every firing. In normal gameplay it should
-   -- now stay at or near zero; only the FMV decompressor's
+   -- stay at or near zero; only the FMV decompressor's
    -- branch-in-branch-delay-slot idiom should move it.
    chainedDelaySlot <= ds_prev_isbranch when (PCold1(31 downto 0) /= (ds_prev_pc + 4)) else '0';
 
@@ -1714,11 +1731,10 @@ begin
       debug_trace_bus(831 downto 800) <= trace_s1;
       debug_trace_bus(863 downto 832) <= trace_s2;
       debug_trace_bus(895 downto 864) <= trace_tlb_census;
-      -- Fill starts at 740, not 739: widening trace_trigger_id to three bits
-      -- pushed game_running up one, and leaving the fill where it was gave bit
-      -- 739 two drivers. ModelSim resolved that silently; only the Quartus
-      -- analysis pass rejects it, which is why BRINGUP makes that pass mandatory
-      -- after any change that moves bits between fields.
+      -- Fill starts at 740, not 739: bit 739 is game_running, and a fill over
+      -- it would give it two drivers. ModelSim resolves that silently; only the
+      -- Quartus analysis pass rejects it, which is why BRINGUP makes that pass
+      -- mandatory after any change that moves bits between fields.
       debug_trace_bus(767 downto 740) <= (others => '0');
    end generate;
 
@@ -1734,10 +1750,9 @@ begin
             debug_fetch_pc_register <= (others => '0');
             debug_t2_reload_register <= (others => '0');
             -- debug_ret_count_register is NOT cleared here. It is written by
-            -- the decodeNewPulse process now, and a register driven from two
+            -- the decodeNewPulse process, and a register driven from two
             -- processes is illegal for synthesis - Quartus rejects it outright
-            -- while ModelSim resolves it silently, which is why the suite
-            -- passed and the build did not.
+            -- while ModelSim resolves it silently.
          elsif (ce_93 = '1' and stall = 0 and decodeNew = '1') then
             debug_fetch_pc_register <= std_logic_vector(PCold1(31 downto 0));
             debug_prev_op_live      <= std_logic_vector(opcode1);
@@ -1745,10 +1760,7 @@ begin
             hist_op1 <= debug_prev_op_live;
             -- EVERY transition out of the decompressed program back into
             -- the boot ROM, with the address it landed on, the address it left
-            -- from, and a running count. The existing capture above is
-            -- first-only, which was right while the question was "does the
-            -- handoff happen at all" and is useless now that the game boots,
-            -- runs, and restarts itself on a cycle.
+            -- from, and a running count.
             --
             -- Read the landing address: BFC00000 is the reset vector,
             -- BFC00380 the general exception vector for Status.BEV = 1, and
@@ -1775,25 +1787,12 @@ begin
    end process;
 
    -- common
-   -- Scanout reads these pages directly from the framebuffer RAM, outside the
-   -- CPU data-cache coherence domain. Keep only those exact pages uncached.
-   executeMemUseCacheEffective <= '0' when
-      FRAMEBUFFER_UNCACHED and
-      (((executeMemAddress >= FB0_LOW) and (executeMemAddress < FB0_HIGH)) or
-       ((executeMemAddress >= FB1_LOW) and (executeMemAddress < FB1_HIGH)))
-      else executeMemUseCache;
-
    stall        <= '0' & stall4 & stall3 & stall2 & stall1;
 
-   -- Uncached split, perf-only. The region of the access in stage 3, latched
-   -- into stage 4 alongside writebackMemWrite. executeMemAddress is physical
-   -- for the KSEG0/1 accesses KI makes. The framebuffer term is the SAME
-   -- expression executeMemUseCacheEffective uses, so UF counts exactly the
-   -- accesses the core itself treats as framebuffer, and synthesis shares the
-   -- comparators instead of adding a second set to this timing-critical
-   -- register.
-   -- The line buffer shares this term too, so a load it serves is exactly a
-   -- load UF counts.
+   -- Whether the stage 3 access is inside a framebuffer page. The data cache
+   -- takes it as RW_fb for the partial framebuffer stores; the stall census
+   -- latches the region into stage 4 alongside writebackMemWrite.
+   -- executeMemAddress is physical for the KSEG0/1 accesses KI makes.
    executeMemFB <= '1' when
       (((executeMemAddress >= FB0_LOW) and (executeMemAddress < FB0_HIGH)) or
        ((executeMemAddress >= FB1_LOW) and (executeMemAddress < FB1_HIGH))) else '0';
@@ -1812,227 +1811,73 @@ begin
    perf_uc_rom   <= perf_uc_load when (perf_st4_region = "11") else '0';
    perf_uc_ram   <= perf_uc_load when (perf_st4_region = "00") else '0';
 
-   -- ---------------------------------------------- framebuffer line buffer
-   -- All from registers: the load's address as stage 4 presents it, the
-   -- buffer, the write FIFO's held payload and the response mailbox state.
-   --
-   -- The lookup runs where the load is latched into the buffer's state
-   -- machine, so fbl_hit and fbl_way are registers in CHECK. Nothing can
-   -- change a tag while a load sits in CHECK: only a fetch completion writes
-   -- one, and a fetch is outstanding only in WAIT.
-   process (mem4_address, fbbuf_tag, fbbuf_valid)
-      variable hit : std_logic;
-      variable way : integer range 0 to FBL_WAYS - 1;
-   begin
-      hit := '0';
-      way := 0;
-      for w in 0 to FBL_WAYS - 1 loop
-         if (fbbuf_valid(w) = '1' and mem4_address(31 downto 5) = fbbuf_tag(w)) then
-            hit := '1';
-            way := w;
-         end if;
-      end loop;
-      fbl_look_hit <= hit;
-      fbl_look_way <= way;
-   end process;
+   -- The lost-cycle census; see debug_perf_events in the port list. Each
+   -- class excludes the ones before it, and none can hold in a cycle that
+   -- retires, so together with retirement they cover every running cycle
+   -- exactly once. Simulation checks that, cycle by cycle.
+   perf_lost_md <= '1' when (ce_93 = '1' and stall4 = '0' and stall4Masked(2) = '1' and
+                             hiloWait > 0) else '0';
+   perf_lost_lb <= '1' when (ce_93 = '1' and stall4 = '0' and stall4Masked(2) = '1' and
+                             hiloWait = 0 and writebackStallFromMEM = '1') or
+                            (ce_93 = '1' and stall4Masked = 0 and writebackNew = '0' and
+                             perf_wb_ld = '1') else '0';
+   perf_lost_s3 <= '1' when (ce_93 = '1' and stall4 = '0' and stall4Masked(2) = '1' and
+                             hiloWait = 0 and writebackStallFromMEM = '0') else '0';
+   perf_lost_s1 <= '1' when (ce_93 = '1' and stall4Masked(3 downto 2) = "00" and
+                             stall4Masked(1 downto 0) /= "00") else '0';
+   perf_lost_fl <= '1' when (ce_93 = '1' and stall4Masked = 0 and writebackNew = '0' and
+                             perf_wb_ld = '0') else '0';
 
-   -- The answer may only be written while the response chain is not using
-   -- mem_finished_dataRot, and only once no store is waiting to be accepted:
-   -- a store updates the buffer when the FIFO takes it, so a store still
-   -- pending there could be one this load must see.
-   --
-   -- Neither gate is reached in tb_ki_perfbench, and removing either leaves
-   -- its load hash unchanged - measured. A store is accepted the cycle after
-   -- it issues (stage 4 only issues one when the FIFO has room), which is
-   -- before the next load can reach CHECK; and the response chain's own
-   -- priority already keeps the serve below out of a busy cycle. They stay
-   -- as guards: the first holds the buffer's ordering if that handshake ever
-   -- changes, the second keeps read4_uncachedData's source and FH exact.
-   fbl_chain_idle <= '1' when (response_cdc_deliver_93 = '0' and
-                               response_cdc_pending_93 = '0' and
-                               response_cdc_req_sync_93 = response_cdc_req_seen_93) else '0';
-   fbl_store_pending <= writefifo_issue_pending and (not writefifo_Din(105));
-   fbl_serve <= '1' when (FBL_ON and fbl_state = FBL_CHECK and fbl_hit = '1' and
-                          fbl_chain_idle = '1' and fbl_store_pending = '0') else '0';
+   -- A load whose stage-3 bubble a dependency test would remove: presented to
+   -- the data cache this cycle and answered in it (a hit in the predicted way,
+   -- so no WAYFIX replay to pay instead), with a real instruction behind it
+   -- that does not read the loaded register.
+   -- With LOAD_INTERLOCK only loads that TOOK the bubble count: what is left
+   -- is the test's conservatism (an FPU load, a false match on an empty
+   -- stage 2).
+   perf_ld_indep <= '1' when (ce_93 = '1' and datacache_readena = '1' and
+                              datacache_readdone = '1' and executeCOP1ReadEnable = '0' and
+                              executeStallFromMEM = '1' and
+                              decodeNew = '1' and
+                              not (decodeSource1 > 0 and resultTarget = decodeSource1) and
+                              not (decodeSource2 > 0 and resultTarget = decodeSource2)) else '0';
 
-   -- The bridge's own reduction of a framebuffer qword: a 64-bit load takes
-   -- it whole, a narrower one the half address bit 2 selects, zero-extended.
-   fbl_line <= fbbuf_data(fbl_way);
-   with fbl_addr(4 downto 3) select fbl_qword <=
-      fbl_line( 63 downto   0) when "00",
-      fbl_line(127 downto  64) when "01",
-      fbl_line(191 downto 128) when "10",
-      fbl_line(255 downto 192) when others;
-   fbl_word <= fbl_qword                           when (fbl_req64 = '1') else
-               x"00000000" & fbl_qword(63 downto 32) when (fbl_addr(2) = '1') else
-               x"00000000" & fbl_qword(31 downto 0);
-
-   -- A store entering the write FIFO that lands in a buffered line. A
-   -- matching tag can only have come from a framebuffer load, so no range
-   -- check is needed. Line write-backs never target the framebuffer (the
-   -- bridge asserts it) and are excluded anyway.
-   process (writefifo_Din, fbbuf_tag, fbbuf_valid)
-      variable hit : std_logic;
-      variable way : integer range 0 to FBL_WAYS - 1;
-   begin
-      hit := '0';
-      way := 0;
-      for w in 0 to FBL_WAYS - 1 loop
-         if (fbbuf_valid(w) = '1' and
-             unsigned(writefifo_Din(95 downto 69)) = fbbuf_tag(w)) then
-            hit := '1';
-            way := w;
-         end if;
-      end loop;
-      fbl_store_match <= hit;
-      fbl_store_way   <= way;
-   end process;
-
-   fbl_store_hit <= '1' when (FBL_ON and writefifo_wr_accept = '1' and
-                              writefifo_Din(104) = '1' and writefifo_Din(105) = '0' and
-                              writefifo_Din(116) = '0' and fbl_store_match = '1') else '0';
-   -- ki_memory_bridge's FB_WRITE placement: a 64-bit store as given; a
-   -- narrower one arrives in [31:0] with its half in address bit 2.
-   fbl_store_data <= writefifo_Din(63 downto 0) when (writefifo_Din(106) = '1') else
-                     writefifo_Din(31 downto 0) & x"00000000" when (writefifo_Din(66) = '1') else
-                     x"00000000" & writefifo_Din(31 downto 0);
-   fbl_store_be   <= writefifo_Din(103 downto 96) when (writefifo_Din(106) = '1') else
-                     writefifo_Din(99 downto 96) & "0000" when (writefifo_Din(66) = '1') else
-                     "0000" & writefifo_Din(99 downto 96);
-
-   -- A load answered from the line as it already was. The loads that fetched
-   -- are answered the same way a few cycles later, and are not hits.
-   perf_fb_hit <= fbl_serve and (not fbl_fetched);
-
-   -- Read-ahead: the line after the one this load fetched. Worth asking for
-   -- only if it is inside a framebuffer page - outside, the bridge would not
-   -- treat the request as a framebuffer read at all - and not already held.
-   fbl_pf_next <= fbl_addr + 32;
-   process (fbl_pf_next, fbbuf_tag, fbbuf_valid)
-      variable held : std_logic;
-   begin
-      held := '0';
-      for w in 0 to FBL_WAYS - 1 loop
-         if (fbbuf_valid(w) = '1' and fbl_pf_next(31 downto 5) = fbbuf_tag(w)) then
-            held := '1';
-         end if;
-      end loop;
-      if (((fbl_pf_next >= FB0_LOW) and (fbl_pf_next < FB0_HIGH)) or
-          ((fbl_pf_next >= FB1_LOW) and (fbl_pf_next < FB1_HIGH))) then
-         fbl_pf_useful <= not held;
-      else
-         fbl_pf_useful <= '0';
-      end if;
-   end process;
-
-   process (fbl_pf_tag, fbbuf_tag, fbbuf_valid)
-      variable held : std_logic;
-   begin
-      held := '0';
-      for w in 0 to FBL_WAYS - 1 loop
-         if (fbbuf_valid(w) = '1' and fbl_pf_tag = fbbuf_tag(w)) then
-            held := '1';
-         end if;
-      end loop;
-      fbl_pf_held <= held;
-   end process;
-
-   process (fbl_state, fbl_hit, fbl_way, fbl_start, fbl_look_hit, fbl_look_way,
-            fbl_repl, fbl_pf_poison, fbl_pf_tag, writefifo_wr_accept, writefifo_Din)
-      variable pin_valid : std_logic;
-      variable pin_way   : integer range 0 to FBL_WAYS - 1;
-      variable nowhere   : std_logic;
-      variable store_now : std_logic;
-   begin
-      pin_valid := '0';
-      pin_way   := 0;
-      if (fbl_state = FBL_CHECK and fbl_hit = '1') then
-         pin_valid := '1';
-         pin_way   := fbl_way;
-      elsif (fbl_start = '1' and fbl_look_hit = '1') then
-         pin_valid := '1';
-         pin_way   := fbl_look_way;
-      end if;
-      nowhere := '0';
-      if (pin_valid = '1' and pin_way = fbl_repl) then
-         if (FBL_WAYS = 1) then
-            fbl_pf_victim <= 0;
-            nowhere := '1';
-         elsif (fbl_repl = FBL_WAYS - 1) then
-            fbl_pf_victim <= 0;
-         else
-            fbl_pf_victim <= fbl_repl + 1;
-         end if;
-      else
-         fbl_pf_victim <= fbl_repl;
-      end if;
-      store_now := '0';
-      if (writefifo_wr_accept = '1' and writefifo_Din(105) = '0' and
-          writefifo_Din(116) = '0' and
-          unsigned(writefifo_Din(95 downto 69)) = fbl_pf_tag) then
-         store_now := '1';
-      end if;
-      fbl_pf_drop <= fbl_pf_poison or store_now or nowhere;
-   end process;
-
-   -- Asked for where a load is answered from a line that has not asked yet.
-   -- A walk therefore asks for k+1 as it reaches k, one line at a time, and a
-   -- line that is read many times asks once.
-   fbl_pf_start <= '1' when (FBL_PF and fbl_serve = '1' and
-                             fbl_pf_done(fbl_way) = '0' and
-                             fbl_pf_useful = '1' and fbl_pf_busy = '0' and
-                             fbl_pf_req = '0') else '0';
-
-   -- What a miss fetched, against the lines held and the FBL_WAYS thrown away
-   -- before them. One decision per miss: CHECK moves to FETCH the cycle after
-   -- it misses.
-   process (clk93)
-      variable line : unsigned(26 downto 0);
-   begin
-      if rising_edge(clk93) then
-         perf_fb_recent <= '0';
-         perf_fb_adj    <= '0';
-         if (FBL_ON and fbl_state = FBL_CHECK and fbl_hit = '0') then
-            line := fbl_addr(31 downto 5);
-            for h in 1 to FBL_WAYS loop
-               if (fbl_hist_valid(h) = '1' and line = fbl_hist_tag(h)) then
-                  perf_fb_recent <= '1';
-               end if;
-            end loop;
-            for w in 0 to FBL_WAYS - 1 loop
-               if (fbbuf_valid(w) = '1' and
-                   (line = fbbuf_tag(w) + 1 or line = fbbuf_tag(w) - 1)) then
-                  perf_fb_adj <= '1';
-               end if;
-            end loop;
-         end if;
-      end if;
-   end process;
-
-   -- See debug_perf_events in the port list.
-   debug_perf_events <= perf_uc_narrow &                  -- 9 NS
-                        perf_fb_adj &                     -- 8 FA
-                        perf_fb_hit &                     -- 7 FH
-                        perf_fb_load &                    -- 6 FL
+   -- LM (bit 10) is the SRAM-region share of MC. It is APPENDED rather than
+   -- put in S3's slot. Row 14 of the Perf page shows S3 directly for both
+   -- frames. S3's bit is also OR'd into ki_cpu_core's nm_cnt, which selects
+   -- the worst frame, and it is a term of the
+   -- CY - RT = S4 + MD + S3 + S1 + LB identity. Repurposing it would corrupt
+   -- both.
+   debug_perf_events <= perf_ld_indep &                   -- 11 DI
+                        datacache_perf_miss_low &         -- 10 LM
+                        perf_lost_lb &                    -- 9 LB
+                        perf_lost_s1 &                    -- 8 S1
+                        perf_lost_s3 &                    -- 7 S3
+                        perf_lost_md &                    -- 6 MD
                         (stall4 and writeback_UseCache) & -- 5 DC
                         (perf_uc_ram or perf_uc_io or perf_uc_rom) & -- 4 UO
                         perf_uc_fb &                      -- 3 UF
                         stall4 &                          -- 2 S4
                         perf_uc_write &                   -- 1 UW
-                        perf_fb_recent;                   -- 0 FR
+                        datacache_perf_miss;              -- 0 MC
    read_meta_push <= writefifo_wr_accept and writefifo_Din(105);
-   read_meta_pop <= '1' when
+   -- Every store entering the write FIFO, write-backs included: the data
+   -- cache's read-ahead drops a staged line one lands in.
+   datacache_ra_store <= writefifo_wr_accept and (not writefifo_Din(105));
+   resp_take <= '1' when
       (response_cdc_pending_93 = '0' and
        response_cdc_deliver_93 = '0' and
-       response_cdc_req_sync_93 /= response_cdc_req_seen_93) else '0';
+       resp_fifo_empty = '0') else '0';
+   resp_fifo_rd  <= resp_take;
+   read_meta_pop <= resp_take;
    read_meta_tag_mismatch <= '1' when
-      response_cdc_data_1x(72 downto 65) /=
+      resp_fifo_dout(72 downto 65) /=
         read_meta_tag(to_integer(read_meta_rdptr)) else '0';
    read_meta_class_mismatch <= '1' when
-      response_cdc_data_1x(64) /=
+      resp_fifo_dout(64) /=
         read_meta_class(to_integer(read_meta_rdptr)) else '0';
    read_meta_address_mismatch <= '1' when
-      response_cdc_data_1x(104 downto 73) /=
+      resp_fifo_dout(104 downto 73) /=
         read_meta_address(to_integer(read_meta_rdptr)) else '0';
    
    process (clk93)
@@ -2042,10 +1887,10 @@ begin
          writefifo_Rd          <= '0';
          write_cdc_ack_meta_93 <= write_cdc_ack_1x;
          write_cdc_ack_sync_93 <= write_cdc_ack_meta_93;
-         response_cdc_req_meta_93 <= response_cdc_req_1x;
-         response_cdc_req_sync_93 <= response_cdc_req_meta_93;
          mem_finished_instr       <= '0';
          mem_finished_read        <= '0';
+         datacache_fill_done      <= '0';
+         datacache_ra_done        <= '0';
          
          if (reset_93 = '1') then
          
@@ -2053,7 +1898,6 @@ begin
             datacache_request_latched <= '0';
             writefifo_cnt             <= 0;
             datacache_wb_fifo_wrptr   <= (others => '0');
-            datacache_wb_fifo_rdptr   <= (others => '0');
             datacache_wb_fifo_count   <= 0;
             writefifo_issue_pending <= '0';
             writefifo_issue_wb      <= '0';
@@ -2066,13 +1910,8 @@ begin
             write_cdc_busy_93         <= '0';
             write_cdc_ack_meta_93     <= '0';
             write_cdc_ack_sync_93     <= '0';
-            response_cdc_req_meta_93  <= '0';
-            response_cdc_req_sync_93  <= '0';
-            response_cdc_req_seen_93  <= '0';
             response_cdc_pending_93   <= '0';
             response_cdc_deliver_93   <= '0';
-             response_cdc_class_93     <= '0';
-             response_cdc_ack_93       <= '0';
              mem_finished_dataRead     <= (others => '0');
              mem_finished_dataRot      <= (others => '0');
              read_meta_wrptr           <= (others => '0');
@@ -2080,58 +1919,13 @@ begin
              read_meta_count           <= 0;
              read_sequence_93          <= (others => '0');
              debug_response_status_reg   <= (others => '0');
-             fbl_state                 <= FBL_IDLE;
-             fbbuf_valid               <= (others => '0');
-             fbl_hist_valid            <= (others => '0');
-             fbl_hit                   <= '0';
-             fbl_way                   <= 0;
-             fbl_repl                  <= 0;
-             fbl_pf_req                <= '0';
-             fbl_pf_busy               <= '0';
-             fbl_pf_poison             <= '0';
-             fbl_pf_done               <= (others => '0');
 
           else
 
-             -- Framebuffer line buffer: a load entering stage 4, and a store
-             -- entering the write FIFO. The fetch, its completion and the
-             -- answer are in the scheduler and the response chain below.
-             if (FBL_ON and fbl_start = '1') then
-                fbl_state   <= FBL_CHECK;
-                fbl_addr    <= mem4_address;
-                fbl_req64   <= mem4_req64;
-                fbl_fetched <= '0';
-                fbl_hit     <= fbl_look_hit;
-                fbl_way     <= fbl_look_way;
-             elsif (fbl_state = FBL_CHECK and fbl_hit = '0') then
-                fbl_state <= FBL_FETCH;
-             end if;
-
-             -- A store into the line a read-ahead is fetching. The data on its
-             -- way back was read before the store reached the framebuffer, so
-             -- keeping it would lose the store. Drop it instead.
-             if (FBL_PF and fbl_pf_busy = '1' and writefifo_wr_accept = '1' and
-                 writefifo_Din(105) = '0' and writefifo_Din(116) = '0' and
-                 unsigned(writefifo_Din(95 downto 69)) = fbl_pf_tag) then
-                fbl_pf_poison <= '1';
-             end if;
-
-             if (fbl_store_hit = '1') then
-                for q in 0 to 3 loop
-                   if (unsigned(writefifo_Din(68 downto 67)) = to_unsigned(q, 2)) then
-                      for b in 0 to 7 loop
-                         if (fbl_store_be(b) = '1') then
-                            fbbuf_data(fbl_store_way)(q * 64 + b * 8 + 7 downto q * 64 + b * 8) <=
-                               fbl_store_data(b * 8 + 7 downto b * 8);
-                         end if;
-                      end loop;
-                   end if;
-                end loop;
-             end if;
-
              -- Record every accepted read independently of the request CDC.
-             -- A depth of 16 covers the seven-entry transaction FIFO plus
-             -- both CDC mailboxes and the active memory transaction.
+             -- A depth of 16 covers the seven-entry transaction FIFO plus the
+             -- request mailbox, the two-entry response FIFO and the active
+             -- memory transaction - eleven.
              if (read_meta_push = '1') then
                 if (read_meta_count < 16 or read_meta_pop = '1') then
                    read_meta_tag(to_integer(read_meta_wrptr)) <=
@@ -2163,17 +1957,17 @@ begin
                          read_meta_class_mismatch &
                          read_meta_tag_mismatch &
                          read_meta_class(to_integer(read_meta_rdptr)) &
-                         response_cdc_data_1x(64) &
+                         resp_fifo_dout(64) &
                          read_meta_tag(to_integer(read_meta_rdptr)) &
-                         response_cdc_data_1x(72 downto 65) &
+                         resp_fifo_dout(72 downto 65) &
                          std_logic_vector(to_unsigned(read_meta_count, 5)) &
                          "000";
                    end if;
                 elsif (debug_response_status_reg(31) = '0') then
                    debug_response_status_reg <=
                       '1' & '1' & '0' & "000" &
-                      '0' & response_cdc_data_1x(64) &
-                      x"00" & response_cdc_data_1x(72 downto 65) &
+                      '0' & resp_fifo_dout(64) &
+                      x"00" & resp_fifo_dout(72 downto 65) &
                       "00000" & "000";
                 end if;
              end if;
@@ -2187,7 +1981,7 @@ begin
              end if;
          
             if (write_cdc_busy_93 = '1') then
-               if (write_cdc_ack_sync_93 = write_cdc_req_93) then
+               if (write_cdc_ack_in_93 = write_cdc_req_93) then
                   write_cdc_busy_93 <= '0';
                end if;
             elsif (writefifo_Empty = '0') then
@@ -2214,6 +2008,16 @@ begin
                   std_logic_vector(datacache_wb_addr) & datacache_wb_data;
                datacache_wb_fifo_wrptr <= datacache_wb_fifo_wrptr + 1;
             end if;
+            -- The line's mask and bytes, taken with its FIRST word, while the
+            -- cache is certainly still in the write-back states that set
+            -- them. They ride with the words - the mask into the mailbox at
+            -- issue, the bytes beside mem_line_data - and are stable, like
+            -- the words, until the queue is released. Reading the cache's own
+            -- at issue instead would leave it waiting in WRITEBACKDONE.
+            if (datacache_wb_ena = '1' and datacache_wb_fifo_count = 0) then
+               wb_line_mask_93  <= datacache_wb_mask;
+               wb_line_bytes_93 <= datacache_wb_bytes;
+            end if;
 
             -- Released as a whole line, not beat by beat: the words must sit
             -- still until the clk1x side has read them.
@@ -2227,7 +2031,7 @@ begin
             wb_line_done_meta_93 <= wb_line_done_1x;
             wb_line_done_sync_93 <= wb_line_done_meta_93;
             if (wb_line_release = '1') then
-               wb_line_done_seen_93 <= wb_line_done_sync_93;
+               wb_line_done_seen_93 <= wb_line_done_in_93;
                wb_line_issued       <= '0';
             elsif (writefifo_wr_accept = '1' and writefifo_issue_pending = '1' and
                    writefifo_issue_wb = '1') then
@@ -2235,9 +2039,20 @@ begin
             end if;
             
             -- Cache refill requests are one-cycle pulses. Preserve them when
-            -- a higher-priority stage-4 transaction owns this FIFO cycle.
+            -- a higher-priority stage-4 transaction owns this FIFO cycle -
+            -- and ONLY then: a request this cycle's chain below issues
+            -- directly must not also be latched, or it goes out twice. The
+            -- write-back owns the cycle while datacache_wb_sched, not for all
+            -- of datacache_wb_busy: once its line is issued the chain lets a
+            -- fill through behind it, and a request arriving in that window
+            -- would be both issued and latched. The instruction cache would
+            -- then take the duplicate's beats as its NEXT line's fill and mark
+            -- that line valid with nothing written to it. Reachable only when
+            -- a request arrives between a write-back's issue and its release,
+            -- which DCACHE_WB_EARLY (the cache leaving WRITEBACKDONE before
+            -- the release) allows.
             if (datacache_request = '1' and
-                (datacache_wb_busy = '1' or
+                (datacache_wb_sched = '1' or
                  datacache_request_latched = '1' or
                  mem1_request_latched = '1' or
                  mem4_request = '1' or
@@ -2247,7 +2062,7 @@ begin
                   datacache_reqAddr(31 downto 5) & "00000";
             end if;
 
-            if (datacache_wb_busy = '1' or
+            if (datacache_wb_sched = '1' or
                 datacache_request_latched = '1' or
                 mem1_request_latched = '1' or
                 mem4_request = '1' or
@@ -2285,10 +2100,9 @@ begin
                   writefifo_issue_wb           <= '1';
                   writefifo_Din( 63 downto  0) <= datacache_wb_fifo(0)(63 downto 0);
                   writefifo_Din( 95 downto 64) <= datacache_wb_fifo(0)(95 downto 64);
-                  -- The qwords the line really holds. The cache stays in its
-                  -- write-back states until clk1x has taken the line, so its
-                  -- mask is the one for these words.
-                  writefifo_Din(103 downto 96) <= "0000" & datacache_wb_mask;
+                  -- The qwords and bytes the line really holds, latched when
+                  -- its first word was staged: the cache may have moved on.
+                  writefifo_Din(103 downto 96) <= "0000" & wb_line_mask_93;
                   writefifo_Din(104)           <= '1';
                   writefifo_Din(105)           <= '0';
                   writefifo_Din(106)           <= '1';
@@ -2383,25 +2197,6 @@ begin
                writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
                writefifo_Din(116)           <= '0';
                writefifo_Din(117)           <= '0';
-             elsif (fbl_state = FBL_FETCH and writefifo_mem4_ready = '1' and
-                    fbl_pf_busy = '0') then
-                -- The framebuffer line buffer's fetch: the whole 32-byte line
-                -- holding the load in stage 4, which it stands in for - hence
-                -- the same ready as that load. 64-bit and bit 117, so clk1x
-                -- asks the bridge for four qwords and captures them.
-                writefifo_issue_pending      <= '1';
-                writefifo_issue_wb           <= '0';
-                writefifo_Din( 95 downto 64) <=
-                   std_logic_vector(fbl_addr(31 downto 5)) & "00000";
-                writefifo_Din(104)           <= '1';
-                writefifo_Din(105)           <= '1';
-                writefifo_Din(106)           <= '1';
-                writefifo_Din(107)           <= '0';
-                writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
-                writefifo_Din(116)           <= '0';
-                writefifo_Din(117)           <= '1';
-                fbl_state                    <= FBL_WAIT;
-                fbl_fetched                  <= '1';
              elsif (datacache_request = '1' and
                     writefifo_schedule_ready = '1') then
                 writefifo_issue_pending      <= '1';
@@ -2432,145 +2227,80 @@ begin
                   writefifo_Din( 95 downto 64) <=
                      "000" & std_logic_vector(mem1_address(28 downto 5)) & "00000";
                end if;
-             elsif (FBL_PF and fbl_pf_req = '1' and fbl_pf_busy = '0' and
-                    fbl_pf_held = '0' and
-                    fbl_state /= FBL_WAIT and writefifo_mem4_ready = '1') then
-                -- The read-ahead, last in the chain so it can never delay a
-                -- demand access, and issued exactly like the fetch above -
-                -- 64-bit, bit 117 - so clk1x captures it the same way.
+             elsif (DCRA_ON and datacache_ra_pending = '1' and
+                    writefifo_mem4_ready = '1') then
+                -- The data cache's read-ahead, below everything: a line fetch
+                -- (117) marked as the cache's (107), so clk1x captures its four
+                -- qwords as a line rather than giving them to the cache as a
+                -- fill.
                 writefifo_issue_pending      <= '1';
                 writefifo_issue_wb           <= '0';
                 writefifo_Din( 95 downto 64) <=
-                   std_logic_vector(fbl_pf_tag) & "00000";
+                   std_logic_vector(datacache_ra_addr(31 downto 5)) & "00000";
                 writefifo_Din(104)           <= '1';
                 writefifo_Din(105)           <= '1';
                 writefifo_Din(106)           <= '1';
-                writefifo_Din(107)           <= '0';
+                writefifo_Din(107)           <= '1';
                 writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
                 writefifo_Din(116)           <= '0';
                 writefifo_Din(117)           <= '1';
-                fbl_pf_req                   <= '0';
-                fbl_pf_busy                  <= '1';
-                fbl_pf_poison                <= '0';
+                datacache_ra_pending         <= '0';
+            end if;
+            if (DCRA_ON and datacache_ra_request = '1') then
+               datacache_ra_pending <= '1';
             end if;
             
-            -- The memory-domain source holds this mailbox payload until the
-            -- acknowledgement returns. Capture the raw word first, register
-            -- the load-aligned copy on the next cycle, and only then pulse the
-            -- appropriate completion. This keeps completion, transaction type
-            -- and data atomic across the clk1x-to-clk93 boundary.
+            -- The FIFO holds its head until resp_take pops it, so the payload
+            -- is stable here.
+            --
+            -- An UNCACHED stage-4 read is the only completion that carries
+            -- data this side has to work on: capture the raw word first,
+            -- register the load-aligned copy on the next cycle, and only then
+            -- pulse, which keeps completion, transaction type and data atomic
+            -- across the boundary. A CACHE fill's data went into the cache as
+            -- beats in clk1x - the last one a clk1x cycle BEFORE mem_done, so
+            -- it is long written by the time this sees the completion at all -
+            -- and the completion itself carries nothing. Those pulse on the
+            -- cycle they are taken instead of two later, which is two CPU
+            -- cycles off the return path of every demand miss.
             if (response_cdc_deliver_93 = '1') then
-               if (response_cdc_class_93 = '1') then
-                  mem_finished_read <= '1';
-               else
-                  mem_finished_instr <= '1';
-               end if;
-               response_cdc_ack_93     <= response_cdc_req_seen_93;
+               mem_finished_read       <= '1';
                response_cdc_deliver_93 <= '0';
             elsif (response_cdc_pending_93 = '1') then
                mem_finished_dataRot    <= std_logic_vector(read4_uncachedData);
                response_cdc_pending_93 <= '0';
                response_cdc_deliver_93 <= '1';
-            elsif (response_cdc_req_sync_93 /= response_cdc_req_seen_93) then
-               if (FBL_ON and response_cdc_data_1x(105) = '1') then
-                  -- A framebuffer line fetch is complete. Its four qwords
-                  -- are in fbline_fill_1x, stable since before this
-                  -- completion crossed. Take them and acknowledge, but
-                  -- deliver nothing: CHECK answers the load from the buffer.
-                  -- The line it replaces is the round-robin victim, which is
-                  -- also the line CHECK must now read.
-                  --
-                  -- Only one framebuffer fetch is outstanding, so which of
-                  -- the two this is follows from the state: FBL_WAIT means a
-                  -- load is waiting for it, otherwise it is the read-ahead.
-                  if (fbl_state = FBL_WAIT) then
-                     -- A demand fetch: the load waiting for it is the only
-                     -- load there is, so nothing is pinned.
-                     fbbuf_data(fbl_repl)  <= fbline_fill_1x;
-                     fbbuf_tag(fbl_repl)   <= fbl_addr(31 downto 5);
-                     fbbuf_valid(fbl_repl) <= '1';
-                     fbl_pf_done(fbl_repl) <= '0';
-                     fbl_hit               <= '1';
-                     fbl_way               <= fbl_repl;
-                     fbl_state             <= FBL_CHECK;
-                     if (fbl_repl = FBL_WAYS - 1) then
-                        fbl_repl <= 0;
-                     else
-                        fbl_repl <= fbl_repl + 1;
-                     end if;
-                     -- Perf only: the lines thrown away, most recent first.
-                     for h in FBL_WAYS downto 2 loop
-                        fbl_hist_tag(h)   <= fbl_hist_tag(h - 1);
-                        fbl_hist_valid(h) <= fbl_hist_valid(h - 1);
-                     end loop;
-                     fbl_hist_tag(1)       <= fbbuf_tag(fbl_repl);
-                     fbl_hist_valid(1)     <= fbbuf_valid(fbl_repl);
-                  elsif (fbl_pf_drop = '0') then
-                     -- A read-ahead, into a way no load is about to read.
-                     fbbuf_data(fbl_pf_victim)  <= fbline_fill_1x;
-                     fbbuf_tag(fbl_pf_victim)   <= fbl_pf_tag;
-                     fbbuf_valid(fbl_pf_victim) <= '1';
-                     fbl_pf_done(fbl_pf_victim) <= '0';
-                     -- A load already waiting for the line the read-ahead
-                     -- just brought in - or looking it up this very cycle,
-                     -- and about to miss it - takes it instead of fetching
-                     -- it again, which would put one line in two ways. These
-                     -- assignments come after the load's own in this
-                     -- process, so they are the ones that stand.
-                     if ((fbl_state = FBL_CHECK or fbl_state = FBL_FETCH) and
-                         fbl_addr(31 downto 5) = fbl_pf_tag) then
-                        fbl_hit   <= '1';
-                        fbl_way   <= fbl_pf_victim;
-                        fbl_state <= FBL_CHECK;
-                     elsif (fbl_start = '1' and mem4_address(31 downto 5) = fbl_pf_tag) then
-                        fbl_hit   <= '1';
-                        fbl_way   <= fbl_pf_victim;
-                     end if;
-                     if (fbl_pf_victim = FBL_WAYS - 1) then
-                        fbl_repl <= 0;
-                     else
-                        fbl_repl <= fbl_pf_victim + 1;
-                     end if;
-                     for h in FBL_WAYS downto 2 loop
-                        fbl_hist_tag(h)   <= fbl_hist_tag(h - 1);
-                        fbl_hist_valid(h) <= fbl_hist_valid(h - 1);
-                     end loop;
-                     fbl_hist_tag(1)       <= fbbuf_tag(fbl_pf_victim);
-                     fbl_hist_valid(1)     <= fbbuf_valid(fbl_pf_victim);
-                  end if;
-                  if (fbl_state /= FBL_WAIT) then
-                     fbl_pf_busy   <= '0';
-                     fbl_pf_poison <= '0';
-                  end if;
-                  response_cdc_req_seen_93 <= response_cdc_req_sync_93;
-                  response_cdc_ack_93      <= response_cdc_req_sync_93;
+            elsif (resp_fifo_empty = '0') then
+               -- resp_take is this same condition, and pops the FIFO.
+               if (DCRA_ON and resp_fifo_dout(105) = '1') then
+                  -- The data cache's read-ahead is back. Stage its four
+                  -- qwords; the cache decides what they are worth.
+                  datacache_ra_data        <= line_fill_1x;
+                  datacache_ra_done        <= '1';
                else
-                  mem_finished_dataRead    <= response_cdc_data_1x(63 downto 0);
-                  response_cdc_class_93    <= response_cdc_data_1x(64);
-                  response_cdc_req_seen_93 <= response_cdc_req_sync_93;
-                  response_cdc_pending_93  <= '1';
+                  -- Everything that is not a line fetch carries a data word,
+                  -- an instruction fetch included: stage 1 takes an UNCACHED
+                  -- opcode from mem_finished_dataRead beside
+                  -- mem_finished_instr, so this is not the uncached load's
+                  -- alone. Dropping it here hangs the boot ROM.
+                  mem_finished_dataRead <= resp_fifo_dout(63 downto 0);
+                  if (resp_fifo_dout(64) = '0') then
+                     -- An instruction fetch. A cached one is beats in clk1x
+                     -- and this is only its ram_done; an uncached one is the
+                     -- word just captured, which is registered on this same
+                     -- edge and therefore valid in the cycle stage 1 reads it.
+                     mem_finished_instr <= '1';
+                  elsif (resp_fifo_dout(106) = '1') then
+                     -- A data cache fill: beats in clk1x, the last one a
+                     -- clk1x cycle BEFORE mem_done, so it is long written by
+                     -- the time this sees the completion. Its ram_done.
+                     datacache_fill_done <= '1';
+                  else
+                     -- An uncached stage-4 read, the one completion whose
+                     -- data this side still has to rotate. Two more cycles.
+                     response_cdc_pending_93 <= '1';
+                  end if;
                end if;
-            elsif (fbl_serve = '1') then
-               -- A load the buffer answers. read4_uncachedData takes fbl_word
-               -- while fbl_serve is high, so this is the same rotation a
-               -- response gets, and mem_finished_read completes it the same
-               -- way. Written together rather than a cycle apart: both are
-               -- registers, set at one edge and used in the next.
-               mem_finished_dataRot <= std_logic_vector(read4_uncachedData);
-               mem_finished_read    <= '1';
-               fbl_state            <= FBL_IDLE;
-            end if;
-
-            -- Read-ahead, asked for as a load is answered from a line that
-            -- has not asked yet. The issue itself is at the bottom of the
-            -- scheduler's priority.
-            if (fbl_pf_start = '1') then
-               fbl_pf_req            <= '1';
-               fbl_pf_tag            <= fbl_pf_next(31 downto 5);
-               fbl_pf_done(fbl_way)  <= '1';
-            elsif (FBL_PF and fbl_pf_req = '1' and fbl_pf_held = '1') then
-               -- A demand load fetched that line while this request waited.
-               fbl_pf_req <= '0';
             end if;
 
          end if;
@@ -2581,7 +2311,7 @@ begin
    generic map
    (
       SIZE              => 8,
-      DATAWIDTH         => 118, -- 108-bit transaction, 8-bit read sequence tag, 1-bit whole-line write, 1-bit framebuffer line fetch
+      DATAWIDTH         => 118, -- 108-bit transaction, 8-bit read sequence tag, 1-bit whole-line write, 1-bit read-ahead line fetch
       NEARFULLDISTANCE  => 4
    )
    port map
@@ -2612,35 +2342,65 @@ begin
        (writefifo_Full = '0' or writefifo_rd_accept = '1')) else '0';
 
    -- The line's four words are released together, when clk1x reports it has
-   -- handed them over. datacache_wb_fifo_pop is retained only as the debug
-   -- name for that event.
-   wb_line_release <= '1' when (wb_line_done_sync_93 /= wb_line_done_seen_93) else '0';
-   datacache_wb_fifo_pop <= wb_line_release;
+   -- handed them over (wb_line_release below).
+   -- THE CROSSING (see its declarations): the other side's register, or its
+   -- synchroniser.
+   write_cdc_req_in_1x <= write_cdc_req_93 when SYNC_CROSSING else write_cdc_req_sync_1x;
+   write_cdc_ack_in_93 <= write_cdc_ack_1x when SYNC_CROSSING else write_cdc_ack_sync_93;
+   wb_line_done_in_93  <= wb_line_done_1x  when SYNC_CROSSING else wb_line_done_sync_93;
+
+   wb_line_release <= '1' when (wb_line_done_in_93 /= wb_line_done_seen_93) else '0';
    datacache_wb_busy <= '1' when
       (datacache_wb_fifo_count > 0 or
        (writefifo_issue_pending = '1' and writefifo_issue_wb = '1') or
        datacache_wb_ena = '1') else '0';
+   -- Exactly the scheduler branches through which the write-back pre-empts a
+   -- request: its issue pending, the whole line staged and not yet issued,
+   -- or words still arriving.
+   datacache_wb_sched <= '1' when
+      ((writefifo_issue_pending = '1' and writefifo_issue_wb = '1') or
+       (datacache_wb_fifo_count = 4 and wb_line_issued = '0') or
+       (datacache_wb_fifo_count > 0 and datacache_wb_fifo_count < 4) or
+       datacache_wb_ena = '1') else '0';
 
    -- synthesis translate_off
-   assert not (datacache_wb_ena = '1' and
-               datacache_wb_fifo_count = 4 and
-               wb_line_release = '0')
-      report "datacache writeback staging overflow"
-      severity failure;
-
-   -- The line issue takes datacache_wb_mask when it loads the payload, which
-   -- is only the staged words' mask while the cache is still in the states
-   -- that wrote them (WRITEBACK3WRITE to WRITEBACKDONE, debug states 9-11).
+   -- Each cache has at most ONE line fill in flight, so a second fill read
+   -- from the same cache accepted into the write FIFO before the first one's
+   -- completion is a duplicate by definition. Its only other symptom shows
+   -- up much later; this names it where it happens.
    process(clk93)
+      variable ic_out : boolean := false;
+      variable dc_out : boolean := false;
    begin
       if rising_edge(clk93) then
-         if (reset_93 = '0' and datacache_wb_fifo_count > 0) then
-            assert unsigned(datacache_debug_state) >= 9 and unsigned(datacache_debug_state) <= 11
-               report "datacache writeback words staged outside the cache's write-back states"
-               severity failure;
+         if (reset_93 = '1') then
+            ic_out := false; dc_out := false;
+         else
+            if (mem_finished_instr = '1') then ic_out := false; end if;
+            if (datacache_fill_done = '1') then dc_out := false; end if;
+            if (writefifo_wr_accept = '1' and writefifo_Din(105) = '1' and writefifo_Din(116) = '0') then
+               if (writefifo_Din(104) = '0' and writefifo_Din(107) = '1') then
+                  assert not ic_out
+                     report "a second instruction-cache line fill issued while one is outstanding"
+                     severity failure;
+                  ic_out := true;
+               elsif (writefifo_Din(104) = '1' and writefifo_Din(107) = '1' and writefifo_Din(117) = '0') then
+                  assert not dc_out
+                     report "a second data-cache fill issued while one is outstanding"
+                     severity failure;
+                  dc_out := true;
+               end if;
+            end if;
          end if;
       end if;
    end process;
+   -- synthesis translate_on
+
+   -- The line's mask is latched with its first word (wb_line_mask_93), and
+   -- with DCACHE_WB_EARLY the cache leaves for ALLOC with its line still
+   -- staged. What must hold - no second write-back over a staged line - is
+   -- the staging check below, and WRITEBACK1ADDR waiting on fifo_block,
+   -- which datacache_wb_busy holds high while any word is staged.
 
    process(clk93)
       variable held_valid : boolean := false;
@@ -2664,83 +2424,107 @@ begin
       end if;
    end process;
 
-   -- The framebuffer line buffer's safety argument, as checks rather than
-   -- prose. Each one is a claim docs/OPTIMIZATION-HISTORY.md makes.
+-- synthesis translate_off
+   -- An instruction fetch request is issued the cycle it arrives or latched
+   -- for a later one, never neither: otherwise stage 1 waits for ever.
+   process (clk93)
+      variable req_d : boolean := false;
+   begin
+      if rising_edge(clk93) then
+         if (reset_93 = '1') then
+            req_d := false;
+         else
+            if (req_d) then
+               assert (mem1_request_latched = '1' or
+                       (writefifo_issue_pending = '1' and writefifo_Din(104) = '0'))
+                  report "an instruction fetch request was neither issued nor latched"
+                  severity failure;
+            end if;
+            req_d := (mem1_request = '1' or instrcache_request = '1');
+         end if;
+      end if;
+   end process;
+-- synthesis translate_on
+
+-- synthesis translate_off
+   -- LOAD_MERGE_BYPASS's one assumption: a flagged merge load entered stage 4
+   -- on the edge the load it merges behind left it, with no bubble between
+   -- (executeMergeBehind), so while it is in stage 4 the writeback slot holds
+   -- that load - the same target register - and writebackData is its result.
    process(clk93)
    begin
       if rising_edge(clk93) then
-         if reset_93 = '0' then
-            -- Stage 4 holds one load at a time, so a new one cannot arrive
-            -- while the last is still being answered.
-            assert not (fbl_start = '1' and fbl_state /= FBL_IDLE)
-               report "framebuffer load entered stage 4 while the line buffer was busy"
+         if (reset_93 = '0' and ce_93 = '1') then
+            assert not (executeMergeFwd = '1' and executeNew = '1' and stall4 = '0' and
+                        (executeMergeBehind = '0' or writebackTarget /= resultTarget))
+               report "a merge load flagged to skip its bubble is not straight behind the load it merges into"
                severity failure;
-            -- The held load raises no request of its own, and nothing else
-            -- in stage 4 can while it holds it.
-            assert not (mem4_request = '1' and fbl_state /= FBL_IDLE)
-               report "a stage-4 request while the line buffer holds stage 4"
-               severity failure;
-            -- Between a fetch's issue and its completion nothing may store:
-            -- the line it returns would not include the store, and the
-            -- buffer would lose it.
-            assert not (fbl_state = FBL_WAIT and writefifo_wr_accept = '1' and
-                        writefifo_Din(105) = '0')
-               report "a store entered the write FIFO while a framebuffer line fetch was outstanding"
-               severity failure;
-            -- mem_finished_read is also the D-cache's ram_done, which it
-            -- only reads in FILL.
-            assert not (fbl_serve = '1' and datacache_debug_state /= "0000")
-               report "line buffer answered a load while the D-cache was busy"
-               severity failure;
-            -- Only a fetch the buffer is waiting for may complete as one.
-            assert not (response_cdc_req_sync_93 /= response_cdc_req_seen_93 and
-                        response_cdc_pending_93 = '0' and response_cdc_deliver_93 = '0' and
-                        response_cdc_data_1x(105) = '1' and fbl_state /= FBL_WAIT and
-                        fbl_pf_busy = '0')
-               report "a framebuffer line fetch completed that neither a load nor the read-ahead was waiting for"
-               severity failure;
-            -- A load that has found its line keeps it until it is answered:
-            -- nothing may replace the way it is pointing at while it waits.
-            -- This is the claim the read-ahead first broke - a landing line
-            -- overwrote the round-robin victim under a waiting load.
-            assert not (fbl_state = FBL_CHECK and fbl_hit = '1' and
-                        (fbbuf_valid(fbl_way) = '0' or
-                         fbbuf_tag(fbl_way) /= fbl_addr(31 downto 5)))
-               report "the line a waiting framebuffer load found was replaced before it was answered"
-               severity failure;
-            -- One framebuffer fetch at a time: the completion tells the two
-            -- apart by the state, so they may never overlap.
-            assert not (fbl_pf_busy = '1' and fbl_state = FBL_WAIT)
-               report "a framebuffer read-ahead and a demand fetch were outstanding together"
-               severity failure;
-            -- The read-ahead must never be fetching a line the buffer holds:
-            -- two copies of one line, and a store would update only one.
-            assert not (fbl_pf_busy = '1' and fbl_pf_held = '1')
-               report "a framebuffer read-ahead is fetching a line the buffer already holds"
-               severity failure;
-            -- Only a miss fetches, so no line can be in two ways: a store
-            -- would then update one copy and a later load could read the
-            -- other. This is what keeps the ways coherent with each other.
-            for a in 0 to FBL_WAYS - 1 loop
-               for b in a + 1 to FBL_WAYS - 1 loop
-                  assert not (fbbuf_valid(a) = '1' and fbbuf_valid(b) = '1' and
-                              fbbuf_tag(a) = fbbuf_tag(b))
-                     report "the framebuffer line buffer holds one line in two ways"
-                     severity failure;
-               end loop;
-            end loop;
-            -- CHECK answers from a way the lookup marked valid.
-            assert not (fbl_serve = '1' and fbbuf_valid(fbl_way) = '0')
-               report "line buffer answered a load from an invalid way"
-               severity failure;
-            assert not (fbl_serve = '1' and fbbuf_tag(fbl_way) /= fbl_addr(31 downto 5))
-               report "line buffer answered a load from the wrong line"
+            -- BOOT_HOLD's rule: nothing reaches the data cache while it
+            -- clears its tags, where it would be dropped.
+            assert not (datacache_clear_busy = '1' and
+                        (datacache_readena = '1' or datacache_writeena = '1' or
+                         cache_commandEnableD = '1'))
+               report "a data access reached the data cache while it was clearing its tags - it is lost"
                severity failure;
          end if;
       end if;
    end process;
-   -- synthesis translate_on
-   
+
+   -- THE CROSSING's bundled data, as checks rather than prose(see its
+   -- declarations). Under SYNC_CROSSING the margin behind each is one clock
+   -- edge, and a late write is invisible to a data check whenever the stale
+   -- value happens to equal the new one - a line of zeros after another.
+   --
+   -- A fetched line is complete when its completion enters the response
+   -- FIFO: clk93 copies line_fill_1x on the edge it takes that completion,
+   -- which can be the very next one. So no beat may land in it on any edge
+   -- AFTER the completion's, until the next line fetch starts. Detected as a
+   -- change of value, so a late write by any path is caught, not only one
+   -- through the capture below: a change seen at edge N was written at N-1,
+   -- hence the check arms one edge after the completion's.
+   process(clk1x)
+      variable line_done  : boolean := false;
+      variable line_armed : boolean := false;
+      variable line_prev  : std_logic_vector(255 downto 0) := (others => '0');
+   begin
+      if rising_edge(clk1x) then
+         if (reset_1x = '1') then
+            line_done  := false;
+            line_armed := false;
+         else
+            if (line_active_1x = '1' and resp_fifo_wr = '0') then
+               line_done  := false;
+               line_armed := false;
+            end if;
+            assert not (line_armed and line_fill_1x /= line_prev)
+               report "a fetched line changed after its completion entered the response FIFO"
+               severity failure;
+            line_armed := line_done;
+            if (resp_fifo_wr = '1' and line_active_1x = '1') then
+               line_done := true;
+            end if;
+         end if;
+         line_prev := line_fill_1x;
+      end if;
+   end process;
+
+   -- A dirty line's words sit in the staging queue until clk1x has copied
+   -- them (wb_line_release), so the cache must not stage the next victim's
+   -- first word into it before then: the queue would drop it. That includes
+   -- the release's own cycle - the queue takes a word only below four, and
+   -- the release empties it on the same edge.
+   process(clk93)
+   begin
+      if rising_edge(clk93) then
+         if (reset_93 = '0') then
+            assert not (datacache_wb_ena = '1' and datacache_wb_fifo_count = 4)
+               report "a write-back word was staged while the queue still held the previous line"
+               severity failure;
+         end if;
+      end if;
+   end process;
+-- synthesis translate_on
+
     writefifo_block <= '1' when
       (writefifo_issue_pending = '1' or
        writefifo_cnt >= 4 or
@@ -2763,8 +2547,6 @@ begin
       
          write_cdc_req_meta_1x <= write_cdc_req_93;
          write_cdc_req_sync_1x <= write_cdc_req_meta_1x;
-         response_cdc_ack_meta_1x <= response_cdc_ack_93;
-         response_cdc_ack_sync_1x <= response_cdc_ack_meta_1x;
          mem_request           <= '0';
       
          if (reset_1x = '1') then
@@ -2777,45 +2559,42 @@ begin
             write_cdc_req_sync_1x <= '0';
             write_cdc_req_seen_1x <= '0';
             write_cdc_ack_1x      <= '0';
-            response_cdc_data_1x     <= (others => '0');
-            response_cdc_req_1x      <= '0';
-             response_cdc_busy_1x     <= '0';
-             response_cdc_ack_meta_1x <= '0';
-             response_cdc_ack_sync_1x <= '0';
              memory_read_tag_1x       <= (others => '0');
              memory_read_address_1x   <= (others => '0');
-             fbline_active_1x         <= '0';
+             line_active_1x         <= '0';
 
          else
 
-            if (response_cdc_busy_1x = '1' and
-                response_cdc_ack_sync_1x = response_cdc_req_1x) then
-               response_cdc_busy_1x <= '0';
-            end if;
-
-            -- A framebuffer line fetch's beats, in address order. The bridge
-            -- raises the last one no later than mem_done, and fbline_active_1x
+            -- A read-ahead line fetch's beats, in address order. The bridge
+            -- raises the last one no later than mem_done, and line_active_1x
             -- is still set on that cycle, so all four are in before the
             -- completion is sent.
-            if (FBL_ON and fbline_active_1x = '1' and ddr3_DOUT_READY = '1') then
-               case (fbline_beat_1x) is
-                  when "00"   => fbline_fill_1x( 63 downto   0) <= ddr3_DOUT;
-                  when "01"   => fbline_fill_1x(127 downto  64) <= ddr3_DOUT;
-                  when "10"   => fbline_fill_1x(191 downto 128) <= ddr3_DOUT;
-                  when others => fbline_fill_1x(255 downto 192) <= ddr3_DOUT;
+            if (DCRA_ON and line_active_1x = '1' and ddr3_DOUT_READY = '1') then
+               case (line_beat_1x) is
+                  when "00"   => line_fill_1x( 63 downto   0) <= ddr3_DOUT;
+                  when "01"   => line_fill_1x(127 downto  64) <= ddr3_DOUT;
+                  when "10"   => line_fill_1x(191 downto 128) <= ddr3_DOUT;
+                  when others => line_fill_1x(255 downto 192) <= ddr3_DOUT;
                end case;
-               fbline_beat_1x <= fbline_beat_1x + 1;
+               line_beat_1x <= line_beat_1x + 1;
             end if;
 
             case (memstate) is
                when MEMSTATE_IDLE => 
 
-                  if (ce_1x = '1' and response_cdc_busy_1x = '0') then
+                  -- resp_fifo_full: the bridge may start again as soon as
+                  -- there is somewhere to put the answer, not once the CPU
+                  -- has taken the last one.
+                  if (ce_1x = '1' and resp_fifo_full = '0') then
                   
-                     if (write_cdc_req_sync_1x /= write_cdc_req_seen_1x) then
+                     -- resp_fifo_wempty additionally holds back a LINE fetch,
+                     -- which would overwrite line_fill_1x under a completion
+                     -- clk93 has not read yet.
+                     if (write_cdc_req_in_1x /= write_cdc_req_seen_1x and
+                         (write_cdc_data_93(117) = '0' or resp_fifo_wempty = '1')) then
 
-                        write_cdc_req_seen_1x <= write_cdc_req_sync_1x;
-                        write_cdc_ack_1x      <= write_cdc_req_sync_1x;
+                        write_cdc_req_seen_1x <= write_cdc_req_in_1x;
+                        write_cdc_ack_1x      <= write_cdc_req_in_1x;
                         memstate          <= MEMSTATE_BUSY;
                         mem_request       <= '1';
                         memoryMuxStage4   <= '1';
@@ -2830,9 +2609,11 @@ begin
                         
                         mem_size          <= "001";
                         
-                        if (write_cdc_data_93(104) = '1' and write_cdc_data_93(107) = '1') then
+                        if (write_cdc_data_93(104) = '1' and write_cdc_data_93(107) = '1' and
+                            write_cdc_data_93(117) = '0') then
                            -- The KI data cache fills a 32-byte line as four
-                           -- 64-bit DDR words (see cpu_datacache.vhd).
+                           -- 64-bit DDR words (see cpu_datacache.vhd). Not its
+                           -- read-ahead: that is a line fetch, below.
                            mem_size          <= "100";
                            datacache_active  <= '1';
                         end if;
@@ -2842,13 +2623,13 @@ begin
                            instrcache_active  <= '1';
                         end if;
 
-                        if (FBL_ON and write_cdc_data_93(117) = '1') then
-                           -- The framebuffer line buffer's fetch: four qwords,
+                        if (DCRA_ON and write_cdc_data_93(117) = '1') then
+                           -- The data cache's read-ahead: four qwords,
                            -- captured above as they arrive. Not datacache_active
                            -- - the D-cache would take the beats as a fill.
                            mem_size          <= "100";
-                           fbline_active_1x  <= '1';
-                           fbline_beat_1x    <= "00";
+                           line_active_1x  <= '1';
+                           line_beat_1x    <= "00";
                         end if;
 
                         if (write_cdc_data_93(116) = '1') then
@@ -2859,6 +2640,7 @@ begin
                            -- mailbox's own payload. mem_writeMask carries the
                            -- qwords to write, set above from the payload.
                            mem_line_write <= '1';
+                           mem_line_bytes <= wb_line_bytes_93;
                            mem_line_data  <= datacache_wb_fifo(3)(63 downto 0) &
                                              datacache_wb_fifo(2)(63 downto 0) &
                                              datacache_wb_fifo(1)(63 downto 0) &
@@ -2867,7 +2649,7 @@ begin
                            -- the words are in mem_line_data from this edge, so
                            -- the queue is free, and the cache is waiting on it
                            -- to request its fill. Releasing on the ack instead
-                           -- cost 9 cycles per dirty miss in the cache's own
+                           -- would hold every dirty miss in the cache's own
                            -- WRITEBACK states.
                            wb_line_done_1x <= not wb_line_done_1x;
                         end if;
@@ -2880,21 +2662,17 @@ begin
                   -- The FILL DATA the instruction cache is handed for that
                   -- line - the last link before the opcode reaches decode.
                   -- Captured in clk1x, the domain the bridge returns beats in
-                  -- (cpu_instrcache's fill path was rewritten to consume them
-                  -- here), so the first beat is unambiguous. Sampling a clk1x
+                  -- (cpu_instrcache's fill path consumes them here), so the
+                  -- first beat is unambiguous. Sampling a clk1x
                   -- ready pulse from clk93 would land on beat 0 or beat 1
                   -- depending on phase, and a probe that reports a different
                   -- word run to run is worse than none.
                   --
                   if (mem_done = '1') then
-                      if (mem_rnw = '1') then
-                         response_cdc_data_1x <=
-                            fbline_active_1x &
-                            memory_read_address_1x & memory_read_tag_1x &
-                            memoryMuxStage4 & mem_dataRead;
-                        response_cdc_req_1x  <= not response_cdc_req_1x;
-                        response_cdc_busy_1x <= '1';
-                     end if;
+                     -- resp_fifo_din / resp_fifo_wr are concurrent above, so
+                     -- the response enters the FIFO on THIS edge. It cannot
+                     -- be full: the bridge only started this transaction
+                     -- because there was room for its answer.
                      memstate          <= MEMSTATE_IDLE;
                      if (memoryMuxStage4 = '1') then
                         datacache_active <= '0';
@@ -2904,7 +2682,7 @@ begin
                      if (mem_line_write = '1') then
                         mem_line_write  <= '0';
                      end if;
-                     fbline_active_1x <= '0';
+                     line_active_1x <= '0';
                   end if;               
                   
             end case;
@@ -3057,6 +2835,40 @@ begin
    
    cache_commandEnableI <= executeICacheEnable when (stall = 0) else '0';
    
+   -- Driven combinationally, not registered a cycle later in the clk1x
+   -- process, so a fill's completion enters the FIFO ON the mem_done edge.
+   -- Every source here is stable at mem_done. The FIFO ignores a write while
+   -- its own reset_wr is high, so reset needs no term.
+   resp_fifo_din <= datacache_active &
+                    line_active_1x &
+                    memory_read_address_1x & memory_read_tag_1x &
+                    memoryMuxStage4 & mem_dataRead;
+   resp_fifo_wr  <= '1' when (memstate = MEMSTATE_BUSY and mem_done = '1' and
+                              mem_rnw = '1') else '0';
+
+   iresponse_fifo : entity work.cpu_cdc_fifo
+   generic map
+   (
+      WIDTH     => 107,
+      ADDR_BITS => 1,
+      SYNC      => SYNC_CROSSING
+   )
+   port map
+   (
+      clk_wr   => clk1x,
+      reset_wr => reset_1x,
+      wr       => resp_fifo_wr,
+      din      => resp_fifo_din,
+      full     => resp_fifo_full,
+      wr_empty => resp_fifo_wempty,
+
+      clk_rd   => clk93,
+      reset_rd => reset_93,
+      rd       => resp_fifo_rd,
+      dout     => resp_fifo_dout,
+      empty    => resp_fifo_empty
+   );
+
    icpu_instrcache : entity work.cpu_instrcache
    generic map
    (
@@ -3066,7 +2878,6 @@ begin
    (
       clk1x             => clk1x,
       clk93             => clk93,
-      clk2x             => clk2x,
       reset_1x          => reset_1x,
       reset_93          => reset_93,
       ce_93             => ce_93,
@@ -3138,6 +2949,17 @@ begin
    TLB_instrMapped <= TLB_instrMapped2 when (FetchAddrSelect = '1') else TLB_instrMapped1;
                       
    TLB_instrReq <= '1' when (TLB_instrMapped = '1' and (stall = 0 or TLB_ss_load = '1')) else '0';
+
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+         if (reset_93 = '1') then
+            boot_hold <= '1';
+         elsif (ce_93 = '1' and datacache_clear_busy = '0') then
+            boot_hold <= '0';
+         end if;
+      end if;
+   end process;
    
    process (clk93)
    begin
@@ -3147,11 +2969,21 @@ begin
          mem1_request    <= '0';
          TLB_ss_load     <= '0';
          
-         if (reset_93 = '1') then
+         -- BOOT_HOLD. Out of reset the data cache clears its tags for 256
+         -- cycles (CLEARCACHE), and it takes an access only in IDLE: one
+         -- presented during the clear is dropped, and stage 4 waits for its
+         -- done for ever. The KI boot ROM first reaches cached data over a
+         -- hundred uncached fetches in, long after; code entering the ROM's
+         -- reader directly reaches it much sooner. So
+         -- stage 1 stays at the reset vector until the clear ends and sends
+         -- the first fetch, as one request, on that cycle. The instruction
+         -- cache needs none of this: it latches a fill asked for while it
+         -- clears.
+         if (reset_93 = '1' or boot_hold = '1') then
 
             PCold0         <= (others => '0');
-            mem1_request   <= not TLB_instrMapped;
-            TLB_ss_load    <= TLB_instrMapped;
+            mem1_request   <= (not TLB_instrMapped) and not (reset_93 or datacache_clear_busy);
+            TLB_ss_load    <= TLB_instrMapped and not (reset_93 or datacache_clear_busy);
             if (ss_in(16)(3) = '1') then
                mem1_address   <= unsigned(ss_in(5)(31 downto 0)); -- last was branch -> should be patched in the savestate already
                fill_addrTag   <= unsigned(ss_in(5)(31 downto 0));
@@ -3316,7 +3148,8 @@ begin
 
             if (stall = 0) then
 
-               decodeNew <= '0';
+               decodeNew      <= '0';
+               decodeMergeFwd <= '0';
 
                if (exception = '1') then
 
@@ -3326,6 +3159,7 @@ begin
 
                   decodeNew        <= '1';
                   decodeNewPulse   <= '1';
+                  decodeMergeFwd   <= merge_bypass;
 
                   pcOld1           <= pcOld0;
                   opcode1          <= opcodeCacheMuxed;
@@ -4286,9 +4120,7 @@ begin
 
    -- WHICH ARM OF THE MUX ABOVE PRODUCED THIS FETCH ADDRESS.
    --
-   -- This is the field the whole FMV investigation has been missing. Both games
-   -- leave a non-control-transfer instruction in RAM and land on 0xBFC00004,
-   -- and only three of these arms can produce that address at all:
+   -- Only three of these arms can produce 0xBFC00004 at all:
    --
    --   5 REG    a jr/jalr whose register held BFC00004
    --   7 ERET   an eret with EPC = BFC00004
@@ -4333,9 +4165,8 @@ begin
    --
    -- That is the KI FMV restart. The decompressor uses the "jump either way"
    -- idiom - KI1 880322D4/880322D8, KI2 8802F074/8802F078, a bnez with a beqz
-   -- to the same target in its delay slot - and both games recorded
-   -- EPC = target - 4 on hardware. cpu_cop0.vhd carries the donor author's own
-   -- note that this case was never tested.
+   -- to the same target in its delay slot. cpu_cop0.vhd carries the donor
+   -- author's own note that this case was never tested.
    --
    -- A branch in a delay slot is architecturally undefined on MIPS, so there is
    -- no "correct" answer to copy; what matters is that the exception state
@@ -4345,15 +4176,12 @@ begin
    -- executeBranchdelaySlot is already set - is WRONG. That signal is
    -- registered under `if (stall = 0)` and therefore HOLDS across a stall, so
    -- the suppression also swallows the flag for an unrelated branch decoded
-   -- after a stall. Tried in simulation: legitimate delay slots stopped being
-   -- marked, EPC stopped being backed up, and the test program escaped its own
-   -- loop - 64 bad EPCs instead of 2.
+   -- after a stall: legitimate delay slots stop being marked, and EPC stops
+   -- being backed up.
    --
    -- What this needs is a DECODE-ALIGNED "the instruction now in decode is
    -- itself a delay slot" signal, advanced only when the decode advances,
    -- rather than reusing the execute-stage flag.
-   --
-   -- sim/tb_ki_cpu_delayslot_irq.sv reproduces the defect and stays red.
    EXEBranchdelaySlot <= '0' when (executeIgnoreNext = '1') else
                          '1' when (decodeBranchType = BRANCH_ALWAYS_REG) else
                          '1' when (decodeBranchType = BRANCH_JUMPIMM) else
@@ -4709,6 +4537,7 @@ begin
                if (stall = "00100") then
                   executeStallFromMEM <= '0';
                   executeNew          <= '0';
+                  perf_ex_ld          <= '1';  -- perf-only
                end if;
 
                if (writebackStallFromMEM = '1') then
@@ -4717,10 +4546,18 @@ begin
                   end if;
                end if;
                
+               -- The answer must be THIS load's: presented now, so stage 4 is
+               -- not stalled. With LOAD_INTERLOCK an older load that did not
+               -- bubble can still be missing in writeback behind it, and its
+               -- answer would release this one's bubble: the dependent
+               -- instruction would run on the old register, and
+               -- executeStallFromMEM - cleared only in the bubble cycle this
+               -- skipped - would stay set. See the assertion beside
+               -- stall4Masked.
                if (executeStallFromMEM = '1') then               
                   if (executeMemReadEnable = '1' and executeCOP1ReadEnable = '0') then
-                     if (executeMemUseCacheEffective = '1') then
-                        if (datacache_readdone = '1') then
+                     if (executeMemUseCache = '1') then
+                        if (datacache_readdone = '1' and (not LOAD_INTERLOCK or stall4 = '0')) then
                            stall3 <= '0';
                         end if;
                      end if;
@@ -4797,6 +4634,7 @@ begin
             if (stall = 0) then
             
                executeNew              <= '0';
+               perf_ex_ld              <= '0';  -- perf-only
                executeICacheEnable     <= '0';
                executeDCacheEnable     <= '0';
                executeSetLL            <= '0';
@@ -4808,6 +4646,7 @@ begin
                executeMemWriteData     <= EXEMemWriteData;             
                executeMemWriteMask     <= EXEMemWriteMask;
                executeMemReadLastData  <= value2;           
+               executeMergeFwd         <= '0';
 
                executeLLfromTLB        <= EXETLBDataAccess;
                if (EXETLBDataAccess = '1') then
@@ -4849,13 +4688,16 @@ begin
                      executeMemWriteEnable  <= '0';
                   
                   else
-               
+
                      executeNew                    <= '1';
-               
+                     executeMergeFwd               <= decodeMergeFwd;
+
 -- synthesis translate_off
-                     pcOld2                        <= pcOld1;  
+                     executeMergeBehind            <= executeNew and executeMemReadEnable;
+                     pcOld2                        <= pcOld1;
                      opcode2                       <= opcode1;
 -- synthesis translate_on
+                     prof_pc2                      <= std_logic_vector(pcOld1(31 downto 0));
                             
                      -- from calculation
                      if (decodeTarget = 0 or exceptionNew3 = '1') then
@@ -5025,7 +4867,7 @@ begin
                      if (decodehiUpdate = '1') then hi <= value1; end if;
                      if (decodeloUpdate = '1') then lo <= value1; end if;
                      
-                     if ((EXEExceptionMem = '0' and decodeMemReadEnable = '1') or decodeCOP0ReadEnable = '1' or decodeCOP2ReadEnable = '1') then
+                     if ((EXEExceptionMem = '0' and decodeMemReadEnable = '1' and load_use = '1') or decodeCOP0ReadEnable = '1' or decodeCOP2ReadEnable = '1') then
                         stall3              <= '1';
                         executeStallFromMEM <= '1';
                      end if;
@@ -5041,7 +4883,7 @@ begin
                         end if;
                      end if;
                         
-                     -- The TLB stall term used to sit here, as the last
+                     -- The TLB stall term belongs here, as the last
                      -- assignment inside this nest. It is hoisted to the end of
                      -- the process instead; see below.
 
@@ -5054,20 +4896,19 @@ begin
 
             -- Hoisted TLB stall.
             --
-            -- stall3 was the largest critical endpoint in the CPU domain when
-            -- this was written: 152 of the 300 worst setup paths ended here, and
-            -- the last thing to arrive is TLB_dataStall, which sits behind the
+            -- stall3 is a critical endpoint in the CPU domain, and the last
+            -- thing to arrive is TLB_dataStall, which sits behind the
             -- address adder and the mini-TLB CAM. Written inside the nest above,
-            -- this term reached stall3's D input through two levels of logic,
+            -- this term would reach stall3's D input through two logic levels,
             -- because synthesis has to interleave it with the enclosing
             -- set/clear priority cone. Hoisted to the end of the process it is
             -- one OR against everything else, and everything else settles well
-            -- before it does. It does remove stall3 from the critical set - but
-            -- see the note below on what that was worth.
+            -- before it does.
             --
-            -- No gate is needed, and that is not an approximation. This term
-            -- fired inside "stall = 0", "decodeNew = '1' and (exception = '0' or
-            -- exceptionAllowDelay = '1')" and "executeIgnoreNext = '0'", but
+            -- No gate is needed, and that is not an approximation. Inside the
+            -- nest this term fires only within "stall = 0", "decodeNew = '1'
+            -- and (exception = '0' or exceptionAllowDelay = '1')" and
+            -- "executeIgnoreNext = '0'", but
             -- TLB_dataStall is TLB_dataReq and not mini_hit, and TLB_dataReq is
             -- EXETLBDataAccess, which is already '0' unless exception = '0',
             -- stall = 0, executeIgnoreNext = '0' and decodeNew = '1'. Every
@@ -5079,13 +4920,6 @@ begin
             -- block's clear, which requires stall3 = '1', and the TLB unstall's
             -- set, which requires TLB_dataUnStall. Both imply stall /= 0, which
             -- TLB_dataStall excludes, so neither can coincide with this one.
-            --
-            -- This did NOT raise Fmax. stall3 owned the most critical endpoints
-            -- but was not the binding path: instrcache_fill sat a fraction of a
-            -- ns behind and took over the moment stall3 was relieved. Kept
-            -- because it is free (+39 ALMs, no fanout change) and the cone binds
-            -- again once the I-cache tag path is fixed. Judge any successor with
-            -- a DSE sweep, not a single fit - one seed cannot resolve this.
             if (TLB_dataStall = '1') then
                stall3              <= '1';
                executeStallFromMEM <= '0';
@@ -5107,13 +4941,17 @@ begin
    generic map
    (
       LITTLE_ENDIAN => LITTLE_ENDIAN,
-      SKIP_FILL     => DCACHE_SKIP_FILL
+      SKIP_FILL     => DCACHE_SKIP_FILL,
+      FB_PARTIAL    => DCACHE_FB_PARTIAL,
+      WB_EARLY      => DCACHE_WB_EARLY,
+      LOAD_INTERLOCK => LOAD_INTERLOCK,
+      STORE_BUFFER  => DCACHE_STORE_BUFFER,
+      READ_AHEAD    => DCACHE_READ_AHEAD
    )
    port map
    (
       clk1x             => clk1x,
       clk93             => clk93,
-      clk2x             => clk2x,
       reset_1x          => reset_1x,
       reset_93          => reset_93,
       ce_93             => ce_93,
@@ -5129,7 +4967,7 @@ begin
       ram_reqAddr       => datacache_reqAddr,
       ram_active        => datacache_active,
       ram_grant         => rdram_granted2X,
-      ram_done          => mem_finished_read,
+      ram_done          => datacache_fill_done,
       ddr3_DOUT         => ddr3_DOUT,      
       ddr3_DOUT_READY   => ddr3_DOUT_READY,
       
@@ -5137,12 +4975,15 @@ begin
       writeback_addr    => datacache_wb_addr, 
       writeback_data    => datacache_wb_data,
       writeback_mask    => datacache_wb_mask,
+      writeback_bytes   => datacache_wb_bytes,
 
       tag_addr          => EXECacheAddr,
+      next_load         => datacache_next_load,
       
       read_ena          => datacache_readena,
       RW_addr           => datacache_addr,
       RW_64             => executeMem64Bit,
+      RW_fb             => executeMemFB,
       read_busy         => datacache_readbusy,
       read_done         => datacache_readdone,
       read_data         => datacache_data_out,
@@ -5164,32 +5005,98 @@ begin
       writeTagEna       => writeDatacacheTagEna,      
       writeTagValue     => writeDatacacheTagValue,
 
+      clear_busy        => datacache_clear_busy,
       debug_state       => datacache_debug_state,
       perf_miss         => datacache_perf_miss,
+      perf_miss_low     => datacache_perf_miss_low,
       perf_fill_wait    => datacache_perf_fill_wait,
-      perf_fill_data    => datacache_perf_fill_data,
-      perf_fill_hold    => datacache_perf_fill_hold,
-      perf_req_denied   => datacache_perf_req_denied,
-      perf_writeback    => datacache_perf_writeback,
+      perf_fill_data    => open,
+      perf_fill_hold    => open,
+      perf_writeback    => open,
       perf_stride_hit   => datacache_perf_stride_hit,
-      perf_way_slow     => datacache_perf_way_slow,
+      perf_way_slow     => open,
       perf_wb_line      => datacache_perf_wb_line,
       perf_fill_store   => datacache_perf_fill_store,
       perf_fill_skip    => datacache_perf_fill_skip,
       perf_fill_absent  => datacache_perf_fill_absent,
-      perf_delta_hit    => datacache_perf_delta_hit,
+      perf_delta_hit    => open,
+      ra_request        => datacache_ra_request,
+      ra_reqAddr        => datacache_ra_addr,
+      ra_done           => datacache_ra_done,
+      ra_data           => datacache_ra_data,
+      ra_store          => datacache_ra_store,
+      ra_store_addr     => unsigned(writefifo_Din(95 downto 64)),
+      perf_ra_issue     => open,
+      perf_ra_used      => open,
       SS_reset          => SS_reset
    );
 
    stall4Masked <= stall(4 downto 3) & (stall(2) and (not executeStallFromMEM)) & stall(1 downto 0);
+
+   -- The instruction in stage 3 is a load, so the data cache's RAM read this
+   -- cycle is its own; the store buffer drains only in a cycle when it is not.
+   datacache_next_load <= decodeNew and decodeMemReadEnable;
+
+-- synthesis translate_off
+   -- executeStallFromMEM is a bubble's mark: set with stall3, cleared in the
+   -- bubble cycle itself. Set with stage 3 running, a bubble was released
+   -- before it happened - the instruction behind a load ran without its value.
+   process (clk93)
+   begin
+      if (rising_edge(clk93)) then
+         if (reset_93 = '0' and ce_93 = '1' and executeStallFromMEM = '1' and stall3 = '0') then
+            report "cpu: a load's bubble was released before its own answer (executeStallFromMEM set, stall3 clear)"
+               severity failure;
+         end if;
+      end if;
+   end process;
+-- synthesis translate_on
+
+   -- LOAD_INTERLOCK: whether a load in stage 3 must stall the instruction
+   -- behind it for a cycle - the load-delay bubble. That instruction is in
+   -- stage 2 now (decSource1/2, the compares executeForwardValue1/2 register)
+   -- and decodeTarget is the load's rt. An FPU load keeps its bubble, as
+   -- does any load if stage 2 holds nothing and its bits happen to match:
+   -- that costs only the cycle every load pays without LOAD_INTERLOCK.
+   -- Without the bubble the data cache sees ce_fetch high in the load's IDLE
+   -- cycle; see its "LOADS WITHOUT THE BUBBLE".
+   load_use <= '1' when (not LOAD_INTERLOCK or decodeCOP1ReadEnable = '1' or
+                         (decSource1 > 0 and decSource1 = decodeTarget) or
+                         (decSource2 > 0 and decSource2 = decodeTarget and
+                          merge_bypass = '0')) else '0';
+
+   -- LOAD_MERGE_BYPASS. The R4600 manual, describing each of LWL, LWR, LDL and
+   -- LDR: "The contents of general register rt are internally bypassed within
+   -- the processor so that no NOP is needed between an immediately preceding
+   -- load instruction which specifies register rt and a following LDL (or
+   -- LDR) instruction which also specifies register rt." The merge needs the
+   -- old rt only in the data stage, when the load ahead has just produced it,
+   -- so the pair issues back to back - the unaligned ldl/ldr doubleword that
+   -- makes up most of KI2's renderer's load bubbles.
+   --
+   -- Here the follower skips the bubble and so reads rt in stage 3 before the
+   -- load's value exists. It does not use that: in stage 4 the load is one
+   -- stage ahead, its merged result in writebackData, and nothing else can
+   -- have passed between them - so the follower merges into writebackData
+   -- instead (read4_oldData), and keeps it for a merge after a miss
+   -- (writebackReadLastData). A base register equal to the loaded one is a
+   -- real dependency, and keeps the bubble; so does an FPU load ahead.
+   merge_bypass <= '1' when (LOAD_INTERLOCK and LOAD_MERGE_BYPASS and
+                             decodeNew = '1' and decodeMemReadEnable = '1' and
+                             decodeCOP1ReadEnable = '0' and EXEExceptionMem = '0' and
+                             decodeTarget /= 0 and
+                             (opcodeCacheMuxed(31 downto 26) = "100010" or   -- LWL
+                              opcodeCacheMuxed(31 downto 26) = "100110" or   -- LWR
+                              opcodeCacheMuxed(31 downto 26) = "011010" or   -- LDL
+                              opcodeCacheMuxed(31 downto 26) = "011011") and -- LDR
+                             decSource2 = decodeTarget and
+                             decSource1 /= decodeTarget) else '0';
    
    process (all)
       variable skipmem : std_logic;
    begin
    
       stallNew4            <= stall4;
-      fbl_start            <= '0';
-      perf_fb_load         <= '0';
       perf_uc_narrow       <= '0';
 
       mem4_request         <= '0';
@@ -5221,7 +5128,7 @@ begin
          if (executeMemWriteEnable = '1') then
             skipmem := '0';
          
-            if (executeMemUseCacheEffective = '1') then
+            if (executeMemUseCache = '1') then
                datacache_writeena <= '1';
                skipmem            := '1';
                if (DATACACHEWRITETHROUGH = '1') then
@@ -5264,7 +5171,7 @@ begin
          if (executeMemReadEnable = '1') then
             skipmem := '0';
             
-            if (executeMemUseCacheEffective = '1') then
+            if (executeMemUseCache = '1') then
                datacache_readena  <= '1';
                skipmem            := '1';
                if (datacache_readdone = '0') then
@@ -5273,14 +5180,7 @@ begin
             end if;
 
             if (skipmem = '0') then
-               perf_fb_load <= executeMemFB;
-               -- An uncached framebuffer load goes to the line buffer instead
-               -- of the bus. It holds stage 4 all the same.
-               if (FBL_ON and executeMemFB = '1') then
-                  fbl_start    <= '1';
-               else
-                  mem4_request <= '1';
-               end if;
+               mem4_request   <= '1';
                stallNew4      <= '1';
             end if;
 
@@ -5298,11 +5198,11 @@ begin
       if (read_fifoStall = '1' and writefifo_mem4_ready = '1') then
          mem4_request <= '1';
          mem4_rnw     <= '1';
-         -- Same latching as the store replay below, for the same reason. This
-         -- path is NOT demonstrated broken by a bench, but it is the identical
-         -- construct - re-offering from executeMemAddress after stage 3 has
-         -- moved on - so it would read from whatever address happened to be in
-         -- the register rather than the one that was blocked.
+         -- Same latching as the store replay below, for the same reason: it
+         -- is the identical construct - re-offering from executeMemAddress
+         -- after stage 3 has moved on - so it would read from whatever address
+         -- happened to be in the register rather than the one that was
+         -- blocked.
          mem4_address <= read_fifoStall_address;
          mem4_req64   <= read_fifoStall_req64;
       end if;
@@ -5312,12 +5212,10 @@ begin
       if (writeback_fifoStall = '1' and writefifo_mem4_ready = '1') then
          mem4_request   <= '1';
          mem4_rnw       <= '0';
-         -- From the LATCHED copy. Replaying from executeMem* re-offered the
-         -- store with whatever stage 3 had advanced to, which in the game's
-         -- ATA loop was the next iteration's LOAD: the bench measured 0 of 176
-         -- replays carrying the data-port address, all of them carrying
-         -- 0800000c/08000010/08000014 with halfword masks instead. The ATA
-         -- write was lost and a stray halfword was written into main RAM.
+         -- From the LATCHED copy. Replaying from executeMem* would re-offer
+         -- the store with whatever stage 3 had advanced to, which in the
+         -- game's ATA loop is the next iteration's LOAD: the ATA write would
+         -- be lost and a stray halfword written into main RAM.
          mem4_address   <= fifoStall_address;
          mem4_dataWrite <= fifoStall_dataWrite;
          mem4_writeMask <= fifoStall_writeMask;
@@ -5340,29 +5238,27 @@ begin
    -- The response mailbox registers the raw bus word before completion is
    -- asserted. Rotate that stable CPU-domain copy; a second mailbox stage
    -- registers the rotated value before the completion pulse reaches users.
-   -- The line buffer's answer takes the response's place for the one cycle it
-   -- is written; fbl_serve requires the response chain idle, so the two never
-   -- want this at once.
-   read4_uncachedSrc <= fbl_word when (fbl_serve = '1') else mem_finished_dataRead;
 
    read4_uncachedData <=
-      unsigned(read4_uncachedSrc(63 downto 32)) &
-      (x"000000" & unsigned(read4_uncachedSrc(31 downto 24)))
+      unsigned(mem_finished_dataRead(63 downto 32)) &
+      (x"000000" & unsigned(mem_finished_dataRead(31 downto 24)))
                                      when (read4_uncachedRot = "11") else
-      unsigned(read4_uncachedSrc(63 downto 32)) &
-      (x"0000" & unsigned(read4_uncachedSrc(31 downto 16)))
+      unsigned(mem_finished_dataRead(63 downto 32)) &
+      (x"0000" & unsigned(mem_finished_dataRead(31 downto 16)))
                                      when (read4_uncachedRot = "10") else
-      unsigned(read4_uncachedSrc(63 downto 32)) &
-      (x"00" & unsigned(read4_uncachedSrc(31 downto 8)))
+      unsigned(mem_finished_dataRead(63 downto 32)) &
+      (x"00" & unsigned(mem_finished_dataRead(31 downto 8)))
                                      when (read4_uncachedRot = "01") else
-      unsigned(read4_uncachedSrc);
+      unsigned(mem_finished_dataRead);
 
    read4_dataReadData   <= unsigned(datacache_data_out) when (writeback_UseCache = '1' or datacache_readena = '1') else unsigned(mem_finished_dataRot);
    read4_dataReadRot64  <= bus_to_cpu64(std_logic_vector(read4_dataReadData));
    read4_dataReadRot32  <= bus_to_cpu32(std_logic_vector(read4_dataReadData(31 downto 0)));
    
    read4_Addr         <= writebackReadAddress         when (stall4 = '1') else executeMemAddress;
-   read4_oldData      <= writebackReadLastData        when (stall4 = '1') else executeMemReadLastData;
+   read4_oldData      <= writebackReadLastData        when (stall4 = '1') else
+                         writebackData                when (executeMergeFwd = '1') else
+                         executeMemReadLastData;
    read4_cop1_readEna <= writeback_COP1_ReadEnable    when (stall4 = '1') else executeCOP1ReadEnable;
    read4_cop1_target  <= cop1_stage4_target           when (stall4 = '1') else executeCOP1Target;
    read4_useLoadType  <= writebackLoadType            when (stall4 = '1') else executeLoadType;       
@@ -5397,6 +5293,7 @@ begin
             if (stall4Masked = 0) then
             
                writebackNew   <= '0';
+               perf_wb_ld     <= perf_ex_ld;  -- perf-only: the slot's tag moves with it
                
                writebackForwardValue1 <= '0';
                writebackForwardValue2 <= '0';
@@ -5411,10 +5308,17 @@ begin
                   hi_1                         <= hi;
                   lo_1                         <= lo;
 -- synthesis translate_on
+                  prof_pc3                     <= prof_pc2;
                
                   writebackTarget              <= resultTarget;
                   writebackData                <= resultData;
-                  writebackReadLastData        <= executeMemReadLastData;
+                  -- A merge behind a load keeps the load's result for a merge
+                  -- after a miss: writebackData is still that load's here.
+                  if (executeMergeFwd = '1') then
+                     writebackReadLastData     <= writebackData;
+                  else
+                     writebackReadLastData     <= executeMemReadLastData;
+                  end if;
 
                   writebackWriteEnable         <= resultWriteEnable;
                   writeback_UseCache           <= datacache_readena or datacache_writeena or executeDCacheEnable;
@@ -5434,13 +5338,24 @@ begin
                      if (decSource2 > 0 and resultTarget = decSource2) then writebackForwardValue2 <= '1'; end if;
                   end if;
                   
-                  if (executeMemReadEnable = '1' and executeCOP1ReadEnable = '0') then
+                  -- A load that took its bubble: the instruction behind it
+                  -- waited in stage 3 and reads it now.
+                  if (executeMemReadEnable = '1' and executeCOP1ReadEnable = '0' and
+                      (not LOAD_INTERLOCK or executeStallFromMEM = '1')) then
                      if (decodeSource1 > 0 and resultTarget = decodeSource1) then writebackForwardValue1 <= '1'; end if;
                      if (decodeSource2 > 0 and resultTarget = decodeSource2) then writebackForwardValue2 <= '1'; end if;
                   end if;
+                  -- One that did not: the instruction behind it did not read
+                  -- it and goes on to stage 4 with it; the one after comes up
+                  -- from stage 2 now, as behind any other result.
+                  if (LOAD_INTERLOCK and executeMemReadEnable = '1' and
+                      executeCOP1ReadEnable = '0' and executeStallFromMEM = '0') then
+                     if (decSource1 > 0 and resultTarget = decSource1) then writebackForwardValue1 <= '1'; end if;
+                     if (decSource2 > 0 and resultTarget = decSource2) then writebackForwardValue2 <= '1'; end if;
+                  end if;
                   
                   if (executeMemReadEnable = '1' and
-                      executeMemUseCacheEffective = '0' and
+                      executeMemUseCache = '0' and
                       mem4_request = '1' and
                       writefifo_mem4_ready = '0') then
                      read_fifoStall         <= '1';
@@ -5459,7 +5374,7 @@ begin
                         fifoStall_dataWrite <= mem4_dataWrite;
                         fifoStall_writeMask <= mem4_writeMask;
                         fifoStall_req64     <= mem4_req64;
-                        fifoStall_useCache  <= executeMemUseCacheEffective;
+                        fifoStall_useCache  <= executeMemUseCache;
                      else
                         writebackNew        <= '1';
                      end if;
@@ -5522,7 +5437,7 @@ begin
                  (writeback_UseCache = '0' and mem_finished_read = '1') or
                  (writebackMemWrite = '1' and writeback_UseCache = '1' and
                   DATACACHEWRITETHROUGH = '1' and
-                  datacache_debug_state = "0000"))) then
+                  datacache_debug_state = "00000"))) then
             end if;
 
             if (datacache_CmdDone = '1') then
@@ -5561,7 +5476,7 @@ begin
             -- already-missed pulse.
             if (stall4 = '1' and writebackMemWrite = '1' and
                 writeback_UseCache = '1' and DATACACHEWRITETHROUGH = '1' and
-                writeback_fifoStall = '0' and datacache_debug_state = "0000") then
+                writeback_fifoStall = '0' and datacache_debug_state = "00000") then
                stall4       <= '0';
                writebackNew <= '1';
             end if;

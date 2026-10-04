@@ -13,10 +13,9 @@ entity cpu_cop0 is
       -- Narrow the exception-address capture to 32 bits.
       --
       -- BadVAddr, EntryHi and XContext are 64 bits wide and are all written
-      -- from one 64-bit excAddr. At 80 MHz that capture IS the CPU critical
-      -- path - every one of the 25 worst paths ends in this file, with
-      -- COP0_8_BADVIRTUALADDRESS[42] and COP0_20_XCONTEXT_BadVPN among the
-      -- endpoints.
+      -- from one 64-bit excAddr. That capture is on the CPU critical path,
+      -- with COP0_8_BADVIRTUALADDRESS[42] and COP0_20_XCONTEXT_BadVPN among
+      -- the endpoints.
       --
       -- KI uses the 32-bit addressing mode. With the extended-address bits
       -- clear software reads these registers with mfc0, which returns bits
@@ -27,9 +26,6 @@ entity cpu_cop0 is
       -- which is unreachable without 64-bit addressing, and its Region and
       -- BadVPN fields are written from nothing but excAddr - so with this set
       -- they are constant zero and synthesis removes them outright.
-      --
-      -- tb_ki_cpu_badvaddr.sv is the guard: it raises a real AdEL and checks
-      -- BadVAddr through mfc0, the same way a game would.
       ADDR32_ONLY           : boolean := false
    );
    port 
@@ -59,8 +55,8 @@ entity cpu_cop0 is
 -- synthesis translate_on
 
       -- Cause and EPC, OUTSIDE translate_off. cop0_export carries both but is
-      -- simulation-only, and the exception that restarts the game during video
-      -- playback only happens on hardware - so it has to survive synthesis.
+      -- simulation-only; these feed the debug screen, so they have to survive
+      -- synthesis.
       debug_cause             : out unsigned(31 downto 0) := (others => '0');
       debug_epc               : out unsigned(31 downto 0) := (others => '0');
       debug_badvaddr          : out unsigned(31 downto 0) := (others => '0');
@@ -79,9 +75,9 @@ entity cpu_cop0 is
       -- the fault in the capture.
       debug_tlb_exc_stb       : out std_logic := '0';
       debug_eret_epc          : out unsigned(31 downto 0) := (others => '0');
-      -- The value eret actually jumped to, selected the same way line 536-540
-      -- selects eretPC. Captured rather than inferred so ERL does not have to
-      -- be trusted to reconstruct it.
+      -- The value eret actually jumped to, selected the same way eretPC is:
+      -- ErrorEPC when Status.ERL is set, EPC otherwise. Captured rather than
+      -- inferred so ERL does not have to be trusted to reconstruct it.
       debug_eret_target       : out unsigned(31 downto 0) := (others => '0');
       --   31:16  eret count, saturating
       --   3      ERL at the eret - if set, the target came from ErrorEPC
@@ -168,7 +164,7 @@ end entity;
 
 architecture arch of cpu_cop0 is
 
-   -- IDT79R4600 processor ID, matching MAME's R4600 implementation.
+   -- IDT79R4600 processor ID.
    constant COP0_PRID_R4600                 : unsigned(15 downto 0) := x"2020";
 
    signal COP0_0_INDEX_tlbEntry           : unsigned(5 downto 0) := (others => '0');
@@ -421,10 +417,9 @@ begin
    COP2_enable   <= COP0_12_SR_enable_cop2;
    fpuRegMode    <= COP0_12_SR_floatingPointMode;
    -- MIPS III: EXL or ERL forces kernel mode regardless of KSU, and while ERL is
-   -- set kuseg is unmapped (and uncached). The donor never needed either term -
-   -- the N64 does not run with ERL set over kuseg, and KI1 never leaves
-   -- KSEG0/KSEG1 - but KI2's boot ROM stores to kuseg with ERL = 1, and without
-   -- this it takes a TLBS refill exception on every one of them.
+   -- set kuseg is unmapped (and uncached). KI1 never leaves KSEG0/KSEG1, but
+   -- KI2's boot ROM stores to kuseg with ERL = 1, and without this it takes a
+   -- TLBS refill exception on every one of them.
    privilegeMode <= "00" when (COP0_12_SR_exceptionLevel = '1' or COP0_12_SR_errorLevel = '1') else COP0_12_SR_privilegeMode;
    kusegUnmapped <= COP0_12_SR_errorLevel;
    bit64region   <= bit64mode;
@@ -1453,8 +1448,7 @@ begin
    debug_cause(29 downto 28) <= COP0_13_CAUSE_coprocessorError;
    debug_cause(31)           <= COP0_13_CAUSE_branchDelay;
    -- The three Status bits that decide whether an interrupt can be TAKEN, in
-   -- the spare bits of the same word. IP alone cannot answer that, and the FMV
-   -- question is now specifically whether the pipeline redirected itself:
+   -- the spare bits of the same word. IP alone cannot answer that:
    --
    --   bit 0     IE    global interrupt enable
    --   bit 1     BEV   1 selects the BFC0xxxx exception vectors

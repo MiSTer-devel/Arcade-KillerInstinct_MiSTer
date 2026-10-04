@@ -15,7 +15,6 @@ entity cpu_instrcache is
    (
       clk1x             : in  std_logic;
       clk93             : in  std_logic;
-      clk2x             : in  std_logic;
       -- One reset per domain. The fill path below runs on clk1x, so it must be
       -- released by a clk1x-synchronised reset: reset_93 crosses domains
       -- unsynchronised, and once clk93 and clk1x are declared asynchronous
@@ -149,7 +148,7 @@ begin
    
    -- The KI bridge returns cache-fill beats in the 50 MHz clk1x domain.
    -- Consume each ready pulse once in that same domain before crossing the
-   -- completed line into the 75 MHz CPU/tag domain.
+   -- completed line into the CPU/tag domain (clk93, 100 MHz on hardware).
    process (clk1x)
    begin
       if rising_edge(clk1x) then

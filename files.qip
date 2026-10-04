@@ -8,9 +8,9 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_board_io.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_ata.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_framebuffer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_sdram_burst.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_sdram_x2.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_sdram_adapter.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_sdram_bist.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_boot_verify.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_fb_ram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_memory_bridge.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_video_timing.sv

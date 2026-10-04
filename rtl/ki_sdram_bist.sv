@@ -21,8 +21,8 @@
 // has an idle DQ bus either side of it; a burst captures one word per clock
 // out of a bus the device drives continuously, with no turnaround between
 // words. A phase that is marginal will fail the burst read first, and without
-// the burst pass that shows up as a PASS here and a corrupt screen - which is
-// the ambiguous failure this core has repeatedly got stuck in.
+// the burst pass that shows up as a PASS here and a corrupt screen, which is
+// an ambiguous failure.
 //
 // `error_count` therefore reports the two separately:
 //
@@ -31,41 +31,33 @@
 // so EC:0000 is clean, EC:00xx is single-word only, EC:xx00 is burst only, and
 // EC:FFFF remains the watchdog timeout (each byte saturates at 0xFE so a data
 // mismatch can never produce it).
-// TWO REGIONS, and the second one is the point.
+// TWO REGIONS, and the first one is the point.
 //
-// KI's own CPU Board Test reports an SRAM error on hardware. On the real board
-// the 512 KiB at physical 0x00000000 is the SRAM and the 8 MB at 0x08000000 is
+// KI's own CPU Board Test can report an SRAM error. On the real board the
+// 512 KiB at physical 0x00000000 is the SRAM and the 8 MB at 0x08000000 is
 // the DRAM, so that names LOW RAM - which the bridge maps to STORE_LOW, i.e.
-// SDRAM byte 0. This self test has never touched it: BASE_WORD sits at word
-// 0x500000 (byte 0xA00000), deliberately clear of everything the core uses. So
-// `SDRAM:PASS EC:0000` has never said anything about the memory the game's own
-// diagnostic is failing on.
+// SDRAM byte 0. BASE_WORD alone does not touch it: it sits at word 0x800000
+// (byte 0x1000000), deliberately clear of everything the core uses. So a
+// `SDRAM:PASS EC:0000` from that region alone says nothing about the memory
+// the game's own diagnostic checks.
 //
 // The low sweep covers WORDS words from byte 0, which is the bottom 8 KiB of
 // the 512 KiB region. That is a first answer to "does low RAM work at all",
 // not full coverage of it - a fault that only appears at particular high
-// address bits would not be caught, and widening the sweep is the next step if
-// this one comes back clean.
+// address bits would not be caught.
 //
-// It stays below byte 0x30000 on purpose: the framebuffer pages live at
-// 0x30000 and 0x58000, so the test cannot leave its pattern anywhere the
-// screen will show it before the boot ROM clears the buffer.
+// The framebuffer pages inside low RAM (0x30000 and 0x58000) are not swept:
+// ki_memory_bridge serves that window from on-chip memory, so the SDRAM
+// beneath it is never read.
 //
 // A failure identifies its own region without a new report field, because
 // `first_bad_address` carries the full 25-bit word address: below 0x40000 is
-// low RAM, around 0x500000 is the original region.
+// low RAM, from 0x800000 is the free region.
 module ki_sdram_bist #(
   parameter logic [24:0] BASE_WORD = 25'h0800000,
   // Low RAM as the bridge stores it: STORE_LOW is 0, so the CPU physical
   // address and the storage address are the same here.
   parameter logic [24:0] LOW_BASE_WORD = 25'h0000000,
-  // Framebuffer page 0, byte 0x30000 = word 0x18000. This is inside low RAM
-  // too, but it is the part the scanout reader is walking CONTINUOUSLY while
-  // this test runs, and byte 0 is not. Sweeping both makes the result
-  // discriminating rather than merely present: low clean + framebuffer dirty
-  // isolates the fault to contention with scanout, which is the one thing the
-  // video-only reset and the SRAM error have in common.
-  parameter logic [24:0] FB_BASE_WORD = 25'h0018000,
   parameter integer WORDS = 4096,
   // Must divide WORDS, and must not exceed the controller's 16-word maximum.
   // BASE_WORD is 512-word aligned and the burst base is a multiple of this, so
@@ -89,15 +81,17 @@ module ki_sdram_bist #(
   output logic  [4:0] request_burst,
   output logic        request_read,
   output logic        request_write,
-  input  wire  [15:0] request_read_data,
+  // TWO 16-bit words per beat, low word first - see ki_sdram_x2. The
+  // self test is the only requester that issues an ODD burst (the single-word
+  // probe), so it is also the only one that ever sees be = 2'b01.
+  input  wire  [31:0] request_read_data,
+  input  wire   [1:0] request_read_be,
   input  wire         request_data_valid,
   input  wire         request_done,
 
   // Running 32-bit sum of every 16-bit word of the boot ROM as it is stored
   // in SDRAM. Compare against the value computed from ki-l15d.u98 offline:
-  // 0x47571D1B. A mismatch means the CPU is being fed wrong bytes, which is
-  // the one explanation that fits "executes continuously, no CPU errors, never
-  // completes" - a decompressor scanning for a terminator it never finds.
+  // 0x47571D1B. A mismatch means the CPU is being fed wrong bytes.
   output logic [31:0] rom_checksum = 32'd0,
   output logic        busy,
   output logic        done = 1'b0,
@@ -115,8 +109,8 @@ module ki_sdram_bist #(
   // SIMULATION, though, capturing an undriven tri-state bus yields 16'hzzzz,
   // and `!=` against an X/Z operand evaluates to X, which `if` treats as
   // false - so a simulated capture of a floating bus is silently NOT counted.
-  // tb_ki_sdram_bist checks separately that no returned beat contains X/Z,
-  // which is what covers that case. Do not "fix" this by switching to `!==`.
+  // The testbench checks separately that no returned beat contains X/Z, which
+  // is what covers that case. Do not "fix" this by switching to `!==`.
 
   // Address-correlated pattern with an inverted second pass, so a stuck data
   // bit, a swapped address bit and a wired-together lane all produce
@@ -149,11 +143,10 @@ module ki_sdram_bist #(
 
   // DQM: does a write with some bytes disabled leave those bytes alone? The
   // pattern passes write every word with both enables set, so they cannot
-  // tell. The data cache's write-back used to rely on it - a line whose
-  // store-miss fill was skipped went back with its unread qwords masked - and
-  // on hardware that corrupted game data while every simulation passed,
-  // because every SDRAM model honours DQM. Hardware then failed this test:
-  // SD:F, EP 2222, AC AAAA.
+  // tell. A data cache write-back for a line whose store-miss fill was skipped
+  // goes back with its unread qwords masked, so it depends on the answer - and
+  // a simulation cannot give it, because every SDRAM model honours DQM. The
+  // board ignores DQM entirely.
   //
   // Four sub-tests, each harder than the last, so the FIRST failure says how
   // far masking works on this board. Each has its own fill and write pattern,
@@ -165,10 +158,10 @@ module ki_sdram_bist #(
   //   3  four words, mask changing per word fill 1111 2222 3333 4444,
   //                                         write AAAA -> AAAA 2222 33AA AA44
   //
-  // Sub-test 3 is what the skipped fill's write-back did. Sub-tests 0-2 are
-  // what an uncached 8- or 16-bit store to SDRAM still does today. Each has
-  // its own four words at the end of the base region's last row, clear of the
-  // pattern sweep.
+  // Sub-test 3 is what the skipped fill's write-back does. Sub-tests 0-2 are
+  // what an uncached 8- or 16-bit store to SDRAM does. Each has its own four
+  // words at the end of the base region's last row, clear of the pattern
+  // sweep.
   //
   // A failure clears `pass` without touching error_count, so the page shows
   // SD:F with EC:00 - which no pattern failure can - and the first wrong
@@ -186,7 +179,7 @@ module ki_sdram_bist #(
   // has to elaborate under Quartus 17.0.2 as well as the simulator.
   // always_comb, not always @*: dqm_case starts at 0 and stays there until
   // the first sub-test finishes, and an @* block that never sees an event
-  // never runs, which left every constant below X and hung the first write.
+  // never runs, which would leave every constant below X.
   logic [24:0] dqm_addr;
   logic  [4:0] dqm_words;
   logic [63:0] dqm_fill;
@@ -234,13 +227,17 @@ module ki_sdram_bist #(
   logic [INDEX_BITS-1:0] index = '0;
   logic invert_pass = 1'b0;
 
-  logic [1:0] region = 2'd0;
-  wire [24:0] active_base = (region == 2'd0) ? LOW_BASE_WORD :
-                            (region == 2'd1) ? FB_BASE_WORD  :
-                                               BASE_WORD;
+  // 0: low RAM, 1: the free region at BASE_WORD.
+  logic       region = 1'b0;
+  wire [24:0] active_base = region ? BASE_WORD : LOW_BASE_WORD;
 
   // Beat position inside the burst currently in flight.
   logic [4:0] beat = '0;
+  // Words in the beat on the wire. Both halves hold their value between
+  // beats, so the single-word path may still read them at request_done.
+  wire  [4:0] beat_words = request_read_be[1] ? 5'd2 : 5'd1;
+  wire [15:0] rd_lo = request_read_data[15:0];
+  wire [15:0] rd_hi = request_read_data[31:16];
 
   // Counted separately so the debug page can say WHICH read shape failed.
   // Each saturates below 0xFF so their concatenation can never collide with
@@ -303,8 +300,7 @@ module ki_sdram_bist #(
         // from a stall after thousands, or a read stall from a write stall.
         //   EP = {state[3:0], invert_pass, index[10:0]}   (exactly 16 bits)
         //   AC = transactions completed before the stall
-        // The state field grew to 4 bits when the burst pass was added, so the
-        // index field lost one; INDEX_BITS must stay <= 11.
+        // INDEX_BITS must stay <= 11 for the fields to fit.
         first_bad_expected <= {state, invert_pass,
                                {(11 - INDEX_BITS){1'b0}}, index};
         first_bad_actual <= completed;
@@ -319,7 +315,7 @@ module ki_sdram_bist #(
             index <= '0;
             beat <= '0;
             invert_pass <= 1'b0;
-            region <= 2'd0;
+            region <= 1'b0;
             single_errors <= 8'd0;
             burst_errors <= 8'd0;
             watchdog <= '0;
@@ -357,11 +353,11 @@ module ki_sdram_bist #(
 
         BIST_READ_ACK: begin
           if (request_done) begin
-            if (request_read_data != pattern(index, invert_pass)) begin
+            if (rd_lo != pattern(index, invert_pass)) begin
               if (error_count == 16'd0) begin
                 first_bad_address <= active_base + index;
                 first_bad_expected <= pattern(index, invert_pass);
-                first_bad_actual <= request_read_data;
+                first_bad_actual <= rd_lo;
               end
               if (single_errors != 8'hfe)
                 single_errors <= single_errors + 1'b1;
@@ -391,15 +387,28 @@ module ki_sdram_bist #(
         BIST_BURST_ACK: begin
           // Beats stream back one per clock ahead of request_done, so they are
           // checked as they arrive rather than at completion.
+          // A beat carries two words, so both are checked. At most one
+          // error is counted per beat - the count is a severity hint, and the
+          // pass/fail and first_bad_* are what the screen reports.
           if (request_data_valid) begin
-            beat <= beat + 1'b1;
-            if (request_read_data !=
-                pattern(index + INDEX_BITS'(beat), invert_pass)) begin
+            beat <= beat + beat_words;
+            if (rd_lo != pattern(index + INDEX_BITS'(beat), invert_pass)) begin
               if (error_count == 16'd0) begin
                 first_bad_address <= active_base + index + beat;
                 first_bad_expected <=
                     pattern(index + INDEX_BITS'(beat), invert_pass);
-                first_bad_actual <= request_read_data;
+                first_bad_actual <= rd_lo;
+              end
+              if (burst_errors != 8'hfe)
+                burst_errors <= burst_errors + 1'b1;
+            end else if (request_read_be[1] &&
+                         (rd_hi != pattern(index + INDEX_BITS'(beat + 5'd1),
+                                           invert_pass))) begin
+              if (error_count == 16'd0) begin
+                first_bad_address <= active_base + index + beat + 1'b1;
+                first_bad_expected <=
+                    pattern(index + INDEX_BITS'(beat + 5'd1), invert_pass);
+                first_bad_actual <= rd_hi;
               end
               if (burst_errors != 8'hfe)
                 burst_errors <= burst_errors + 1'b1;
@@ -410,7 +419,7 @@ module ki_sdram_bist #(
             // A burst that returned the wrong NUMBER of beats is as much a
             // failure as one that returned wrong data, and would otherwise
             // pass silently.
-            if ((beat + (request_data_valid ? 5'd1 : 5'd0)) !=
+            if ((beat + (request_data_valid ? beat_words : 5'd0)) !=
                 BURST_WORDS[4:0]) begin
               if (burst_errors != 8'hfe)
                 burst_errors <= burst_errors + 1'b1;
@@ -432,8 +441,8 @@ module ki_sdram_bist #(
         // names whichever failed first.
         BIST_NEXT_PASS: begin
           if (invert_pass) begin
-            if (region != 2'd2) begin
-              region <= region + 1'b1;
+            if (!region) begin
+              region <= 1'b1;
               invert_pass <= 1'b0;
               index <= '0;
               beat <= '0;
@@ -475,14 +484,24 @@ module ki_sdram_bist #(
 
         BIST_DQM_ACK: begin
           if (dqm_step == 2'd2 && request_data_valid) begin
-            beat <= beat + 1'b1;
-            if (request_read_data != dqm_expect[{beat[1:0], 4'd0} +: 16]) begin
+            beat <= beat + beat_words;
+            if (rd_lo != dqm_expect[{beat[1:0], 4'd0} +: 16]) begin
               // The first sub-test to fail is the one that says how far
               // masking works, so only the first mismatch is kept.
               if (!dqm_bad && error_count == 16'd0) begin
                 first_bad_address <= dqm_addr + beat;
                 first_bad_expected <= dqm_expect[{beat[1:0], 4'd0} +: 16];
-                first_bad_actual <= request_read_data;
+                first_bad_actual <= rd_lo;
+              end
+              dqm_bad <= 1'b1;
+            end else if (request_read_be[1] &&
+                         (rd_hi !=
+                          dqm_expect[{beat[1:0] | 2'd1, 4'd0} +: 16])) begin
+              if (!dqm_bad && error_count == 16'd0) begin
+                first_bad_address <= dqm_addr + beat + 1'b1;
+                first_bad_expected <=
+                    dqm_expect[{beat[1:0] | 2'd1, 4'd0} +: 16];
+                first_bad_actual <= rd_hi;
               end
               dqm_bad <= 1'b1;
             end
@@ -491,7 +510,8 @@ module ki_sdram_bist #(
             if (dqm_step != 2'd2) begin
               dqm_step <= dqm_step + 2'd1;
               state <= BIST_DQM_ISSUE;
-            end else if ((beat + (request_data_valid ? 5'd1 : 5'd0)) != dqm_words) begin
+            end else if ((beat + (request_data_valid ? beat_words : 5'd0))
+                         != dqm_words) begin
               // The read did not return the words it asked for, which no
               // count of mismatches would show.
               pass <= 1'b0;
@@ -509,7 +529,7 @@ module ki_sdram_bist #(
 
         // The pattern test is finished; now verify what the CPU will
         // actually be fed. Holding `busy` here keeps the CPU in reset for the
-        // ~11 ms this takes, which is harmless and deliberate.
+        // length of the checksum pass, which is harmless and deliberate.
         BIST_WAIT_BOOT: begin
           if (boot_loaded) begin
             sum_index <= 19'd0;
@@ -528,7 +548,8 @@ module ki_sdram_bist #(
 
         BIST_SUM_ACK: begin
           if (request_data_valid)
-            rom_sum <= rom_sum + {16'd0, request_read_data};
+            rom_sum <= rom_sum + {16'd0, rd_lo} +
+                       (request_read_be[1] ? {16'd0, rd_hi} : 32'd0);
           if (request_done) begin
             if (sum_index >= (ROM_WORDS - BURST_WORDS)) begin
               rom_checksum <= rom_sum;

@@ -27,8 +27,7 @@ module ki_board_io (
   output logic [18:0] framebuffer_base,
   output logic        sound_reset,
   output logic [31:0] sound_data,
-  output logic        sound_data_strobe,
-  output logic [31:0] coin_control
+  output logic        sound_data_strobe
 );
   import ki_board_pkg::*;
 
@@ -82,19 +81,17 @@ module ki_board_io (
       // not do that for several seconds.
       //
       // The real board does not work that way. Its DCS runs from power-on and
-      // sounds a power-on self-test chime entirely on its own: MAME plays that
-      // chime 2.823 s after reset while the first write to this register does
-      // not arrive until 6.459 s. Holding the board off until the game asks
+      // sounds a power-on self-test chime entirely on its own, well before the
+      // first write to this register. Holding the board off until the game asks
       // means the chime either lands far too late or, once the disk is mounted
       // and commands start flowing, is overwritten in the one-word mailbox
-      // before it is ever heard. Both are exactly what hardware showed.
+      // before it is ever heard.
       //
       // core_reset still gates the DCS separately, so it stays in reset while
       // its ROM is being written into DDR.
       sound_reset      <= 1'b1;
       sound_control    <= 32'h0000_0000;
       sound_data       <= 32'h0000_0000;
-      coin_control     <= 32'h0000_0000;
       sound_data_strobe <= 1'b0;
     end else if (bus_request && bus_write && io_selected) begin
       if ((!game_ki2 && (bus_word_address == 32'h1000_0080)) ||
@@ -120,12 +117,6 @@ module ki_board_io (
           ( game_ki2 && (bus_word_address == 32'h1000_00a0))) begin
         sound_data <= merge_bytes(sound_data, bus_write_data,
                                   bus_byte_enable);
-      end
-
-      if ((!game_ki2 && (bus_word_address == 32'h1000_00b0)) ||
-          ( game_ki2 && (bus_word_address == 32'h1000_00b8))) begin
-        coin_control <= merge_bytes(coin_control, bus_write_data,
-                                    bus_byte_enable);
       end
     end
   end

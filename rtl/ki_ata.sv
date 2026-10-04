@@ -27,8 +27,7 @@ module ki_ata (
   input  wire         sd_ack,
   // Wide enough for a whole batch, not one sector. hps_io declares this
   // [12:0] under WIDE(1) and counts 16-bit words across the entire multi-block
-  // transfer; the core previously took only the low 8 bits because it only
-  // ever asked for one 512-byte block.
+  // transfer.
   input  wire  [12:0] sd_buff_addr,
   input  wire  [15:0] sd_buff_dout,
   output logic [15:0] sd_buff_din,
@@ -51,9 +50,7 @@ module ki_ata (
   // (13 heads, 47 sectors for KI1) as well as LBA mode, so a translation
   // error would read back a different sector than was written.
   output wire  [31:0] debug_read_lba,
-  output wire  [31:0] debug_write_lba,
-  output wire  [31:0] debug_write_info,
-  output wire  [31:0] debug_dataport_info
+  output wire  [31:0] debug_write_lba
 );
   import ki_board_pkg::*;
 
@@ -73,6 +70,25 @@ module ki_ata (
   } ata_state_t;
 
   // Sector streaming.
+  //
+  // A read asks the HPS for BATCH_SECTORS sectors per request (hps_io supports
+  // up to 32 blocks / 16 KiB via sd_blk_cnt), and two such batches are held so
+  // the HPS can be filling one bank while the CPU drains the other. Together
+  // they turn N round trips per N sectors, all of them exposed, into
+  // N/BATCH_SECTORS round trips, nearly all of them hidden behind the PIO
+  // transfer.
+  //
+  // BATCH_SECTORS = 8 puts the buffer at 2 * 8 * 512 B = 8 KiB, 8 M10Ks.
+  //
+  // The case for 16 is that the worst-case HPS round trip is far longer than
+  // the time the CPU takes to drain an 8-sector bank, so the prefetch could
+  // not keep up and halving the number of round trips would be the only lever
+  // left.
+  //
+  // That reasoning treats a maximum as if it were an average. The prefetch
+  // covers essentially all handovers, and the worst case is a rare tail event,
+  // not the normal round trip, so 16 buys nothing, costs 8 more M10Ks and
+  // tightens clk_core, the tightest domain in the design.
   localparam integer BATCH_SECTORS = 8;
   localparam integer SECTOR_WORDS  = 256;
   localparam integer BANK_WORDS    = BATCH_SECTORS * SECTOR_WORDS; // 2048
@@ -100,13 +116,6 @@ module ki_ata (
   logic [11:0] data_writes;
   logic [31:0] last_read_lba;
   logic [31:0] last_write_lba;
-  logic [11:0] sd_wr_issued;
-  logic [11:0] sd_wr_acked;
-  logic        sd_wr_d;
-  logic  [3:0] last_wr_be;
-  logic  [7:0] last_wr_addr;
-  logic [11:0] write_cmds;
-  logic  [7:0] max_write_index;
   logic        irq_pending_d;
   logic        image_ready;
   logic        image_readonly;
@@ -129,9 +138,7 @@ module ki_ata (
 
   // How many sectors the next request may cover: whatever is left of the
   // command, capped at a batch, and capped again so a batch can never run off
-  // the end of the image. The single-sector path re-checked the bound on every
-  // sector because it re-entered ATA_READ_SETUP each time; batching has to
-  // carry that check into the request size instead.
+  // the end of the image.
   wire [31:0] sectors_to_end = image_sectors - sd_lba;
   wire  [8:0] fetch_avail    = (sectors_to_end > 32'd256)
                                  ? 9'd256 : sectors_to_end[8:0];
@@ -146,10 +153,6 @@ module ki_ata (
   assign debug_image_ready = image_ready;
   assign debug_read_lba  = last_read_lba;
   assign debug_write_lba = last_write_lba;
-  // img_readonly | sectors we asked the HPS to write | handshakes it completed
-  assign debug_write_info = {image_readonly, 7'd0, sd_wr_issued, sd_wr_acked};
-  assign debug_dataport_info = {last_wr_be, max_write_index, write_cmds,
-                                last_wr_addr};
   assign debug_info = {last_command, irq, irq_pending, device_control[1],
                        1'b0, data_index, data_writes};
 
@@ -159,6 +162,9 @@ module ki_ata (
                       (bus_address <= (KI_ATA_CS1_ADDR + 3));
   wire [2:0] cs0_register = bus_address[5:3];
   wire bus_access = bus_request && (cs0_selected || cs1_selected);
+  // A data-port write needs a low-halfword enable and advances data_index
+  // by exactly one halfword. A host writing 32-bit words, or writing the
+  // upper halfword at offset +2, would have half its transfer refused.
   wire cpu_buffer_write = bus_access && bus_write && cs0_selected &&
                           (cs0_register == 3'd0) &&
                           (state == ATA_PIO_WRITE) && |bus_byte_enable[1:0];
@@ -169,9 +175,8 @@ module ki_ata (
 
   // Buffer addressing.
   //
-  // Writes are untouched by the streaming work: they remain one sector at a
-  // time and use the first sector of bank 0, so both ports address the same
-  // 256 words the single-sector implementation used. Only reads see the banks.
+  // Writes are one sector at a time and use the first sector of bank 0, so
+  // both ports address the same 256 words. Only reads see the banks.
   wire hps_write_mode = (state == ATA_PIO_WRITE) || (state == ATA_SD_WRITE_WAIT);
 
   wire [BUF_AW-1:0] buf_cpu_addr =
@@ -302,8 +307,6 @@ module ki_ata (
       // Physical geometry, straight out of the CHD headers:
       //   kinst.chd   CYLS:419,  HEADS:13, SECS:47  -> 419*13*47  = 256009
       //   kinst2.chd  CYLS:1463, HEADS:13, SECS:47  -> 1463*13*47 = 893893
-      // KI2 previously read 988 cylinders and 822016 sectors, matching neither
-      // its image nor anything else.
       capacity = game_ki2 ? 32'd893893 : 32'd256009;
       cylinders = game_ki2 ? 16'd1463 : 16'd419;
       heads = 16'd13;
@@ -417,13 +420,6 @@ module ki_ata (
       data_writes       <= 12'd0;
       last_read_lba     <= 32'h0;
       last_write_lba    <= 32'h0;
-      sd_wr_issued      <= 12'd0;
-      sd_wr_acked       <= 12'd0;
-      sd_wr_d           <= 1'b0;
-      last_wr_be        <= 4'd0;
-      last_wr_addr      <= 8'd0;
-      write_cmds        <= 12'd0;
-      max_write_index   <= 8'd0;
       irq_pending_d     <= 1'b0;
       irq_pending       <= 1'b0;
       image_ready       <= 1'b0;
@@ -454,25 +450,6 @@ module ki_ata (
       // and the image itself is not taking the data.
       // How far the block ever got, and what the host is actually presenting.
       //
-      // cpu_buffer_write demands |bus_byte_enable[1:0] and advances
-      // data_index by exactly ONE HALFWORD per accepted access. A host writing
-      // 32-bit words, or writing the upper halfword at offset +2, would have
-      // half its transfer silently refused - the block would then stop short
-      // of 0xFF and sd_wr would never fire, which is exactly what WH shows.
-      if (state == ATA_PIO_WRITE && data_index > max_write_index)
-        max_write_index <= data_index;
-      if (bus_access && bus_write && cs0_selected && cs0_register == 3'd0) begin
-        last_wr_be   <= bus_byte_enable;
-        last_wr_addr <= bus_address[7:0];
-      end
-
-      sd_wr_d <= sd_wr;
-      if (sd_wr && !sd_wr_d && sd_wr_issued != 12'hfff)
-        sd_wr_issued <= sd_wr_issued + 1'b1;
-      if (state == ATA_SD_WRITE_WAIT && !sd_ack && sd_ack_d &&
-          sd_wr_acked != 12'hfff)
-        sd_wr_acked <= sd_wr_acked + 1'b1;
-
       // Count RISING edges of irq_pending. A status-register read clears it -
       // correct ATA behaviour - so a live sample of the irq line cannot tell
       // "never asserted" from "asserted and already consumed", and those are
@@ -488,7 +465,7 @@ module ki_ata (
       image_readonly <= img_readonly;
       image_sectors  <= img_size[40:9];
 
-      // READ SECTORS no longer issues the transfer itself. It validates the
+      // READ SECTORS does not issue the transfer itself. It validates the
       // request and hands off to the fetch engine below, which owns sd_rd for
       // the whole command and runs ahead of the host.
       if (state == ATA_READ_SETUP) begin
@@ -503,7 +480,7 @@ module ki_ata (
       // ---- fetch engine -------------------------------------------------
       // Fills whichever bank is free, independently of what the host is
       // draining. This is the prefetch: while ATA_PIO_READ hands one bank to
-      // the CPU 260 ns at a time, the HPS round trip for the next batch is
+      // the CPU a halfword at a time, the HPS round trip for the next batch is
       // already in flight against the other.
       if (read_active && !fetch_busy && fetch_remaining != 9'd0 &&
           !bank_valid[fill_bank]) begin
@@ -531,7 +508,7 @@ module ki_ata (
       end
 
       // ---- drain start ---------------------------------------------------
-      // ATA_SD_READ_WAIT now means "the host is waiting for its bank", not
+      // ATA_SD_READ_WAIT means "the host is waiting for its bank", not
       // "a request is in flight". When the prefetch has already landed this
       // fires the cycle after the previous bank was released.
       if (read_active && state == ATA_SD_READ_WAIT && bank_valid[drain_bank]) begin
@@ -696,7 +673,6 @@ module ki_ata (
                   sd_blk_cnt        <= 6'd0;
                   sd_lba            <= selected_lba();
                   last_write_lba    <= selected_lba();
-                  if (write_cmds != 12'hfff) write_cmds <= write_cmds + 1'b1;
                   sectors_remaining <= (sector_count == 0) ? 9'd256 : {1'b0, sector_count};
                   status            <= ATA_BUSY;
                   error_reg         <= 8'h00;

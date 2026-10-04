@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// MAME-compatible keyboard controls for the Killer Instinct board shell.
+// Keyboard controls for the Killer Instinct board shell.
 
 module ki_keyboard
 (
@@ -12,7 +12,7 @@ module ki_keyboard
 // ps2_key_i contains Set-2 scan codes. Bit 10 toggles for each make/break
 // event, bit 9 is the pressed state and bit 8 marks E0-extended keys. Keeping
 // bit 8 in the selector prevents keypad keys from masquerading as arrows and
-// distinguishes the left modifiers used by MAME from their right variants.
+// distinguishes the left modifiers used here from their right variants.
 reg key_toggle = 1'b0;
 
 always @(posedge clk_i) begin
@@ -44,6 +44,7 @@ always @(posedge clk_i) begin
 			9'h015: p2_o[6] <= ps2_key_i[9]; // Q: P2 Button 3
 			9'h01d: p2_o[7] <= ps2_key_i[9]; // W: P2 Button 4
 			9'h024: p2_o[8] <= ps2_key_i[9]; // E: P2 Button 5
+			9'h00d: p2_o[9] <= ps2_key_i[9]; // Tab: P2 Button 6
 		endcase
 	end
 end
