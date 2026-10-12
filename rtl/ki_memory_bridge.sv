@@ -7,6 +7,12 @@ module ki_memory_bridge (
   input  wire         reset,
 
   input  wire         cpu_request,
+  // While high, no CPU request is started. One already started finishes, and
+  // the next waits in pending_* until this falls, so the CPU stalls on its
+  // next miss or I/O access while scanout, the DCS ROM and downloads carry
+  // on. Only IDLE consults it, so it never splits a transaction. This is how
+  // the core pauses.
+  input  wire         cpu_hold,
   input  wire         cpu_rnw,
   input  wire  [31:0] cpu_address,
   input  wire         cpu_req64,
@@ -30,8 +36,14 @@ module ki_memory_bridge (
   output logic [63:0] cpu_data_read,
   output logic        cpu_done,
   output logic        cpu_grant,
-  output logic [63:0] cpu_cache_data,
-  output logic        cpu_cache_data_ready,
+  output wire  [63:0] cpu_cache_data,
+  // One pulse per 64-bit word of a line, in address order. The last comes no
+  // later than cpu_done - for a line from SDRAM, on the same clock. Both
+  // caches take a beat while their fill is active, which cpu.vhd ends on the
+  // edge after cpu_done, so a beat on cpu_done's own clock is still theirs.
+  // A qword from SDRAM is not registered here: it goes out on the clock its
+  // second half arrives from the adapter.
+  output wire         cpu_cache_data_ready,
 
   output logic        io_request,
   output logic        io_write,
@@ -376,15 +388,45 @@ module ki_memory_bridge (
       download_inflight &&
       !download_is_boot[download_read_pointer] &&
       (ddr_write_ack_sync2 != ddr_write_ack_seen);
+  // A read finishes on its last beat (SDRAM_READ_WAIT), a clock before the
+  // adapter raises sdram_done for it. That done is then owed: it belongs to a
+  // transaction already over, and no wait state may take it for its own.
+  logic done_owed = 1'b0;
+  wire  sdram_done_now = sdram_done && !done_owed;
+
+  // The caches' qword. From SDRAM it is not registered: it is complete on the
+  // clock its second half arrives, and goes out on that clock. The boot
+  // cache, the boot ROM line and the framebuffer still drive it from
+  // registers.
+  //
+  // A whole line from SDRAM - sixteen words, 32-byte aligned, so one burst
+  // the adapter streams two words a clock with no gap - raises cpu_done on
+  // the edge that takes its one-but-last beat. Its last half-beat is then on
+  // the wire during cpu_done's own clock (fill_tail), and the last qword goes
+  // out beside cpu_done: the relation a registered last qword had with
+  // cpu_done, a clock sooner.
+  logic [63:0] cpu_cache_data_q = 64'd0;
+  logic        cpu_cache_data_ready_q = 1'b0;
+  logic        line_read = 1'b0;
+  logic        fill_tail = 1'b0;
+  wire         fill_pass = sdram_data_valid && operation_req64 &&
+                           (read_word_index == 2'd2) &&
+                           ((state == SDRAM_READ_WAIT) || fill_tail);
+  assign cpu_cache_data       = fill_pass ? read_buffer_next : cpu_cache_data_q;
+  assign cpu_cache_data_ready = fill_pass || cpu_cache_data_ready_q;
+
   // One burst covers the whole 64-bit word, so completion is simply done.
   wire download_sdram_pop =
       download_inflight &&
       download_is_boot[download_read_pointer] &&
       (state == DOWNLOAD_SDRAM_WRITE_WAIT) &&
-      sdram_done;
+      sdram_done_now;
   wire download_pop = download_ddr_pop || download_sdram_pop;
 
   wire have_cpu = cpu_pending || cpu_request;
+  // A CPU request IDLE may start now. Every decision below that would start
+  // one uses this, so a held request looks to them like no request at all.
+  wire cpu_turn = have_cpu && !cpu_hold;
 
   // See the perf_* ports. perf_frame is already in this clock domain, so the
   // edge detect is only to tolerate a multi-cycle strobe.
@@ -519,6 +561,19 @@ module ki_memory_bridge (
       SDRAM_MAX_BURST : row_words_left[4:0];
   wire [4:0] next_burst = (read_words_remaining > burst_cap) ?
       burst_cap : read_words_remaining;
+  // The same for a read IDLE is accepting now, from the request's own address
+  // and length rather than the registers it is about to load, so the read
+  // goes out on this clock instead of from SDRAM_READ_ISSUE on the next.
+  wire [24:0] active_first_word = active_req64 ?
+      {active_storage_address[25:3], 2'b00} :
+      {active_storage_address[25:2], 1'b0};
+  wire [9:0] active_row_words_left =
+      SDRAM_ROW_WORDS[9:0] - {1'b0, active_first_word[8:0]};
+  wire [4:0] active_burst_cap =
+      (active_row_words_left >= {5'd0, SDRAM_MAX_BURST}) ?
+      SDRAM_MAX_BURST : active_row_words_left[4:0];
+  wire [4:0] active_first_burst = (active_read_words > active_burst_cap) ?
+      active_burst_cap : active_read_words;
 
 
   // ------------------------------------------------------------------
@@ -689,7 +744,7 @@ module ki_memory_bridge (
   // continues the one being held. The boot-table window is excluded so the
   // snoop in SDRAM_WRITE_WAIT still sees every store there.
   wire wb_gather_ok =
-      WB_GATHER && have_cpu && !active_rnw && !active_line_write &&
+      WB_GATHER && cpu_turn && !active_rnw && !active_line_write &&
       active_req64 && (active_write_mask == 8'hff) &&
       !io_selected && !cpu_hits_fb &&
       is_memory_address(active_address) &&
@@ -706,7 +761,7 @@ module ki_memory_bridge (
   // goes out first - wb_flush_needed below covers that, because a line write
   // is not wb_gather_ok.
   wire line_req =
-      have_cpu && !active_rnw && active_line_write &&
+      cpu_turn && !active_rnw && active_line_write &&
       !io_selected && !cpu_hits_fb &&
       is_memory_address(active_address) &&
       !is_boot_address(active_address);
@@ -714,7 +769,7 @@ module ki_memory_bridge (
   // The same, into the framebuffer. line_req refuses it (!cpu_hits_fb) because
   // the burst path is SDRAM's; this is the on-chip RAM's own path.
   wire fb_line_req =
-      have_cpu && !active_rnw && active_line_write &&
+      cpu_turn && !active_rnw && active_line_write &&
       cpu_hits_fb;
 
   // Anything else that needs the bus, a full line, or a line left sitting
@@ -723,7 +778,7 @@ module ki_memory_bridge (
       (wb_count == 3'd4) ||
       ((wb_count != 3'd0) &&
        ((download_count != 0) || wb_idle[5] ||
-        (have_cpu && !wb_gather_ok)));
+        (cpu_turn && !wb_gather_ok)));
 
   always_ff @(posedge clk) begin
     boot_cache_read_data <= boot_cache[boot_cache_read_address];
@@ -763,12 +818,44 @@ module ki_memory_bridge (
       $fatal(1);
     end
   end
+
+  // An owed done arrives before any beat of the next transaction: the adapter
+  // completes one transaction before it launches another. If it ever came
+  // later, done_owed would swallow the wrong done.
+  always_ff @(posedge clk) begin
+    // A line's last half-beat must follow its early done on the next clock,
+    // or it would reach the caches after their fill had ended.
+    if (!reset && fill_tail && !sdram_data_valid) begin
+      $error("bridge: a line's last half-beat did not follow its early done");
+      $fatal(1);
+    end
+    if (!reset && done_owed && sdram_data_valid && !fill_tail) begin
+      $error("bridge: a beat arrived while a finished read's done was still owed");
+      $fatal(1);
+    end
+  end
+
+  // cpu_hold's rule: an IDLE clock with it high starts no CPU transaction.
+  // Every CPU answer IDLE gives is registered, so the clock after shows it -
+  // and IDLE can only move to a state some other requester chose.
+  logic held_idle = 1'b0;
+  always_ff @(posedge clk) begin
+    held_idle <= !reset && cpu_hold && (state == IDLE);
+    if (!reset && held_idle &&
+        (cpu_done || cpu_grant || io_request ||
+         fb_read_accept || fb_write_accept ||
+         ((state != IDLE) && (state != SDRAM_WB_FLUSH_ISSUE) &&
+          (state != DOWNLOAD_SDRAM_WRITE_ISSUE)))) begin
+      $error("bridge: a CPU request was started while cpu_hold was high");
+      $fatal(1);
+    end
+  end
 `endif
 
   always_ff @(posedge clk) begin
     cpu_done <= 1'b0;
     cpu_grant <= 1'b0;
-    cpu_cache_data_ready <= 1'b0;
+    cpu_cache_data_ready_q <= 1'b0;
     video_data_valid <= 1'b0;
     video_done <= 1'b0;
     io_request <= 1'b0;
@@ -779,6 +866,8 @@ module ki_memory_bridge (
     sdram_write <= 1'b0;
 
     if ((wb_count != 3'd0) && !wb_idle[5]) wb_idle <= wb_idle + 1'b1;
+    if (sdram_done && done_owed) done_owed <= 1'b0;
+    fill_tail <= 1'b0;
 
     // Line-fill beats land straight in the buffer, one per clock, exactly as
     // the CPU read path assembles its own beats below.
@@ -792,6 +881,7 @@ module ki_memory_bridge (
     // the adapter streams them out of the controller's CAS pipeline, one per
     // clock, and only afterwards raises sdram_done. Assembling them here keeps
     // the read states responsible for issuing and completing, nothing else.
+    // A completed qword reaches the caches through fill_pass, not from here.
     if (sdram_data_valid && (state == SDRAM_READ_WAIT)) begin
       read_buffer <= read_buffer_next;
       read_word_index <= read_word_index + 2'd2;
@@ -803,8 +893,6 @@ module ki_memory_bridge (
         if (read_word_index == 2'd0)
           cpu_data_read <= {32'd0, read_buffer_next[31:0]};
       end else if (read_word_index == 2'd2) begin
-        cpu_cache_data <= read_buffer_next;
-        cpu_cache_data_ready <= 1'b1;
         cpu_data_read <= read_buffer_next;
         read_buffer <= 64'd0;
         fill_beat <= fill_beat + 1'b1;
@@ -892,7 +980,7 @@ module ki_memory_bridge (
       state <= IDLE;
       cpu_pending <= 1'b0;
       cpu_data_read <= 64'hffff_ffff_ffff_ffff;
-      cpu_cache_data <= 64'd0;
+      cpu_cache_data_q <= 64'd0;
       video_data <= 64'd0;
       io_write <= 1'b0;
       io_address <= 32'd0;
@@ -915,6 +1003,8 @@ module ki_memory_bridge (
       dcs_rom_done_seen <= dcs_rom_done_sync2;
       dcs_rom_data <= 64'd0;
       read_buffer <= 64'd0;
+      done_owed <= 1'b0;
+      fill_tail <= 1'b0;
       vid_state <= VID_IDLE;
       vid_left <= 3'd0;
     end else begin
@@ -1047,7 +1137,7 @@ module ki_memory_bridge (
                 download_inflight <= 1'b1;
               end
             end
-          end else if (have_cpu && !active_line_write) begin
+          end else if (cpu_turn && !active_line_write) begin
             // !active_line_write: a whole-line write belongs to the burst path
             // above and nowhere else. Without this it could be served here as
             // an ordinary 64-bit write - storing 8 of its 32 bytes and
@@ -1077,6 +1167,8 @@ module ki_memory_bridge (
               read_buffer <= 64'd0;
               read_word_index <= 2'd0;
               read_words_remaining <= active_read_words;
+              line_read <= active_req64 && (active_read_words == 5'd16) &&
+                           (active_first_word[3:0] == 4'd0);
               fill_beat <= 2'd0;
               // The framebuffer window is served entirely from on-chip memory,
               // so it is checked before every SDRAM path below.
@@ -1141,6 +1233,14 @@ module ki_memory_bridge (
                   boot_rom_wait_cycles <=
                       {active_read_words, {BOOT_ROM_WAIT_SHIFT{1'b0}}};
                   state <= BOOT_ROM_ACCESS_WAIT;
+                end else if (sdram_ready) begin
+                  // Straight out, as SDRAM_READ_ISSUE would on the next clock.
+                  // A read the first burst does not finish still goes back
+                  // through SDRAM_READ_ISSUE for the rest.
+                  sdram_address <= active_first_word;
+                  sdram_burst <= active_first_burst;
+                  sdram_read <= 1'b1;
+                  state <= SDRAM_READ_WAIT;
                 end else begin
                   state <= SDRAM_READ_ISSUE;
                 end
@@ -1173,8 +1273,8 @@ module ki_memory_bridge (
 
         BOOT_CACHE_READ_RETURN: begin
           if (operation_req64) begin
-            cpu_cache_data <= boot_cache_read_data;
-            cpu_cache_data_ready <= 1'b1;
+            cpu_cache_data_q <= boot_cache_read_data;
+            cpu_cache_data_ready_q <= 1'b1;
             cpu_data_read <= boot_cache_read_data;
           end else begin
             cpu_data_read <= operation_address[2] ?
@@ -1212,7 +1312,7 @@ module ki_memory_bridge (
         end
 
         DOWNLOAD_SDRAM_WRITE_WAIT: begin
-          if (sdram_done)
+          if (sdram_done_now)
             state <= IDLE;
         end
 
@@ -1229,7 +1329,7 @@ module ki_memory_bridge (
         end
 
         ROM_LINE_FILL_WAIT: begin
-          if (sdram_done) begin
+          if (sdram_done_now) begin
             rom_line_tag <= rom_pending_tag;
             rom_line_valid <= 1'b1;
             state <= ROM_LINE_RETURN;
@@ -1238,13 +1338,13 @@ module ki_memory_bridge (
 
         ROM_LINE_RETURN: begin
           if (operation_req64) begin
-            cpu_cache_data <= {
+            cpu_cache_data_q <= {
               rom_line[rom_line_offset + 4'd3],
               rom_line[rom_line_offset + 4'd2],
               rom_line[rom_line_offset + 4'd1],
               rom_line[rom_line_offset]
             };
-            cpu_cache_data_ready <= 1'b1;
+            cpu_cache_data_ready_q <= 1'b1;
             cpu_data_read <= {
               rom_line[rom_line_offset + 4'd3],
               rom_line[rom_line_offset + 4'd2],
@@ -1272,11 +1372,26 @@ module ki_memory_bridge (
           end
         end
 
-        // Beats are assembled by the sdram_data_valid block above. All this
-        // has to decide, at sdram_done, is whether the operation still owes
-        // words - which happens only when a row boundary split the request.
+        // Beats are assembled by the sdram_data_valid block above. The
+        // operation is finished on its last beat - a whole line on the beat
+        // before, with fill_tail carrying the last one: the adapter's done
+        // would only arrive later, and that time lands on every miss. The
+        // done is then owed (done_owed). A burst a row boundary split still
+        // waits for its done before the rest goes out.
         SDRAM_READ_WAIT: begin
-          if (sdram_done) begin
+          if (sdram_data_valid && (read_words_left_next == 0)) begin
+            cpu_done <= 1'b1;
+            cpu_pending <= 1'b0;
+            done_owed <= 1'b1;
+            state <= IDLE;
+          end else if (sdram_data_valid && line_read &&
+                       (read_words_left_next == 5'd2)) begin
+            cpu_done <= 1'b1;
+            cpu_pending <= 1'b0;
+            done_owed <= 1'b1;
+            fill_tail <= 1'b1;
+            state <= IDLE;
+          end else if (sdram_done_now) begin
             if (read_words_left_next == 0) begin
               cpu_done <= 1'b1;
               cpu_pending <= 1'b0;
@@ -1324,7 +1439,7 @@ module ki_memory_bridge (
         end
 
         SDRAM_WB_FLUSH_WAIT: begin
-          if (sdram_done) begin
+          if (sdram_done_now) begin
             if (wb_split && wb_qmask != 4'd0) begin
               state <= SDRAM_WB_FLUSH_ISSUE;
             end else begin
@@ -1372,7 +1487,7 @@ module ki_memory_bridge (
             rmw_read[{rmw_index[1], 5'd0} +: 32] <= sdram_read_data;
             rmw_index <= rmw_index + 2'd2;
           end
-          if (sdram_done) state <= SDRAM_WRITE_RMW_ISSUE;
+          if (sdram_done_now) state <= SDRAM_WRITE_RMW_ISSUE;
         end
 
         // The write half: every byte of every word, so nothing depends on the
@@ -1389,7 +1504,7 @@ module ki_memory_bridge (
         end
 
         SDRAM_WRITE_WAIT: begin
-          if (sdram_done) begin
+          if (sdram_done_now) begin
             cpu_pending <= 1'b0;
             cpu_done <= 1'b1;
             debug_write_count <= debug_write_count + 1'b1;
@@ -1426,8 +1541,8 @@ module ki_memory_bridge (
 
         FB_READ_WAIT: begin
           if (operation_req64) begin
-            cpu_cache_data <= fb_q;
-            cpu_cache_data_ready <= 1'b1;
+            cpu_cache_data_q <= fb_q;
+            cpu_cache_data_ready_q <= 1'b1;
             cpu_data_read <= fb_q;
           end else begin
             // A 32-bit access takes the half its address selects, matching

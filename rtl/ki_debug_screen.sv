@@ -62,11 +62,12 @@ module ki_debug_screen (
   // ever happens WITHOUT a RAM -> boot ROM transition.
   // 0 status, 1 trace, 2 performance census.
   input  wire   [1:0] page,
-  // Per-frame stall census from ki_cpu_core; ten 16-bit fields, each counting
-  // units of 256 CPU cycles. See debug_perf_bus there for the field order.
+  // Per-game-frame stall census from ki_cpu_core, page flip to page flip;
+  // fourteen 16-bit fields. See debug_perf_bus there for the field order.
   input  wire [223:0] perf,
-  // The worst frame since the last clear, same ten fields. Gameplay slowdowns
-  // are occasional, so the live row usually shows a good frame.
+  // The slowest game frame since the last clear, same fourteen fields.
+  // Gameplay slowdowns are occasional, so the live row usually shows a good
+  // frame.
   input  wire [223:0] perf_worst,
   input  wire [271:0] perf_prof,
   // Which coarse bucket F0..F7 cover. Latched with perf_prof in the CPU, so
@@ -211,10 +212,10 @@ module ki_debug_screen (
   // inside the hottest coarse bucket, because 32 KB is too wide to name a
   // loop.
   //
-  // This is the SAME frame as the Perf page's worst block - the one that lost
-  // the most cycles outside stage 4 since the last Clear - so SUM(B)/CY is a
-  // real check. It is the worst frame of ANY scene since Clear: on KI2 that
-  // is the FMV player if a video played, so Clear during the scene you want.
+  // This is the SAME frame as the Perf page's second block - the slowest game
+  // frame since the last Clear - so SUM(B)/CY is a real check. It is the
+  // slowest frame of ANY scene since Clear, so Clear during the scene you
+  // want.
   function automatic [7:0] prof_char(
     input logic  [3:0] row,
     input logic  [4:0] column,
@@ -263,10 +264,11 @@ module ki_debug_screen (
     end
   endfunction
 
-  // Where the CPU's cycles went in the frame just finished. Effective speed is
-  // clock x IPC, and this is the IPC half. CY is the frame length, so every
-  // other field is read against it - a full 100 MHz frame is about 1970 hex
-  // units of 256 cycles.
+  // Where the CPU's cycles went in the game frame just finished, from one page
+  // flip to the next. Effective speed is clock x IPC, and this is the IPC
+  // half. CY is the frame length, so every other field is read against it -
+  // one vblank at 100 MHz is about 19DE hex units of 256 cycles, a game frame
+  // at 30 fps twice that, and CY FFFF is a window that closed with no flip.
   function automatic [7:0] perf_char(
     input logic  [3:0] row,
     input logic  [4:0] column,
@@ -277,7 +279,7 @@ module ki_debug_screen (
     logic  [3:0] r;
     integer i;
     begin
-      // Rows 8-13 repeat the same six rows for the worst frame, so one
+      // Rows 8-13 repeat the same six rows for the slowest frame, so one
       // renderer serves both blocks and they cannot drift apart.
       r = (row >= 4'd8) ? (row - 4'd7) : row;
       for (i = 0; i < 14; i = i + 1)
@@ -311,8 +313,8 @@ module ki_debug_screen (
         // from SDRAM like everything else. MC - LM is the DRAM region's
         // share. A count, not cycles, like MC.
         //
-        // S3 has no field here; row 14 shows it for both frames. Its bit
-        // still feeds nm_cnt and the CY - RT identity.
+        // S3 has no field here; row 14 shows it for both frames. It is still
+        // a term of the CY - RT identity.
         4: perf_char = (column < 5'd8) ? perf_field(column, 5'd0, "M", "D", f[8])
                                        : perf_field(column, 5'd8, "L", "M", f[12]);
         // S1: stage 1 waiting for an instruction (an instruction cache miss).
@@ -336,14 +338,13 @@ module ki_debug_screen (
                                        : perf_field(column, 5'd8, "M", "C", f[2]);
         default: perf_char = " ";
       endcase
-      // Row 7 labels the second block, and the field its frame was chosen by;
-      // row 0 keeps the page title.
+      // Row 7 labels the second block; row 0 keeps the page title.
       // Columns 0-7 of row 7 are the only free field on a page whose every
       // other row is full (rows 1-6 and 8-13 carry two fields each, row 14
       // carries S3, and there is no third column because H_VISIBLE 320 shows
       // only columns 0-19). The field goes at the LEFT so it lines up with the
       // live block's own first column directly above it, and the header sits
-      // to its right rather than the field sitting under the word WORST and
+      // to its right rather than the field sitting under the word SLOWEST and
       // being read as part of it.
       //
       // DI - the LIVE frame's recoverable load bubbles, in units of 256 cycles
@@ -353,17 +354,17 @@ module ki_debug_screen (
       // 2.01 in a dependent chain, measured on the board; LOAD_INTERLOCK
       // (cpu.vhd) gives this core the same behavior. DI counts only a bubble
       // taken that need not have been, and should read about zero. It is the
-      // LIVE frame on purpose: the worst-NM frame can be an outlier (an FMV
-      // frame, an idle frame), and the question is what a TYPICAL fight frame
-      // would gain. DI <= LB always.
+      // LIVE frame on purpose: the slowest frame can be an outlier (a video,
+      // a pause), and the question is what a TYPICAL fight frame would gain.
+      // DI <= LB always.
       if (row == 4'd7) begin
         if (column < 5'd8) begin
           perf_char = perf_field(column, 5'd0, "D", "I", f[13]);
         end else begin
           case (column)
-            8: perf_char="W"; 9: perf_char="O"; 10: perf_char="R";
-            11: perf_char="S"; 12: perf_char="T";
-            14: perf_char="N"; 15: perf_char="M";
+            8: perf_char="S"; 9: perf_char="L"; 10: perf_char="O";
+            11: perf_char="W"; 12: perf_char="E"; 13: perf_char="S";
+            14: perf_char="T";
             default: perf_char=" ";
           endcase
         end
@@ -380,9 +381,8 @@ module ki_debug_screen (
       // frame.
       //
       // It shows BOTH frames rather than following the block layout, because
-      // nm_cnt - which picks the worst frame - is MD or S3 or S1 or LB, so
-      // the worst block is where an S3 spike would appear first and the
-      // comparison against the live frame is the point. 3L is live, 3W worst.
+      // the comparison against the live frame is the point. 3L is live, 3W
+      // the slowest frame.
       // It is the one row reading p and w at once, hence the direct indexing
       // instead of f[].
       if (row == 4'd14) begin

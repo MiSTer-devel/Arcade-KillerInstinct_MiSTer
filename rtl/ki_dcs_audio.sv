@@ -27,6 +27,10 @@ module ki_dcs_audio #(
 ) (
     input  wire logic        clk,
     input  wire logic        rst,
+    // While high, the board stands still: the DSP takes no step and the DAC
+    // takes no slot, so the program and its sample clock stop together and
+    // resume where they were. The output holds its last sample.
+    input  wire logic        pause,
     input  wire logic        host_reset,
     input  wire logic        host_cmd_wr,
     input  wire logic [15:0] host_cmd_data,
@@ -75,12 +79,16 @@ module ki_dcs_audio #(
     localparam logic [DCS_PHASE_W:0] DCS_PHASE_MOD = CLK_HZ;
     logic [DCS_PHASE_W-1:0] dcs_phase;
     logic [DCS_PHASE_W:0] dcs_phase_sum;
-    wire dcs_ce = (dcs_phase_sum >= DCS_PHASE_MOD);
+    wire dcs_ce = !pause && (dcs_phase_sum >= DCS_PHASE_MOD);
 
+    // Both cadences hold their phase through a pause, so the DSP and the DAC
+    // pick up exactly where they stopped relative to each other.
     always_comb dcs_phase_sum = {1'b0, dcs_phase} + DCS_PHASE_STEP;
     always_ff @(posedge clk) begin
         if (rst)
             dcs_phase <= '0;
+        else if (pause)
+            dcs_phase <= dcs_phase;
         else if (dcs_ce)
             dcs_phase <= dcs_phase_sum - DCS_PHASE_MOD;
         else
@@ -89,10 +97,12 @@ module ki_dcs_audio #(
 
     // DCS Audio 2K feeds the mono DAC at 31.25 kHz.
     logic [$clog2(DAC_DIV)-1:0] dac_div_ctr;
-    wire dac_slot_ce = (dac_div_ctr == DAC_DIV-1);
+    wire dac_slot_ce = !pause && (dac_div_ctr == DAC_DIV-1);
     always_ff @(posedge clk) begin
         if (rst)
             dac_div_ctr <= '0;
+        else if (pause)
+            dac_div_ctr <= dac_div_ctr;
         else if (dac_slot_ce)
             dac_div_ctr <= '0;
         else

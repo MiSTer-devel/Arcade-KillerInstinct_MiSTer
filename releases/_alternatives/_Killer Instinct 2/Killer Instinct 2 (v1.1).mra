@@ -1,6 +1,6 @@
 <misterromdescription>
   <name>Killer Instinct 2 (v1.1)</name>
-  <mratimestamp>20260924</mratimestamp>
+  <mratimestamp>20261007</mratimestamp>
   <mameversion>0287</mameversion>
   <setname>kinst2</setname>
   <year>1996</year>
@@ -8,7 +8,7 @@
   <category>Fighter</category>
   <rbf>KillerInstinct</rbf>
 
-  <buttons names="High Quick,High Medium,High Fierce,Low Quick,Low Medium,Low Fierce,Start,Coin,Service,Test,-,-,-,-,-,-" default="A,B,X,Y,R,L,Start,Select"/>
+  <buttons names="High Quick,High Medium,High Fierce,Low Quick,Low Medium,Low Fierce,Start,Coin,Service,Test,Pause,-,-,-,-,-" default="A,B,X,Y,R,L,Start,Select"/>
 
   <switches default="FF,FF">
     <dip bits="0,1" name="Blood Level" ids="None,Low,Medium,High"/>

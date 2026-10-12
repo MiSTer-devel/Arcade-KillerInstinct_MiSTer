@@ -50,6 +50,10 @@ entity ki_cpu_core is
       clk93          : in  std_logic;
       reset          : in  std_logic;
       irq            : in  std_logic_vector(1 downto 0);
+      -- The system is paused. Synchronised into clk93, it stops Count and
+      -- keeps the stall watchdog from flagging a CPU the memory bridge is
+      -- holding on purpose; see ki_memory_bridge's cpu_hold.
+      pause          : in  std_logic := '0';
 
       mem_request    : out std_logic;
       mem_rnw        : out std_logic;
@@ -101,21 +105,27 @@ entity ki_cpu_core is
       -- Board-side freeze request; see cpu.vhd's port of the same name.
       debug_trace_trigger     : in  std_logic;
 
-      -- Per-frame stall census, built from cpu.vhd's debug_perf_events.
+      -- Per-game-frame stall census, built from cpu.vhd's debug_perf_events.
       --
       -- Effective speed is clock x IPC. These answer the IPC half: of the
-      -- cycles in a frame, how many retired an instruction and how many went
-      -- to each kind of stall.
+      -- cycles in a game frame, how many retired an instruction and how many
+      -- went to each kind of stall.
       --
-      -- perf_frame is a free-running frame strobe from the video domain; it is
-      -- synchronised and edge-detected here. On each edge the counters are
-      -- latched and cleared, so the exported values describe ONE frame and are
-      -- stable for the whole of the next one - which is what makes them safe
-      -- to sample from another clock domain without a handshake.
+      -- perf_flip changes level on every page flip, the game's switch to a
+      -- newly drawn frame; it is synchronised here, and each change closes a
+      -- window: the counters are latched and cleared, so the exported values
+      -- describe ONE game frame and are stable for the whole of the next one -
+      -- which is what makes them safe to sample from another clock domain
+      -- without a handshake. A window is a whole game frame, however many
+      -- vblanks it took, including any wait for the vblank it flips at.
       --
-      -- Each field is 16 bits counting units of 256 cycles, saturating. A
-      -- 100 MHz frame is ~1.67M cycles, about 6510 units, so a full frame of
-      -- any single cause reads ~1970 hex.
+      -- A window also closes when CY saturates: 2^24 cycles with no flip,
+      -- about ten vblanks at 100 MHz. A scene that is not flipping still
+      -- updates the page, and reads CY FFFF.
+      --
+      -- Each field is 16 bits counting units of 256 cycles, saturating. One
+      -- vblank at 100 MHz is about 1.70M cycles, 19DE hex units, so a game
+      -- frame at 59 fps reads about 19DE and one at 30 fps twice that.
       --
       --   field 0 cycles           CY    6 other uncached load     UO
       --         1 retired          RT    7 stall4, cached          DC
@@ -133,13 +143,11 @@ entity ki_cpu_core is
       -- the page's two self-checks. UO holds the disk's data-port reads, so
       -- a frame waiting on the disk shows there.
       --
-      -- The WORST block keeps the frame that lost the most cycles OUTSIDE
-      -- stage 4 (MD + S3 + S1 + LB + FL), header WORST NM: a fight frame can
-      -- stall little on memory and still spend many of its cycles retiring
-      -- nothing.
-      perf_frame              : in  std_logic;
-      -- While high, hold the worst-frame capture cleared. Release it to start
-      -- a fresh capture window.
+      -- The second block keeps the slowest game frame since the last clear,
+      -- header SLOWEST: the longest window a flip both opened and closed.
+      perf_flip               : in  std_logic;
+      -- While high, hold the slowest-frame capture cleared. Release it to
+      -- start a fresh capture.
       perf_clear              : in  std_logic;
       -- Per-frame values from ki_memory_bridge. Stable for a whole frame, so
       -- two flops are enough to bring them over; the residual risk is a torn
@@ -147,11 +155,11 @@ entity ki_cpu_core is
       perf_bridge_out         : in  std_logic_vector(15 downto 0);
       perf_bridge_burst       : in  std_logic_vector(15 downto 0);
       debug_perf_bus          : out std_logic_vector(223 downto 0) := (others => '0');
-      -- The single worst frame seen since the last clear. Gameplay slowdowns
+      -- The slowest game frame seen since the last clear. Gameplay slowdowns
       -- are occasional, so a photograph of the live values usually catches a
       -- good frame; this keeps the bad one. Every field comes from the SAME
       -- frame, so the row still reads as one coherent census rather than a set
-      -- of unrelated maxima. The header names the key.
+      -- of unrelated maxima.
       debug_perf_worst        : out std_logic_vector(223 downto 0) := (others => '0')
    );
 end entity;
@@ -163,6 +171,8 @@ architecture rtl of ki_cpu_core is
    signal reset_93_pipe  : std_logic_vector(1 downto 0) := (others => '1');
    signal irq_meta       : std_logic_vector(1 downto 0) := (others => '0');
    signal irq_sync       : std_logic_vector(1 downto 0) := (others => '0');
+   signal pause_meta     : std_logic := '0';
+   signal pause_sync     : std_logic := '0';
 
    -- Performance census. See debug_perf_bus in the port list.
    -- 0 CY, 1 RT, then one per debug_perf_events bit.
@@ -191,8 +201,8 @@ architecture rtl of ki_cpu_core is
    signal debug_retired_i : std_logic_vector(31 downto 0);
    signal prof_pc_i       : std_logic_vector(31 downto 0);
    signal prof_valid_i    : std_logic;
-   signal perf_frame_meta : std_logic_vector(2 downto 0) := (others => '0');
-   -- perf_clear comes from the OSD, so it crosses into clk93 like perf_frame
+   signal perf_flip_meta  : std_logic_vector(2 downto 0) := (others => '0');
+   -- perf_clear comes from the OSD, so it crosses into clk93 like perf_flip
    -- does. It is a manual toggle and a one-frame mis-sample would be
    -- harmless, but leaving one control synchronised and its neighbour not is
    -- the kind of inconsistency that reads as an oversight later.
@@ -217,10 +227,14 @@ begin
          reset_93_pipe <= (others => '1');
          irq_meta      <= (others => '0');
          irq_sync      <= (others => '0');
+         pause_meta    <= '0';
+         pause_sync    <= '0';
       elsif (rising_edge(clk93)) then
          reset_93_pipe <= reset_93_pipe(0) & '0';
          irq_meta      <= irq;
          irq_sync      <= irq_meta;
+         pause_meta    <= pause;
+         pause_sync    <= pause_meta;
       end if;
    end process;
 
@@ -267,7 +281,7 @@ begin
          DISABLE_DTLBMINI      => '0',
          ALECK64               => '1',
          irqRequest            => irq_sync,
-         cpuPaused             => '0',
+         cpuPaused             => pause_sync,
          error_instr           => errors(0),
          error_stall           => errors(1),
          error_FPU             => errors(2),
@@ -336,36 +350,35 @@ begin
    gperf : if DEBUG_TRACE /= 0 generate
       signal retired_prev : unsigned(31 downto 0) := (others => '0');
       signal retired_cnt  : unsigned(23 downto 0) := (others => '0');
+      -- The slowest frame's CY: the second block's key.
       signal worst_key    : unsigned(23 downto 0) := (others => '0');
-      -- Cycles lost outside stage 4 this frame: the worst block's key.
-      signal nm_cnt       : unsigned(23 downto 0) := (others => '0');
+      -- CY has reached 2^24 - 1: the window closes on the next clock.
+      -- Registered, so the window's end is two flops' function rather than a
+      -- 24-bit compare on a signal that fans out to every counter.
+      signal cy_full      : std_logic := '0';
+      -- A flip opened this window. Only such a window, closed by a flip, is
+      -- one game frame; one opened by reset or by a full CY started part way
+      -- through a frame.
+      signal win_flip     : std_logic := '0';
       signal prof_cnt     : t_prof := (others => (others => '0'));
       signal fine_cnt     : t_fine := (others => (others => '0'));
-      -- The PROF page and the Perf page's worst block latch the SAME frame,
-      -- on nm_cnt.
+      -- The PROF page and the Perf page's second block latch the SAME window:
+      -- the slowest game frame since the last clear, so SUM(B)/CY is a real
+      -- check rather than two pages describing two frames.
       --
-      -- A key of "retired MINUS one bucket" cannot pick that frame. A fixed
-      -- bucket is a game-specific assumption: KI1's wait loop is in bucket 0,
-      -- but KI2's hot region is bucket 5. The HOTTEST bucket is no better: a
-      -- drawing loop and a wait loop can both sit inside one 32 KB bucket, so
-      -- that key reads near zero for a drawing frame and a waiting frame
-      -- alike. Concentration in a coarse bucket does not separate work from
-      -- waiting.
+      -- The frame rate is set by exactly these windows: the game shows a frame
+      -- at each flip, so the longest flip-to-flip window is the frame that
+      -- held the rate down. Its wait for the vblank it flips at, if any, is
+      -- inside it; the PROF page shows which code that time ran.
       --
-      -- Cycles LOST does. A spin retires at high IPC and stalls for nothing;
-      -- drawing loads and stores and misses. So nm_cnt selects the frame that
-      -- limits the rate, and sharing it with the Perf page means SUM(B)/CY is
-      -- a real check rather than two pages describing two frames.
-      --
-      -- It is the worst frame SINCE CLEAR, of ANY scene. On KI2 that is the
-      -- FMV player whenever a video has played since the Clear - a dependent-
-      -- load palette blitter at 0x8802C000. To profile a scene, Clear DURING
-      -- it.
+      -- It is the slowest frame SINCE CLEAR, of ANY scene: a video playing at
+      -- a lower rate than the fight around it wins. To measure a scene, Clear
+      -- DURING it.
       -- The hottest coarse bucket, tracked incrementally: one compare against
       -- the bucket being bumped, never a 9-way maximum, because this design is
       -- placement-bound at 100 MHz and a comparison tree here is not free.
-      -- Copied into fine_base when a worst frame is latched, so the fine map
-      -- follows the worst-TYPE frame rather than whichever vblank came last.
+      -- Copied into fine_base when a slowest frame is latched, so the fine map
+      -- follows the slowest type of frame rather than whichever came last.
       signal hot_val      : unsigned(23 downto 0) := (others => '0');
       signal hot_idx      : unsigned(2 downto 0)  := (others => '0');
       signal fine_base    : unsigned(2 downto 0)  := (others => '0');
@@ -391,18 +404,18 @@ begin
    -- read against LB, so it has LB's units of 256. A frame has far more of
    -- them than a raw 16-bit count can hold.
    --
-   -- MC (2) and LM (12) are COUNTS, not cycles, and small: a frame's misses
-   -- fit well inside 16 bits. Scaling them by 256 like a cycle counter would
-   -- throw away the resolution that matters, so these two export their LOW
-   -- bits and the page shows the count itself.
-   --
-   -- They saturate at 65,535 rather than wrapping only because bump() stops at
-   -- 24 bits; a frame with more than 65,535 misses would read the low 16 bits
-   -- of the true count and lie. That is the assumption being made.
+   -- MC (2) and LM (12) are COUNTS, not cycles. Scaling them by 256 like a
+   -- cycle counter would throw away the resolution that matters, so these two
+   -- export their LOW bits and the page shows the count itself, up to 65,535.
+   -- A game frame of several vblanks can miss more often than that, so a
+   -- larger count reads FFFF rather than its low 16 bits.
    function perf_slice(v : unsigned(23 downto 0); idx : integer)
       return std_logic_vector is
    begin
       if (idx = 2 or idx = 12) then
+         if (v(23 downto 16) /= 0) then
+            return x"FFFF";
+         end if;
          return std_logic_vector(v(15 downto 0));
       end if;
       return std_logic_vector(v(23 downto 8));
@@ -421,19 +434,21 @@ begin
       fine_idx  <= to_integer(prof_pc_u(14 downto 12));
 
       process (clk93)
+         variable flip : std_logic;
          variable tick : std_logic;
          -- synthesis translate_off
          variable fsum : unsigned(27 downto 0);
          -- synthesis translate_on
       begin
          if (rising_edge(clk93)) then
+            flip := perf_flip_meta(1) xor perf_flip_meta(2);
+            tick := flip or cy_full;
             -- synthesis translate_off
-            -- THE PROF INVARIANT, checked at EVERY frame end, not just at a
-            -- latch. Within a frame the fine map counts only the bucket
-            -- fine_base names and fine_base moves only at a frame end, so the
+            -- THE PROF INVARIANT, checked at EVERY window end, not just at a
+            -- latch. Within a window the fine map counts only the bucket
+            -- fine_base names and fine_base moves only at a window end, so the
             -- fine bins must sum to that bucket's coarse count EXACTLY.
-            if (perf_frame_meta(1) = '1' and perf_frame_meta(2) = '0' and
-                reset_93_pipe(1) = '0') then
+            if (tick = '1' and reset_93_pipe(1) = '0') then
                fsum := (others => '0');
                for i in 0 to FINE_N - 1 loop
                   fsum := fsum + resize(fine_cnt(i), 28);
@@ -452,9 +467,8 @@ begin
                   severity error;
             end if;
             -- synthesis translate_on
-            perf_frame_meta <= perf_frame_meta(1 downto 0) & perf_frame;
+            perf_flip_meta  <= perf_flip_meta(1 downto 0) & perf_flip;
             perf_clear_meta <= perf_clear_meta(0) & perf_clear;
-            tick := perf_frame_meta(1) and (not perf_frame_meta(2));
 
             if (reset_93_pipe(1) = '1') then
                perf_cnt         <= (others => (others => '0'));
@@ -465,34 +479,35 @@ begin
                fine_base        <= (others => '0');
                debug_perf_prof  <= (others => '0');
                debug_prof_fine  <= (others => '0');
-               nm_cnt           <= (others => '0');
                retired_prev     <= (others => '0');
                retired_cnt      <= (others => '0');
                worst_key        <= (others => '0');
                debug_perf_worst <= (others => '0');
+               cy_full          <= '0';
+               win_flip         <= '0';
             elsif (tick = '1') then
-               -- Latch the frame just finished, then restart the window.
+               -- Latch the window just closed, then open the next.
                for i in 0 to PERF_N - 1 loop
                   debug_perf_bus(i * 16 + 15 downto i * 16)
                      <= perf_slice(perf_cnt(i), i);
                end loop;
                debug_perf_bus(31 downto 16)
                   <= std_logic_vector(retired_cnt(23 downto 8));
-               -- Keep the frame that lost the most cycles outside stage 4 -
-               -- for BOTH pages, so they describe one frame. Compared before
-               -- the counters are cleared.
+               -- Keep the slowest game frame - for BOTH pages, so they
+               -- describe one frame. Compared before the counters are
+               -- cleared. A window that reached a full CY is not one, even if
+               -- a flip closes it on that same clock.
                --
-               -- PROF latches UNCONDITIONALLY with the Perf worst block, not
+               -- PROF latches UNCONDITIONALLY with the Perf slowest block, not
                -- only when hot_idx = fine_base, i.e. only when the fine map is
-               -- already aimed at this frame's own hottest bucket. When the
-               -- vblanks of a game frame have different hot buckets, such a
-               -- gate can drop every frame. A guard that silently discards
-               -- the measurement is worse than a measurement that is
-               -- sometimes mis-aimed.
+               -- already aimed at this frame's own hottest bucket. When frames
+               -- alternate between hot buckets, such a gate can drop every
+               -- frame. A guard that silently discards the measurement is
+               -- worse than a measurement that is sometimes mis-aimed.
                --
                -- The aim follows the last LATCHED frame rather than the last
-               -- frame, so it converges on the worst-type frame even when
-               -- vblanks alternate. The header names the bucket the fine
+               -- frame, so it converges on the slowest type of frame even when
+               -- frames alternate. The header names the bucket the fine
                -- counts were taken in, so SUM(F) against that bucket still
                -- shows whether a given capture was aimed: equal means aimed,
                -- anything else means the fine map describes another bucket.
@@ -501,8 +516,9 @@ begin
                   debug_perf_prof  <= (others => '0');
                   debug_perf_worst <= (others => '0');
                   worst_key        <= (others => '0');
-               elsif (nm_cnt > worst_key) then
-                  worst_key <= nm_cnt;
+               elsif (flip = '1' and cy_full = '0' and win_flip = '1' and
+                      perf_cnt(0) > worst_key) then
+                  worst_key <= perf_cnt(0);
                   -- The base the fine counts were binned under, captured
                   -- before it moves.
                   debug_prof_fine <= std_logic_vector(fine_base);
@@ -523,22 +539,22 @@ begin
                      <= std_logic_vector(retired_cnt(23 downto 8));
                end if;
 
+               win_flip     <= flip;
+               cy_full      <= '0';
                perf_cnt     <= (others => (others => '0'));
                prof_cnt     <= (others => (others => '0'));
                fine_cnt     <= (others => (others => '0'));
                hot_val      <= (others => '0');
-               nm_cnt       <= (others => '0');
                retired_cnt  <= (others => '0');
                retired_prev <= unsigned(debug_retired_i);
             else
                perf_cnt(0) <= bump(perf_cnt(0), '1');
+               if (perf_cnt(0) = x"FFFFFE") then
+                  cy_full <= '1';
+               end if;
                for b in 0 to 11 loop
                   perf_cnt(b + 2) <= bump(perf_cnt(b + 2), perf_events(b));
                end loop;
-               -- MD, S3, S1, LB: mutually exclusive, so an OR counts their
-               -- sum. FL is not on the bus.
-               nm_cnt <= bump(nm_cnt, perf_events(6) or perf_events(7) or
-                                      perf_events(8) or perf_events(9));
                -- Retired is a free-running total in cpu.vhd, so difference it
                -- against the value at the start of this window.
                retired_cnt <= resize(unsigned(debug_retired_i) - retired_prev, 24);

@@ -3,7 +3,7 @@
 
 // Burst-capable 16-bit SDRAM controller for Killer Instinct.
 //
-// Two design choices provide the required throughput:
+// Four design choices provide the required throughput:
 //
 // 1. ADDRESS DECOMPOSITION. The controller uses col = addr[9:1],
 //    row = addr[22:10], bank = addr[24:23], so 512
@@ -19,6 +19,14 @@
 //    out tRP and issues ACTIVE from S_IDLE on the next clock, and a read
 //    releases on the edge that captures its last word. ki_sdram_adapter
 //    launches an arriving request directly and passes words straight through.
+//
+// 4. THE ROW CLOSES WHEN IDLE. With nothing pending and tRAS met, S_IDLE
+//    precharges every bank, so the next access to another row starts with
+//    ACTIVE instead of waiting out PRECHARGE and tRP first. Only one row is
+//    open at a time, across all four banks, so most accesses are to another
+//    row; one to the row just closed pays ACTIVE and tRCD instead of hitting
+//    it. A write has already waited out tWR in S_TURNAROUND before S_IDLE
+//    sees it.
 //
 // Writes burst up to 16 words. A write burst needs no streaming handshake
 // because the payload is presented all at once: `din` is 16 words wide - one
@@ -361,6 +369,15 @@ module ki_sdram_burst #(
             wait_cnt <= T_RCD - 4'd1;
             state <= S_RCD;
           end
+        end else if (open_valid && ras_ok) begin
+          // Nothing waiting: close the row now, so the next access to another
+          // row does not wait for it. A request arriving during tRP stays
+          // pending and is taken in S_IDLE after.
+          open_valid <= 1'b0;
+          cmd_d <= CMD_PRECHARGE;
+          a_d[10] <= 1'b1;             // all banks
+          wait_cnt <= T_RP - 4'd1;
+          state <= S_RP;
         end
       end
 
@@ -399,7 +416,7 @@ module ki_sdram_burst #(
         // the next edge. It saves the clock spent seeing zero.
         if ((beats_out == 0) || ((beats_out == 5'd1) && cas_take)) begin
           ready <= 1'b1;
-          state <= S_IDLE;               // row stays open
+          state <= S_IDLE;               // row open until S_IDLE closes it
         end
       end
 
@@ -419,7 +436,7 @@ module ki_sdram_burst #(
         wr_index <= wr_index + 1'b1;
         if (beats_left <= 1) begin
           wait_cnt <= T_WR;
-          state <= S_TURNAROUND;         // row stays open
+          state <= S_TURNAROUND;         // row open until S_IDLE closes it
         end else beats_left <= beats_left - 1'b1;
       end
 

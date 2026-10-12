@@ -122,6 +122,8 @@ localparam CONF_STR = {
 	"P1O1,Aspect Ratio,Original,Full Screen;",
 	"P1O2,Video Timing,Native,60Hz CRT;",
 	"-;",
+	"O8,OSD Pause,Off,On;",
+	"-;",
 	"DIP;",
 	"-;",
 `ifdef KI_DEBUG_BUILD
@@ -133,7 +135,7 @@ localparam CONF_STR = {
 	"-;",
 `endif
 	"R0,Reset;",
-	"J1,High Quick,High Medium,High Fierce,Low Quick,Low Medium,Low Fierce,Start,Coin,Service,Test;",
+	"J1,High Quick,High Medium,High Fierce,Low Quick,Low Medium,Low Fierce,Start,Coin,Service,Test,Pause;",
 	"V,1.59"
 };
 
@@ -471,19 +473,21 @@ assign video_max_v_count = crt_60hz ? CRT_V_TOTAL-1 : native_max_v_count;
 //
 // MiSTer joystick bits are right/left/down/up in 3:0, then the CONF_STR J1
 // order from bit 4: High Quick, High Medium, High Fierce, Low Quick,
-// Low Medium, Low Fierce, Start, Coin, Service, Test.
+// Low Medium, Low Fierce, Start, Coin, Service, Test, Pause.
 //
 // Merge the arcade keyboard controls with the matching MiSTer joystick bits
 // before translating them to the board's active-low ports.
 wire [12:0] keyboard_p1;
 wire [12:0] keyboard_p2;
+wire        keyboard_pause;
 
 ki_keyboard keyboard
 (
 	.clk_i(clk_core),
 	.ps2_key_i(ps2_key),
 	.p1_o(keyboard_p1),
-	.p2_o(keyboard_p2)
+	.p2_o(keyboard_p2),
+	.pause_o(keyboard_pause)
 );
 
 wire [12:0] controls_p1 = joystick_0[12:0] | keyboard_p1;
@@ -534,6 +538,24 @@ wire [31:0] input_p2 = {
 wire test_pressed = joystick_0[13] | joystick_1[13];
 wire [15:0] dip_switches_live =
 	dip_switches & {~test_pressed, 15'h7fff};
+
+// Pause: the game stands still while the OSD is open with OSD Pause on, and
+// from one press of P or a pad's Pause button to the next. The memory bridge
+// starts no CPU request, so the CPU stops at its next miss or I/O access;
+// Count stops with it, so the game's own frame timing sees no time pass; and
+// the sound board stops in step. Scanout carries on, so the frame the game
+// last flipped to stays on screen. ki_pause decides when.
+wire core_pause;
+
+ki_pause pause_control
+(
+	.clk(clk_core),
+	.reset(cpu_reset),
+	.osd_open(OSD_STATUS),
+	.osd_pause(status[8]),
+	.button(keyboard_pause | joystick_0[14] | joystick_1[14]),
+	.pause(core_pause)
+);
 
 wire [31:0] io_read_data;
 wire io_done;
@@ -622,9 +644,10 @@ reg [31:0] debug_cpu_ret_count_meta = 32'h0, debug_cpu_ret_count_sync = 32'h0;
 reg [31:0] debug_cpu_pc_meta = 32'h0000_0000;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
 reg [31:0] debug_cpu_pc_sync = 32'h0000_0000;
-// Per-frame stall census. ki_cpu_core latches these once per frame and holds
-// them for the whole of the next one, so they are already stable when this
-// domain samples them - the two flops are for metastability, not coherence.
+// Per-game-frame stall census. ki_cpu_core latches these once per game frame
+// and holds them for the whole of the next one, so they are already stable
+// when this domain samples them - the two flops are for metastability, not
+// coherence.
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
 reg [223:0] debug_perf_bus_meta = 224'd0;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
@@ -1023,12 +1046,24 @@ always @(posedge clk_core) begin
 	end
 end
 
+// Changes level at every page flip - a change of framebuffer_base, the event
+// ki_fps_overlay counts. ki_cpu_core's Perf census closes a game frame at each
+// change.
+reg        perf_flip = 1'b0;
+reg [18:0] perf_flip_base = 19'd0;
+always @(posedge clk_core) begin
+	perf_flip_base <= framebuffer_base;
+	if(!core_reset && framebuffer_base != perf_flip_base)
+		perf_flip <= ~perf_flip;
+end
+
 ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 (
 	.clk1x(clk_core),
 	.clk93(clk_cpu),
 	.reset(cpu_reset),
 	.irq(cpu_irq),
+	.pause(core_pause),
 	.mem_request(cpu_mem_request),
 	.mem_rnw(cpu_mem_rnw),
 	.mem_address(cpu_mem_address),
@@ -1047,7 +1082,7 @@ ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 	.errors(cpu_errors),
 	.debug_fetch_pc(debug_cpu_pc),
 	.debug_retired(debug_cpu_retired),
-	.perf_frame(frame_start),
+	.perf_flip(perf_flip),
 	.perf_clear(status[7]),
 	.perf_bridge_out(bridge_perf_out),
 	.perf_bridge_burst(bridge_perf_burst),
@@ -1117,6 +1152,7 @@ ki_memory_bridge memory_bridge
 	.ddr_clk(clk_ddr),
 	.reset(shell_reset),
 	.cpu_request(cpu_mem_request),
+	.cpu_hold(core_pause),
 	.cpu_rnw(cpu_mem_rnw),
 	.cpu_address(cpu_mem_address),
 	.cpu_req64(cpu_mem_req64),
@@ -1357,6 +1393,7 @@ ki_dcs_audio dcs_audio_board
 (
 	.clk(clk_core),
 	.rst(shell_reset),
+	.pause(core_pause),
 	.host_reset(dcs_host_reset),
 	.host_cmd_wr(sound_data_strobe),
 	.host_cmd_data(sound_data[15:0]),

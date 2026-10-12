@@ -6,7 +6,9 @@ module ki_keyboard
 	input             clk_i,
 	input      [10:0] ps2_key_i,
 	output reg [12:0] p1_o = 13'd0,
-	output reg [12:0] p2_o = 13'd0
+	output reg [12:0] p2_o = 13'd0,
+	// P, held: the pause button. See ki_pause.
+	output reg        pause_o = 1'b0
 );
 
 // ps2_key_i contains Set-2 scan codes. Bit 10 toggles for each make/break
@@ -45,6 +47,8 @@ always @(posedge clk_i) begin
 			9'h01d: p2_o[7] <= ps2_key_i[9]; // W: P2 Button 4
 			9'h024: p2_o[8] <= ps2_key_i[9]; // E: P2 Button 5
 			9'h00d: p2_o[9] <= ps2_key_i[9]; // Tab: P2 Button 6
+
+			9'h04d: pause_o <= ps2_key_i[9]; // P: Pause
 		endcase
 	end
 end

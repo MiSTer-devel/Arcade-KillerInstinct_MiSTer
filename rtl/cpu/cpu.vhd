@@ -570,6 +570,8 @@ architecture arch of cpu is
    signal writefifo_Empty              : std_logic;
    signal writefifo_Full               : std_logic;
    signal writefifo_wr_accept          : std_logic;
+   signal writefifo_bypass             : std_logic;
+   signal writefifo_fifo_wr            : std_logic;
    signal writefifo_rd_accept          : std_logic;
    signal writefifo_schedule_ready     : std_logic;
    signal writefifo_block              : std_logic;
@@ -638,7 +640,10 @@ architecture arch of cpu is
    --     edge the completion enters the FIFO, and clk93 copies it on the
    --     edge it takes that completion - which is also the edge clk1x's next
    --     line fetch waits for (resp_fifo_wempty);
-   --   - a fill's beats are in the cache a clk1x cycle before mem_done.
+   --   - a fill's last beat is written no later than mem_done, and clk93
+   --     reads it no sooner than the next clk1x edge: the instruction cache
+   --     a cycle after the completion's take, the data cache through
+   --     datacache_fill_due when its access is to that qword.
    signal write_cdc_req_in_1x          : std_logic;
    signal write_cdc_ack_in_93          : std_logic;
    signal wb_line_done_in_93           : std_logic;
@@ -689,6 +694,8 @@ architecture arch of cpu is
    signal response_cdc_deliver_93      : std_logic := '0';
    -- The data cache's own completion; see bit 106 above. Its ram_done.
    signal datacache_fill_done          : std_logic := '0';
+   signal datacache_fill_due           : std_logic := '0';
+   signal datacache_fill_last          : std_logic;
 
    -- Independent clk93-domain ownership scoreboard. The main transaction
    -- FIFO carries a sequence tag to clk1x and back; this queue records what
@@ -1844,10 +1851,8 @@ begin
 
    -- LM (bit 10) is the SRAM-region share of MC. It is APPENDED rather than
    -- put in S3's slot. Row 14 of the Perf page shows S3 directly for both
-   -- frames. S3's bit is also OR'd into ki_cpu_core's nm_cnt, which selects
-   -- the worst frame, and it is a term of the
-   -- CY - RT = S4 + MD + S3 + S1 + LB identity. Repurposing it would corrupt
-   -- both.
+   -- frames, and it is a term of the CY - RT = S4 + MD + S3 + S1 + LB
+   -- identity. Repurposing it would corrupt both.
    debug_perf_events <= perf_ld_indep &                   -- 11 DI
                         datacache_perf_miss_low &         -- 10 LM
                         perf_lost_lb &                    -- 9 LB
@@ -1889,7 +1894,8 @@ begin
          write_cdc_ack_sync_93 <= write_cdc_ack_meta_93;
          mem_finished_instr       <= '0';
          mem_finished_read        <= '0';
-         datacache_fill_done      <= '0';
+         datacache_fill_done      <= datacache_fill_due;
+         datacache_fill_due       <= '0';
          datacache_ra_done        <= '0';
          
          if (reset_93 = '1') then
@@ -1989,9 +1995,15 @@ begin
                write_cdc_req_93  <= not write_cdc_req_93;
                write_cdc_busy_93 <= '1';
                writefifo_Rd <= '1';
+            elsif (writefifo_bypass = '1') then
+               write_cdc_data_93 <= writefifo_Din;
+               write_cdc_req_93  <= not write_cdc_req_93;
+               write_cdc_busy_93 <= '1';
             end if;
          
-            if (writefifo_wr_accept = '1' and writefifo_rd_accept = '0') then
+            -- The FIFO's own occupancy: a bypassed request never enters it.
+            if (writefifo_wr_accept = '1' and writefifo_bypass = '0' and
+                writefifo_rd_accept = '0') then
                writefifo_cnt <= writefifo_cnt + 1;
             end if;
             if (writefifo_rd_accept = '1' and writefifo_wr_accept = '0') then
@@ -2258,11 +2270,10 @@ begin
             -- register the load-aligned copy on the next cycle, and only then
             -- pulse, which keeps completion, transaction type and data atomic
             -- across the boundary. A CACHE fill's data went into the cache as
-            -- beats in clk1x - the last one a clk1x cycle BEFORE mem_done, so
-            -- it is long written by the time this sees the completion at all -
-            -- and the completion itself carries nothing. Those pulse on the
-            -- cycle they are taken instead of two later, which is two CPU
-            -- cycles off the return path of every demand miss.
+            -- beats in clk1x - the last one no later than mem_done - and the
+            -- completion itself carries nothing. Those pulse on the cycle they
+            -- are taken, or the one after for a data cache fill whose access
+            -- is to the line's last qword (below), instead of two later.
             if (response_cdc_deliver_93 = '1') then
                mem_finished_read       <= '1';
                response_cdc_deliver_93 <= '0';
@@ -2291,10 +2302,21 @@ begin
                      -- edge and therefore valid in the cycle stage 1 reads it.
                      mem_finished_instr <= '1';
                   elsif (resp_fifo_dout(106) = '1') then
-                     -- A data cache fill: beats in clk1x, the last one a
-                     -- clk1x cycle BEFORE mem_done, so it is long written by
-                     -- the time this sees the completion. Its ram_done.
-                     datacache_fill_done <= '1';
+                     -- A data cache fill: beats in clk1x, the last one no
+                     -- later than mem_done - on its own clock, for an SDRAM
+                     -- read. Its ram_done. FILL reads or writes its access's
+                     -- qword through port b on the edge ram_done arrives,
+                     -- half a clk1x cycle after port a wrote the last beat,
+                     -- and a dual-clock M10K's access to an address the
+                     -- other port is writing is undefined until the writing
+                     -- clock's next edge. Only the last qword can be that
+                     -- address, so a fill whose access is to it waits a
+                     -- cycle.
+                     if (datacache_fill_last = '1') then
+                        datacache_fill_due <= '1';
+                     else
+                        datacache_fill_done <= '1';
+                     end if;
                   else
                      -- An uncached stage-4 read, the one completion whose
                      -- data this side still has to rotate. Two more cycles.
@@ -2319,7 +2341,7 @@ begin
       clk       => clk93,
       reset     => reset_93,  
       Din       => writefifo_Din,     
-      Wr        => writefifo_wr,      
+      Wr        => writefifo_fifo_wr, 
       Full      => writefifo_Full,
       Dout      => writefifo_Dout,    
       Rd        => writefifo_Rd,      
@@ -2335,6 +2357,18 @@ begin
    writefifo_wr <= writefifo_issue_pending;
 
    writefifo_rd_accept <= writefifo_Rd and not writefifo_Empty;
+   -- A request with nothing queued ahead of it and the mailbox free goes
+   -- straight into the mailbox on the edge the FIFO would have taken it, a
+   -- clk93 cycle sooner than through the FIFO and out of it again - and,
+   -- with the clocks aligned, a whole clk1x cycle sooner on the other side.
+   -- Order is kept: Empty falls on the edge that writes the FIFO, so while
+   -- it is set nothing is queued. The request is still ACCEPTED - the read
+   -- tags, the read-ahead's store report and the write-back's issue all see
+   -- it as before - it just never occupies the FIFO.
+   writefifo_bypass <= '1' when (writefifo_issue_pending = '1' and
+                                 writefifo_Empty = '1' and
+                                 write_cdc_busy_93 = '0') else '0';
+   writefifo_fifo_wr <= writefifo_wr and not writefifo_bypass;
    writefifo_wr_accept <= writefifo_wr and
                           (not writefifo_Full or writefifo_rd_accept);
    writefifo_schedule_ready <= '1' when
@@ -2579,113 +2613,101 @@ begin
                line_beat_1x <= line_beat_1x + 1;
             end if;
 
-            case (memstate) is
-               when MEMSTATE_IDLE => 
+            -- The previous transaction ends.
+            if (memstate = MEMSTATE_BUSY and mem_done = '1') then
+               -- resp_fifo_din / resp_fifo_wr are concurrent above, so
+               -- the response enters the FIFO on THIS edge. It cannot
+               -- be full: the bridge only started this transaction
+               -- because there was room for its answer.
+               memstate          <= MEMSTATE_IDLE;
+               if (memoryMuxStage4 = '1') then
+                  datacache_active <= '0';
+               else
+                  instrcache_active <= '0';
+               end if;
+               if (mem_line_write = '1') then
+                  mem_line_write  <= '0';
+               end if;
+               line_active_1x <= '0';
+            end if;
 
-                  -- resp_fifo_full: the bridge may start again as soon as
-                  -- there is somewhere to put the answer, not once the CPU
-                  -- has taken the last one.
-                  if (ce_1x = '1' and resp_fifo_full = '0') then
-                  
-                     -- resp_fifo_wempty additionally holds back a LINE fetch,
-                     -- which would overwrite line_fill_1x under a completion
-                     -- clk93 has not read yet.
-                     if (write_cdc_req_in_1x /= write_cdc_req_seen_1x and
-                         (write_cdc_data_93(117) = '0' or resp_fifo_wempty = '1')) then
+            -- The next request is taken in IDLE, or on the edge the previous
+            -- one ends, so a request already waiting in the mailbox loses no
+            -- clock to IDLE. resp_fifo_full: the bridge may start again as
+            -- soon as there is somewhere to put the answer, not once the CPU
+            -- has taken the last one; on the ending edge the FIFO must have
+            -- been empty, as it may take that transaction's answer now.
+            -- resp_fifo_wempty also holds back a LINE fetch, which would
+            -- overwrite line_fill_1x under a completion clk93 has not read
+            -- yet; one waits for IDLE.
+            if (ce_1x = '1' and write_cdc_req_in_1x /= write_cdc_req_seen_1x and
+                ((memstate = MEMSTATE_IDLE and resp_fifo_full = '0' and
+                  (write_cdc_data_93(117) = '0' or resp_fifo_wempty = '1')) or
+                 (memstate = MEMSTATE_BUSY and mem_done = '1' and
+                  resp_fifo_wempty = '1' and write_cdc_data_93(117) = '0'))) then
 
-                        write_cdc_req_seen_1x <= write_cdc_req_in_1x;
-                        write_cdc_ack_1x      <= write_cdc_req_in_1x;
-                        memstate          <= MEMSTATE_BUSY;
-                        mem_request       <= '1';
-                        memoryMuxStage4   <= '1';
-                        mem_dataWrite     <= write_cdc_data_93(63 downto 0);
-                        mem_address       <= unsigned(write_cdc_data_93(95 downto 64));
-                        mem_writeMask     <= write_cdc_data_93(103 downto 96);
-                        memoryMuxStage4   <= write_cdc_data_93(104);
-                        mem_rnw           <= write_cdc_data_93(105);
-                        mem_req64         <= write_cdc_data_93(106);
-                        memory_read_tag_1x <= write_cdc_data_93(115 downto 108);
-                        memory_read_address_1x <= write_cdc_data_93(95 downto 64);
-                        
-                        mem_size          <= "001";
-                        
-                        if (write_cdc_data_93(104) = '1' and write_cdc_data_93(107) = '1' and
-                            write_cdc_data_93(117) = '0') then
-                           -- The KI data cache fills a 32-byte line as four
-                           -- 64-bit DDR words (see cpu_datacache.vhd). Not its
-                           -- read-ahead: that is a line fetch, below.
-                           mem_size          <= "100";
-                           datacache_active  <= '1';
-                        end if;
-                        
-                        if (write_cdc_data_93(104) = '0' and write_cdc_data_93(107) = '1') then
-                           mem_size          <= "100";
-                           instrcache_active  <= '1';
-                        end if;
+               write_cdc_req_seen_1x <= write_cdc_req_in_1x;
+               write_cdc_ack_1x      <= write_cdc_req_in_1x;
+               memstate          <= MEMSTATE_BUSY;
+               mem_request       <= '1';
+               memoryMuxStage4   <= '1';
+               mem_dataWrite     <= write_cdc_data_93(63 downto 0);
+               mem_address       <= unsigned(write_cdc_data_93(95 downto 64));
+               mem_writeMask     <= write_cdc_data_93(103 downto 96);
+               memoryMuxStage4   <= write_cdc_data_93(104);
+               mem_rnw           <= write_cdc_data_93(105);
+               mem_req64         <= write_cdc_data_93(106);
+               memory_read_tag_1x <= write_cdc_data_93(115 downto 108);
+               memory_read_address_1x <= write_cdc_data_93(95 downto 64);
+               
+               mem_size          <= "001";
+               
+               if (write_cdc_data_93(104) = '1' and write_cdc_data_93(107) = '1' and
+                   write_cdc_data_93(117) = '0') then
+                  -- The KI data cache fills a 32-byte line as four
+                  -- 64-bit DDR words (see cpu_datacache.vhd). Not its
+                  -- read-ahead: that is a line fetch, below.
+                  mem_size          <= "100";
+                  datacache_active  <= '1';
+               end if;
+               
+               if (write_cdc_data_93(104) = '0' and write_cdc_data_93(107) = '1') then
+                  mem_size          <= "100";
+                  instrcache_active  <= '1';
+               end if;
 
-                        if (DCRA_ON and write_cdc_data_93(117) = '1') then
-                           -- The data cache's read-ahead: four qwords,
-                           -- captured above as they arrive. Not datacache_active
-                           -- - the D-cache would take the beats as a fill.
-                           mem_size          <= "100";
-                           line_active_1x  <= '1';
-                           line_beat_1x    <= "00";
-                        end if;
+               if (DCRA_ON and write_cdc_data_93(117) = '1') then
+                  -- The data cache's read-ahead: four qwords,
+                  -- captured above as they arrive. Not datacache_active
+                  -- - the D-cache would take the beats as a fill.
+                  mem_size          <= "100";
+                  line_active_1x  <= '1';
+                  line_beat_1x    <= "00";
+               end if;
 
-                        if (write_cdc_data_93(116) = '1') then
-                           -- One transaction for the whole dirty line. The
-                           -- four words are read straight out of the clk93
-                           -- staging queue, which holds them still until this
-                           -- cycle - the same bundled-data rule as this
-                           -- mailbox's own payload. mem_writeMask carries the
-                           -- qwords to write, set above from the payload.
-                           mem_line_write <= '1';
-                           mem_line_bytes <= wb_line_bytes_93;
-                           mem_line_data  <= datacache_wb_fifo(3)(63 downto 0) &
-                                             datacache_wb_fifo(2)(63 downto 0) &
-                                             datacache_wb_fifo(1)(63 downto 0) &
-                                             datacache_wb_fifo(0)(63 downto 0);
-                           -- Released HERE, not when the bridge acknowledges:
-                           -- the words are in mem_line_data from this edge, so
-                           -- the queue is free, and the cache is waiting on it
-                           -- to request its fill. Releasing on the ack instead
-                           -- would hold every dirty miss in the cache's own
-                           -- WRITEBACK states.
-                           wb_line_done_1x <= not wb_line_done_1x;
-                        end if;
+               if (write_cdc_data_93(116) = '1') then
+                  -- One transaction for the whole dirty line. The
+                  -- four words are read straight out of the clk93
+                  -- staging queue, which holds them still until this
+                  -- cycle - the same bundled-data rule as this
+                  -- mailbox's own payload. mem_writeMask carries the
+                  -- qwords to write, set above from the payload.
+                  mem_line_write <= '1';
+                  mem_line_bytes <= wb_line_bytes_93;
+                  mem_line_data  <= datacache_wb_fifo(3)(63 downto 0) &
+                                    datacache_wb_fifo(2)(63 downto 0) &
+                                    datacache_wb_fifo(1)(63 downto 0) &
+                                    datacache_wb_fifo(0)(63 downto 0);
+                  -- Released HERE, not when the bridge acknowledges:
+                  -- the words are in mem_line_data from this edge, so
+                  -- the queue is free, and the cache is waiting on it
+                  -- to request its fill. Releasing on the ack instead
+                  -- would hold every dirty miss in the cache's own
+                  -- WRITEBACK states.
+                  wb_line_done_1x <= not wb_line_done_1x;
+               end if;
 
-                     end if;
-
-                  end if;
-                  
-               when MEMSTATE_BUSY =>
-                  -- The FILL DATA the instruction cache is handed for that
-                  -- line - the last link before the opcode reaches decode.
-                  -- Captured in clk1x, the domain the bridge returns beats in
-                  -- (cpu_instrcache's fill path consumes them here), so the
-                  -- first beat is unambiguous. Sampling a clk1x
-                  -- ready pulse from clk93 would land on beat 0 or beat 1
-                  -- depending on phase, and a probe that reports a different
-                  -- word run to run is worse than none.
-                  --
-                  if (mem_done = '1') then
-                     -- resp_fifo_din / resp_fifo_wr are concurrent above, so
-                     -- the response enters the FIFO on THIS edge. It cannot
-                     -- be full: the bridge only started this transaction
-                     -- because there was room for its answer.
-                     memstate          <= MEMSTATE_IDLE;
-                     if (memoryMuxStage4 = '1') then
-                        datacache_active <= '0';
-                     else
-                        instrcache_active <= '0';
-                     end if;
-                     if (mem_line_write = '1') then
-                        mem_line_write  <= '0';
-                     end if;
-                     line_active_1x <= '0';
-                  end if;               
-                  
-            end case;
+            end if;
             
          end if;
       end if;
@@ -4968,6 +4990,7 @@ begin
       ram_active        => datacache_active,
       ram_grant         => rdram_granted2X,
       ram_done          => datacache_fill_done,
+      fill_last_q       => datacache_fill_last,
       ddr3_DOUT         => ddr3_DOUT,      
       ddr3_DOUT_READY   => ddr3_DOUT_READY,
       
@@ -5693,6 +5716,7 @@ begin
       executeNew              => executeNew,
       reset                   => reset_93,
       preNMI                  => preNMI,
+      cpuPaused               => cpuPaused,
       
       RANDOMMISS              => RANDOMMISS,
       DISABLE_BOOTCOUNT       => DISABLE_BOOTCOUNT,

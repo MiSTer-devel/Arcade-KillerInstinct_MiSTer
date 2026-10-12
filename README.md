@@ -17,6 +17,7 @@ implements:
 - Game DIP switches.
 - Native/60 Hz CRT timing modes.
 - Original/Full Screen aspect ratios
+- Core Pause
 
 ### Known issue
 

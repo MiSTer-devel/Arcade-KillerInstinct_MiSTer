@@ -16,6 +16,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_memory_bridge.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_video_timing.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_startup_osd_button.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_keyboard.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_pause.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ki_dcs_audio.sv
 set_global_assignment -name VHDL_FILE rtl/ki_cpu_core.vhd
 set_global_assignment -name SYSTEMVERILOG_FILE KillerInstinct.sv

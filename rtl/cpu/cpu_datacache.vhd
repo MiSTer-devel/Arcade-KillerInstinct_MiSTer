@@ -54,6 +54,9 @@ entity cpu_datacache is
       ram_active        : in  std_logic := '0';
       ram_grant         : in  std_logic := '0';
       ram_done          : in  std_logic := '0';
+      -- This fill's own access is to the line's last qword, the beat that
+      -- arrives last: cpu.vhd holds its ram_done a cycle (datacache_fill_due).
+      fill_last_q       : out std_logic;
       ddr3_DOUT         : in  std_logic_vector(63 downto 0);
       ddr3_DOUT_READY   : in  std_logic;
       
@@ -631,6 +634,7 @@ begin
 
    debug_state <= std_logic_vector(to_unsigned(tState'pos(state), 5));
    clear_busy  <= '1' when (state = CLEARCACHE) else '0';
+   fill_last_q <= '1' when (tag_read_addr(4 downto 3) = "11") else '0';
    fill_grant <= ram_grant and ram_active;
 
    -- Exactly the IDLE branch that starts a fill, so one cycle per miss: the

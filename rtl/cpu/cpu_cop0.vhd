@@ -37,6 +37,9 @@ entity cpu_cop0 is
       executeNew              : in  std_logic;
       reset                   : in  std_logic;
       preNMI                  : in  std_logic;
+      -- The system is paused: Count stands still, so software that times
+      -- itself with Count sees no time pass.
+      cpuPaused               : in  std_logic := '0';
       
       RANDOMMISS              : in  unsigned(3 downto 0);
       DISABLE_BOOTCOUNT       : in  std_logic;
@@ -712,9 +715,11 @@ begin
 
             -- count
             if (cop0Written9 = 0) then
-               COP0_9_COUNT <= COP0_9_COUNT + 1;
-               if (COP0_9_COUNT(32 downto 1) = COP0_11_COMPARE) then
-                  COP0_13_CAUSE_interruptPending(7) <= '1';
+               if (cpuPaused = '0') then
+                  COP0_9_COUNT <= COP0_9_COUNT + 1;
+                  if (COP0_9_COUNT(32 downto 1) = COP0_11_COMPARE) then
+                     COP0_13_CAUSE_interruptPending(7) <= '1';
+                  end if;
                end if;
             else
                cop0Written9 <= cop0Written9 - 1;
