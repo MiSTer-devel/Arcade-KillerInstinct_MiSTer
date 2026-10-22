@@ -31,6 +31,12 @@ module emu
 	output        HDMI_BLACKOUT,
 	output        HDMI_BOB_DEINT,
 
+	input   [5:0] LFB_FMT,
+	input  [31:0] LFB_BASE,
+	input  [11:0] LFB_WIDTH,
+	input  [11:0] LFB_HEIGHT,
+	input  [13:0] LFB_STRIDE,
+
 `ifdef MISTER_FB
 	output        FB_EN,
 	output  [4:0] FB_FORMAT,
@@ -131,6 +137,7 @@ localparam CONF_STR = {
 	"P2O4,Video Output,Game,Debug;",
 	"P2O56,Debug Page,Status,Trace,Perf,Prof;",
 	"P2O7,Perf Peak,Run,Clear;",
+	"P2O9C,Prof Fine Map,Auto,B0,B1,B2,B3,B4,B5,B6,B7;",
 	"P2O3,FPS Overlay,Off,On;",
 	"-;",
 `endif
@@ -580,6 +587,7 @@ wire [63:0] cpu_mem_data_write;
 wire        cpu_mem_line_write;
 wire [255:0] cpu_mem_line_data;
 wire  [31:0] cpu_mem_line_bytes;
+wire        cpu_mem_line_ra;
 wire [63:0] cpu_mem_data_read;
 wire cpu_mem_done;
 wire cpu_mem_grant;
@@ -662,12 +670,12 @@ wire  [15:0] bridge_perf_burst;
 // domain, so it has been still for thousands of cycles by the time the video
 // domain samples it.
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
-reg [271:0] debug_perf_prof_meta = 272'd0;
+reg [335:0] debug_perf_prof_meta = 336'd0;
 reg [2:0]   debug_prof_fine_meta = 3'd0;
 (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
-reg [271:0] debug_perf_prof_sync = 272'd0;
+reg [335:0] debug_perf_prof_sync = 336'd0;
 reg [2:0]   debug_prof_fine_sync = 3'd0;
-wire [271:0] debug_perf_prof;
+wire [335:0] debug_perf_prof;
 // Which coarse bucket F0..F7 cover. It travels with the prof bus because it
 // is latched with it, so the two cannot disagree about which frame they show.
 wire [2:0]  debug_prof_fine;
@@ -988,8 +996,8 @@ always @(posedge clk_core) begin
 		debug_cpu_pc_sync <= 32'h0000_0000;
 		debug_perf_bus_meta <= 192'd0;
 		debug_perf_bus_sync <= 192'd0;
-		debug_perf_prof_meta <= 272'd0;
-		debug_perf_prof_sync <= 272'd0;
+		debug_perf_prof_meta <= 336'd0;
+		debug_perf_prof_sync <= 336'd0;
 		debug_prof_fine_meta <= 3'd0;
 		debug_prof_fine_sync <= 3'd0;
 		debug_perf_worst_meta <= 192'd0;
@@ -1057,6 +1065,20 @@ always @(posedge clk_core) begin
 		perf_flip <= ~perf_flip;
 end
 
+// The data cache's direct fill path: from the CPU's clock to the SDRAM
+// controller's second port and back through ki_fast_fill, inside the adapter.
+wire        cpu_fast_ok;
+wire        cpu_fast_req_tog;
+wire [31:0] cpu_fast_req_line;
+wire        cpu_fast_window;
+wire        cpu_fast_beat;
+wire        cpu_fast_first;
+wire [63:0] cpu_fast_qword;
+wire        cpu_fast_done_tog;
+wire        controller_fast_tog;
+wire [24:0] controller_fast_addr;
+wire        controller_fast_valid;
+
 ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 (
 	.clk1x(clk_core),
@@ -1074,16 +1096,26 @@ ki_cpu_core #(.DEBUG_TRACE(DEBUG_TRACE)) cpu
 	.mem_line_write(cpu_mem_line_write),
 	.mem_line_data(cpu_mem_line_data),
 	.mem_line_bytes(cpu_mem_line_bytes),
+	.mem_line_ra(cpu_mem_line_ra),
 	.mem_dataRead(cpu_mem_data_read),
 	.mem_done(cpu_mem_done),
 	.cache_grant(cpu_mem_grant),
 	.cache_data(cpu_cache_data),
 	.cache_data_ready(cpu_cache_data_ready),
+	.fast_ok(cpu_fast_ok),
+	.fast_req_tog(cpu_fast_req_tog),
+	.fast_req_line(cpu_fast_req_line),
+	.fast_window(cpu_fast_window),
+	.fast_beat(cpu_fast_beat),
+	.fast_first(cpu_fast_first),
+	.fast_qword(cpu_fast_qword),
+	.fast_done_tog(cpu_fast_done_tog),
 	.errors(cpu_errors),
 	.debug_fetch_pc(debug_cpu_pc),
 	.debug_retired(debug_cpu_retired),
 	.perf_flip(perf_flip),
 	.perf_clear(status[7]),
+	.prof_fine_sel(status[12:9]),
 	.perf_bridge_out(bridge_perf_out),
 	.perf_bridge_burst(bridge_perf_burst),
 	.debug_perf_bus(debug_perf_bus),
@@ -1162,11 +1194,13 @@ ki_memory_bridge memory_bridge
 	.cpu_line_write(cpu_mem_line_write),
 	.cpu_line_data(cpu_mem_line_data),
 	.cpu_line_bytes(cpu_mem_line_bytes),
+	.cpu_line_ra(cpu_mem_line_ra),
 	.cpu_data_read(cpu_mem_data_read),
 	.cpu_done(cpu_mem_done),
 	.cpu_grant(cpu_mem_grant),
 	.cpu_cache_data(cpu_cache_data),
 	.cpu_cache_data_ready(cpu_cache_data_ready),
+	.fast_ok(cpu_fast_ok),
 	.io_request(io_request),
 	.io_write(io_write),
 	.io_address(io_address),
@@ -1295,6 +1329,13 @@ ki_sdram_adapter sdram_adapter
 	.aux_data_valid(bist_sdram_data_valid),
 	.aux_done(bist_sdram_done),
 	.sdram_ready(sdram_ready),
+	.fast_req_tog(cpu_fast_req_tog),
+	.fast_req_line(cpu_fast_req_line),
+	.fast_window(cpu_fast_window),
+	.fast_beat(cpu_fast_beat),
+	.fast_first(cpu_fast_first),
+	.fast_qword(cpu_fast_qword),
+	.fast_done_tog(cpu_fast_done_tog),
 	.controller_address(controller_sdram_address),
 	.controller_write_data(controller_sdram_write_data),
 	.controller_byte_enable(controller_sdram_byte_enable),
@@ -1303,7 +1344,10 @@ ki_sdram_adapter sdram_adapter
 	.controller_write(controller_sdram_write),
 	.controller_read_data(controller_sdram_read_data),
 	.controller_dout_valid(controller_sdram_dout_valid),
-	.controller_ready(controller_sdram_ready)
+	.controller_ready(controller_sdram_ready),
+	.controller_fast_tog(controller_fast_tog),
+	.controller_fast_addr(controller_fast_addr),
+	.controller_fast_valid(controller_fast_valid)
 );
 
 // The address decomposition uses col = addr[9:1], so 512 consecutive words
@@ -1338,7 +1382,10 @@ ki_sdram_burst #(
 	.din(controller_sdram_write_data),
 	.we(controller_sdram_write),
 	.rd(controller_sdram_read),
-	.ready(controller_sdram_ready)
+	.ready(controller_sdram_ready),
+	.fast_tog(controller_fast_tog),
+	.fast_addr(controller_fast_addr),
+	.fast_valid(controller_fast_valid)
 );
 
 ki_framebuffer framebuffer

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 `default_nettype none
 
-module ki_memory_bridge (
+module ki_memory_bridge #(
+  // A demand read of the framebuffer streams, a qword a cycle; see
+  // FB_READ_ISSUE. 0 reads every qword in two cycles, as a read-ahead's.
+  parameter bit FB_STREAM = 1'b1
+) (
   input  wire         clk,
   input  wire         ddr_clk,
   input  wire         reset,
@@ -33,6 +37,10 @@ module ki_memory_bridge (
   // enables - and every CPU line into SDRAM has whole qwords. Tie to all ones
   // where nothing drives it.
   input  wire  [31:0] cpu_line_bytes,
+  // The read is the data cache's read-ahead fetching a line nothing has
+  // asked for yet (cpu.vhd's mem_line_ra), not a demand fill. Tie low where
+  // nothing drives it.
+  input  wire         cpu_line_ra,
   output logic [63:0] cpu_data_read,
   output logic        cpu_done,
   output logic        cpu_grant,
@@ -44,6 +52,11 @@ module ki_memory_bridge (
   // A qword from SDRAM is not registered here: it goes out on the clock its
   // second half arrives from the adapter.
   output wire         cpu_cache_data_ready,
+  // Nothing of the CPU's that touches SDRAM is in flight or held here, and
+  // the CPU is not being held: the bridge's half of the direct fill path's
+  // ordering rule (cpu.vhd, fast_go). A line written back into the
+  // framebuffer, waiting or being written, does not count.
+  output wire         fast_ok,
 
   output logic        io_request,
   output logic        io_write,
@@ -151,10 +164,10 @@ module ki_memory_bridge (
 );
   import ki_board_pkg::*;
 
-  localparam logic [27:0] STORE_LOW  = 28'h000_0000;
-  localparam logic [27:0] STORE_MAIN = 28'h010_0000;
-  localparam logic [27:0] STORE_BOOT = 28'h090_0000;
-  localparam logic [27:0] STORE_DCS  = 28'h0a0_0000;
+  localparam logic [27:0] STORE_LOW  = KI_STORE_LOW;
+  localparam logic [27:0] STORE_MAIN = KI_STORE_MAIN;
+  localparam logic [27:0] STORE_BOOT = KI_STORE_BOOT;
+  localparam logic [27:0] STORE_DCS  = KI_STORE_DCS;
 
   localparam integer BOOT_CACHE_BYTES = 8 * 1024;
   localparam integer BOOT_CACHE_WORDS = BOOT_CACHE_BYTES / 8;
@@ -221,6 +234,9 @@ module ki_memory_bridge (
   logic [7:0] pending_write_mask = 8'd0;
   logic [63:0] pending_data_write = 64'd0;
   logic        pending_line_write = 1'b0;
+  logic        pending_line_ra = 1'b0;
+  // The request waiting is a line written back into the framebuffer.
+  logic        pending_fb_line = 1'b0;
   logic [255:0] pending_line_data = 256'd0;
   logic  [31:0] pending_line_bytes = 32'hFFFF_FFFF;
 
@@ -463,6 +479,7 @@ module ki_memory_bridge (
   wire [63:0] active_data_write =
       cpu_pending ? pending_data_write : cpu_data_write;
   wire active_line_write = cpu_pending ? pending_line_write : cpu_line_write;
+  wire active_line_ra = cpu_pending ? pending_line_ra : cpu_line_ra;
   wire [255:0] active_line_data =
       cpu_pending ? pending_line_data : cpu_line_data;
   wire  [31:0] active_line_bytes =
@@ -600,10 +617,10 @@ module ki_memory_bridge (
   // Two exact 320x240x16 buffers. The two 10 KiB holes remain low SDRAM.
   localparam integer FB_BUFFER_WORDS = 19200;
   localparam integer FB_WORDS = 38400;
-  localparam logic [31:0] FB0_LOW  = 32'h0003_0000;
-  localparam logic [31:0] FB0_HIGH = 32'h0005_5800;
-  localparam logic [31:0] FB1_LOW  = 32'h0005_8000;
-  localparam logic [31:0] FB1_HIGH = 32'h0007_d800;
+  localparam logic [31:0] FB0_LOW  = KI_FB0_LOW;
+  localparam logic [31:0] FB0_HIGH = KI_FB0_HIGH;
+  localparam logic [31:0] FB1_LOW  = KI_FB1_LOW;
+  localparam logic [31:0] FB1_HIGH = KI_FB1_HIGH;
 
   wire  [63:0] fb_q;
   wire  [63:0] fb_vq;
@@ -628,9 +645,16 @@ module ki_memory_bridge (
     return (byte_address - FB0_LOW) >> 3;
   endfunction
 
-  // A read serves one 64-bit word per two cycles. A 32-byte cache-line fill is
-  // four of them; a 64-bit or 32-bit access is one.
+  // A 32-byte cache-line read is four 64-bit words; a 64-bit or 32-bit access
+  // is one. fb_stream: this read takes a word a cycle (FB_READ_ISSUE).
   logic [2:0] fb_qwords_left = 3'd0;
+  // A line read starts at the qword its address names and goes on in the
+  // R4600's sub-block order, that qword XOR the count: fb_rd_line is the
+  // line's first qword, fb_rd_start the one asked for, fb_rd_k the count. A
+  // line address names qword 0, and the order is then the plain one.
+  logic [15:0] fb_rd_line = 16'd0;
+  logic [1:0]  fb_rd_start = 2'd0, fb_rd_k = 2'd0;
+  logic       fb_stream = 1'b0;
 
   // A WHOLE-LINE write into the framebuffer: a dirty data-cache line written
   // back. KI2 draws its framebuffer through a WRITE-BACK cache on the board -
@@ -706,23 +730,11 @@ module ki_memory_bridge (
            (address <= KI_BOOT_LAST);
   endfunction
 
+  // ki_board_pkg's map, which ki_fast_fill uses for the direct fill path too.
   function automatic logic [27:0] storage_address(
     input logic [31:0] address
   );
-    if (address <= KI_LOW_RAM_LAST)
-      return STORE_LOW + address[27:0];
-    if ((address >= KI_MAIN_RAM_BASE) &&
-        (address <= KI_MAIN_RAM_LAST))
-      return STORE_MAIN +
-          (address[27:0] - KI_MAIN_RAM_BASE[27:0]);
-    // Main RAM is physically 8 MiB.  The ROM proves that A23 selects no DRAM
-    // pin for the following 1 MiB, which aliases the array's first 1 MiB.
-    if ((address >= KI_MAIN_RAM_ALIAS_BASE) &&
-        (address <= KI_MAIN_RAM_ALIAS_LAST))
-      return STORE_MAIN +
-          (address[27:0] - KI_MAIN_RAM_ALIAS_BASE[27:0]);
-    return STORE_BOOT +
-        (address[27:0] - KI_BOOT_BASE[27:0]);
+    return ki_storage_address(address);
   endfunction
 
   always_comb begin
@@ -972,6 +984,10 @@ module ki_memory_bridge (
       pending_write_mask <= cpu_write_mask;
       pending_data_write <= cpu_data_write;
       pending_line_write <= cpu_line_write;
+      pending_line_ra <= cpu_line_ra;
+      pending_fb_line <= cpu_line_write && !cpu_rnw &&
+                         (((cpu_address >= FB0_LOW) && (cpu_address < FB0_HIGH)) ||
+                          ((cpu_address >= FB1_LOW) && (cpu_address < FB1_HIGH)));
       pending_line_data <= cpu_line_data;
       pending_line_bytes <= cpu_line_bytes;
     end
@@ -1176,6 +1192,10 @@ module ki_memory_bridge (
                 fb_read_accept  <= active_rnw;
                 fb_write_accept <= !active_rnw;
                 fb_addr <= fb_index(active_address);
+                fb_rd_line <= fb_index({active_address[31:5], 5'd0});
+                fb_rd_start <= active_address[4:3];
+                fb_rd_k <= 2'd0;
+                fb_stream <= FB_STREAM && !active_line_ra;
                 fb_qwords_left <=
                     (active_read_words < 5'd4) ? 3'd1 : active_read_words[4:2];
                 if (active_rnw) begin
@@ -1533,10 +1553,20 @@ module ki_memory_bridge (
           end
         end
 
-        // One 64-bit word per two cycles on port A: present the address, then
-        // take the registered output. No SDRAM is involved.
+        // Port A, the RAM's address registered and its word out a cycle
+        // later. A streamed read takes a word a cycle after the first: each
+        // FB_READ_WAIT takes the word FB_READ_ISSUE or the WAIT before it
+        // addressed, while the next address is being registered. A
+        // read-ahead's line (fb_stream low) takes two cycles a word, WAIT
+        // handing back to ISSUE: streamed, the real board's test ROM reads
+        // cached VRAM slower than this core would, because the ROM's read
+        // loop runs on the read-ahead. No SDRAM is involved.
         FB_READ_ISSUE: begin
           state <= FB_READ_WAIT;
+          if (fb_stream && (fb_qwords_left > 3'd1)) begin
+            fb_addr <= fb_rd_line | {14'd0, fb_rd_start ^ (fb_rd_k + 2'd1)};
+            fb_rd_k <= fb_rd_k + 2'd1;
+          end
         end
 
         FB_READ_WAIT: begin
@@ -1556,8 +1586,16 @@ module ki_memory_bridge (
             state <= IDLE;
           end else begin
             fb_qwords_left <= fb_qwords_left - 3'd1;
-            fb_addr <= fb_addr + 16'd1;
-            state <= FB_READ_ISSUE;
+            if (fb_stream) begin
+              if (fb_qwords_left > 3'd2) begin
+                fb_addr <= fb_rd_line | {14'd0, fb_rd_start ^ (fb_rd_k + 2'd1)};
+                fb_rd_k <= fb_rd_k + 2'd1;
+              end
+            end else begin
+              fb_addr <= fb_rd_line | {14'd0, fb_rd_start ^ (fb_rd_k + 2'd1)};
+              fb_rd_k <= fb_rd_k + 2'd1;
+              state <= FB_READ_ISSUE;
+            end
           end
         end
 
@@ -1677,6 +1715,27 @@ module ki_memory_bridge (
   // M10K carries the early reset path and both exact framebuffer pages. SDRAM
   // carries the complete boot ROM and all other mutable CPU RAM. DDR3 carries
   // immutable DCS ROM.
+  //
+  // A line written back into the framebuffer goes to the on-chip RAM alone,
+  // so neither one waiting (fb_line_waiting) nor FB_LINE_WRITE writing one
+  // holds a direct SDRAM read back. FB_LINE_WRITE is only taken with nothing
+  // gathered - wb_flush_needed goes first - and anything else of the CPU's
+  // that arrives while it runs waits as cpu_pending.
+  wire fb_line_waiting = cpu_pending && pending_fb_line;
+  assign fast_ok = !reset && ((state == IDLE) || (state == FB_LINE_WRITE)) &&
+                   (!cpu_pending || fb_line_waiting) &&
+                   (wb_count == 3'd0) && !done_owed && !fill_tail &&
+                   (download_count == 5'd0) && !cpu_hold;
+
+`ifndef SYNTHESIS
+  // fast_ok holds through FB_LINE_WRITE on this.
+  always_ff @(posedge clk) begin
+    if (!reset && (state == FB_LINE_WRITE) && (wb_count != 3'd0)) begin
+      $error("bridge: a framebuffer line write with %0d chunks still gathered", wb_count);
+      $fatal(1);
+    end
+  end
+`endif
 endmodule
 
 `default_nettype wire

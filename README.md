@@ -51,3 +51,5 @@ R4300i CPU adapted from the [N64](https://github.com/MiSTer-devel/N64_MiSTer) Mi
 `adsp2105.sv` and `dcs_mem.sv` are adapted from the [Wolf Unit](https://github.com/blahm1d/wolf-unit) MiSTer core
 
 [MAME](https://github.com/mamedev/mame) kinst driver as a reference
+
+[MisterAddons](https://github.com/misteraddons) original hardware measurements

@@ -31,7 +31,48 @@ entity cpu_datacache is
       LOAD_INTERLOCK : boolean := false;
       -- A store that hits parks in a one-entry buffer instead of writing the
       -- data RAMs in its own cycle. See "THE STORE BUFFER".
-      STORE_BUFFER   : boolean := false
+      STORE_BUFFER   : boolean := false;
+      -- A load of the buffered doubleword takes the buffer's bytes merged
+      -- over the RAMs' read instead of draining it and re-reading. Needs
+      -- STORE_BUFFER. See "THE STORE BUFFER".
+      SB_FORWARD     : boolean := false;
+      -- A load miss on a line is answered as soon as its own qword is in,
+      -- and the rest of the line lands while the CPU runs on. See "EARLY
+      -- RESTART".
+      EARLY_RESTART  : boolean := false;
+      -- A load missing on the staged read-ahead line is answered in
+      -- FILLRA_COPY's last cycle, from the staging register. See "READING
+      -- AHEAD".
+      RA_ANSWER      : boolean := false;
+      -- A framebuffer line is filled from the qword its access wants: the
+      -- request carries that qword in ram_reqAddr bits 4..3, and the bridge
+      -- returns the line in sub-block order, beat k being that qword XOR k,
+      -- as the R4600 returns a block. The access's own qword is then the
+      -- first in (see EARLY RESTART). Every other line starts at qword 0.
+      CWF_FB         : boolean := false;
+      -- A framebuffer miss with a dirty victim is filled before the victim is
+      -- written back. Once the victim's four words are staged the cache goes
+      -- to its fill without waiting for the line to cross, and wb_hold keeps
+      -- cpu.vhd from issuing the staged line until the cache is back in IDLE:
+      -- the bridge reads the new line, then writes the old - the R4600's
+      -- order. The hold goes up as the last word is staged, never earlier: a
+      -- miss taken in the IDLE cycle that ends the last one's hold lets that
+      -- line go before its own write-back needs the queue. An SDRAM miss
+      -- keeps the write-back first; its direct fill needs the staging queue
+      -- empty.
+      FILL_FIRST     : boolean := false;
+      -- With FILL_FIRST, the fill is asked for in the cycle the miss is
+      -- taken, and the victim is staged while it comes: the R4600 moves the
+      -- dirty line to its write buffer before it reads. Only when nothing
+      -- holds the write FIFO then (fifo_block), so the staging queue is
+      -- empty: the staging starts in the next cycle without waiting for the
+      -- request to issue, and its four reads are taken in the four cycles
+      -- after - before the fill's first beat, which crosses to clk1x and
+      -- back, can reach the data RAMs. The staging-read assertion below
+      -- holds it. Otherwise the fill is asked for once the victim is staged,
+      -- as with FILL_FIRST alone. A fill done before FILL is found done
+      -- there (fam_done_r).
+      FILL_AT_MISS   : boolean := false
    );
    port 
    (
@@ -57,6 +98,10 @@ entity cpu_datacache is
       -- This fill's own access is to the line's last qword, the beat that
       -- arrives last: cpu.vhd holds its ram_done a cycle (datacache_fill_due).
       fill_last_q       : out std_logic;
+      -- FILL_FIRST: the staged write-back is a framebuffer miss's victim, and
+      -- that miss's fill has not been answered. cpu.vhd issues the staged
+      -- line only when this is low.
+      wb_hold           : out std_logic := '0';
       ddr3_DOUT         : in  std_logic_vector(63 downto 0);
       ddr3_DOUT_READY   : in  std_logic;
       
@@ -137,6 +182,9 @@ entity cpu_datacache is
       -- and main RAM at 0x08000000, and the bridge compares the address it
       -- receives against those - so the test is just the top bits being zero.
       perf_miss_low     : out std_logic := '0';
+      -- Of those, the misses to a framebuffer page (RW_fb): the rest of
+      -- perf_miss_low is the SRAM region outside them.
+      perf_miss_fb      : out std_logic := '0';
       -- The fill interval, split exhaustively rather than sampled by proxy:
       -- a partition of the FILL state itself, with a sum check.
       --
@@ -218,6 +266,9 @@ entity cpu_datacache is
       ra_data           : in  std_logic_vector(255 downto 0) := (others => '0');
       ra_store          : in  std_logic := '0';
       ra_store_addr     : in  unsigned(31 downto 0) := (others => '0');
+      -- EARLY_RESTART: a fill request raised while the line before it is
+      -- still landing may leave now (cpu.vhd, fast_go_q).
+      tail_q_ok         : in  std_logic := '0';
       perf_ra_issue     : out std_logic := '0';
       perf_ra_used      : out std_logic := '0';
       SS_reset          : in  std_logic
@@ -289,7 +340,8 @@ architecture arch of cpu_datacache is
    --     a load (next_load), so nobody wants this cycle's read;
    --   * by the next store to another doubleword, which parks in its place (a
    --     store to the same doubleword and way merges instead);
-   --   * by a load of the buffered doubleword, which then re-reads (REREAD);
+   --   * by a load of the buffered doubleword, which then re-reads (REREAD) -
+   --     unless SB_FORWARD answers it, below;
    --   * by a command;
    --   * in the first cycle of FILL, the dirty victim's WRITEBACK1ADDR and
    --     FILLRA_WAIT, which leave the port idle - so a line is never read,
@@ -298,6 +350,21 @@ architecture arch of cpu_datacache is
    -- that can hold it (the buffered line is dirty, so it is never evicted
    -- without the write-back). Nothing selecting the RAM address depends on the
    -- tag compare.
+   --
+   -- FORWARDING (SB_FORWARD). A load in IDLE on the buffered doubleword that
+   -- hits the predicted way, whose doubleword the data RAMs read last cycle
+   -- (sb_rd_ok), is answered there and then: the RAMs' read with the
+   -- buffer's bytes over it. A read in a cycle that wrote the same address
+   -- is good too: port b reads new data across its own write. The buffer is not drained for it -
+   -- it stays parked, the next store to the doubleword merges in, and the
+   -- RAMs read on, so the access after the load is not stale. sb_rd_ok also
+   -- holds where ram_stale is set by a store that MERGED: the RAMs then read
+   -- the store's own doubleword, which is the load's. The bytes are merged
+   -- only when the buffered store is in the predicted way - the same
+   -- doubleword index in the other way is another line - and the select
+   -- (sb_fwd_sel) is registers and the MRU RAM's output, never the tag
+   -- compare: a load the select picks wrongly is not answered (read_done).
+   -- Every other load of the buffered doubleword drains it and re-reads.
    --
    -- The same bit is the LRU state. It is written in the access's own IDLE
    -- cycle, not registered first: the access after a load reads it at the end
@@ -350,6 +417,11 @@ architecture arch of cpu_datacache is
    --     then copies the four staged qwords into it, FILLRA_COPY, instead of
    --     asking the bridge; a copy still in flight is waited for, FILLRA_WAIT;
    --   * that miss, if a load, asks for the NEXT line, so a stream runs on;
+   --   * that load is answered in the copy's last cycle, from the staging
+   --     register itself, not read back from the RAM after the copy
+   --     (RA_ANSWER): the copy ends that cycle, so the cache is in IDLE when
+   --     the next access comes, as after any answer; a store lands its data
+   --     in FILLRA_DONE;
    --   * a 64-bit store that skips its fill takes ALLOC as before and throws
    --     the copy away - defensively: the line it leaves is dirty, so its
    --     eviction's write-back would make the copy stale anyway;
@@ -375,8 +447,52 @@ architecture arch of cpu_datacache is
    -- the same test SH counts. A stream arms on its second miss and stays
    -- armed (a miss served from the copy is still a next-line miss); scattered
    -- misses never arm it.
+   --
+   -- EARLY RESTART (EARLY_RESTART). A line arrives a qword at a time, and a
+   -- load needs only one of them. So a load miss on a whole line is answered
+   -- as soon as its own qword is in the data RAM (TAIL_ANS), and the rest of
+   -- the line - the TAIL - lands while the CPU runs on. While it lands:
+   --
+   --   * an access to a qword of the tail line that is in is served as any
+   --     hit; one to a qword not yet in waits for it (TAIL_WAIT), then a load
+   --     is answered (TAIL_ANS) or a store written (TAIL_STORE);
+   --   * a miss in the tail line's set never takes the tail line's way;
+   --   * a write-back of the tail line waits for it to land;
+   --   * a miss's fill request leaves at once when cpu.vhd can queue it
+   --     behind the tail's line on the direct port (tail_q_ok), which serves
+   --     the two in order; otherwise it is held until the tail has landed;
+   --   * the tail line's completion (ram_done) is the one that arrives while
+   --     the tail is landing, and is not the next fill's (fill_done_mine).
+   --
+   -- When the tail has landed, the read-ahead the load would have asked for
+   -- at its completion is asked for then, unless the line after has missed
+   -- meanwhile and is being filled already.
+   --
+   -- The data RAMs are dual-clock M10K, written by the fill on clk1x through
+   -- port a and used by the CPU on clk93 through port b, and a port b access
+   -- to a word within the clk1x cycle of its port a write is undefined and
+   -- not timed. So a qword counts as in from tail_arr_d - one clk93 cycle
+   -- after the clk1x edge that wrote it - for a state that reads or writes it
+   -- on the next edge (TAIL_ANS, TAIL_STORE), and from tail_arr_dd, a cycle
+   -- later, for an access in IDLE, whose read was this cycle's edge. A
+   -- grant's toggle is taken with the arrivals (tail_gnt_d), so a new fill is
+   -- never judged on the last one's qwords.
 
    signal ce_fetch         : std_logic;
+
+   -- CWF_FB: the fill's first qword - the access's, for a framebuffer line,
+   -- else 0 - taken as IDLE takes the rest of the miss; its clk1x copy from
+   -- the grant; and the qword each beat writes.
+   signal fill_start       : unsigned(1 downto 0) := "00";
+   signal fill_start_2x    : unsigned(1 downto 0) := "00";
+   signal fill_q_2x        : unsigned(1 downto 0);
+   -- FILL_FIRST: this miss fills first (ff_miss_r), and wb_hold's register.
+   signal ff_miss_r        : std_logic := '0';
+   signal wb_hold_r        : std_logic := '0';
+   -- FILL_AT_MISS: this miss's fill was asked for at the miss (fam_req_r), and
+   -- it completed before the cache reached FILL (fam_done_r).
+   signal fam_req_r        : std_logic := '0';
+   signal fam_done_r       : std_logic := '0';
 
    type t_tag  is array(0 to 1) of std_logic_vector(57 downto 0);
    type t_data is array(0 to 1) of std_logic_vector(63 downto 0);
@@ -547,7 +663,14 @@ architecture arch of cpu_datacache is
       FILLRA_DONE,
       -- LOAD_INTERLOCK: the RAMs read the load's own doubleword, for the
       -- READWAIT or WAYFIX (reread_wf) that follows.
-      REREAD
+      REREAD,
+      -- EARLY_RESTART: an access to a qword of the landing line that is not
+      -- in yet waits for it; then a load is answered, or a store written.
+      -- A fill's load answered before the line is in is answered in TAIL_ANS
+      -- too.
+      TAIL_WAIT,
+      TAIL_ANS,
+      TAIL_STORE
    );
    signal state : tstate := IDLE;
 
@@ -577,6 +700,14 @@ architecture arch of cpu_datacache is
    signal sb_merge         : std_logic;   -- a store merges into it
    signal sb_drain_idle    : std_logic;
    signal sb_drain         : std_logic;   -- it is written to the RAMs at this edge
+   signal sb_fwd           : std_logic;   -- a load is answered from the buffer
+   signal sb_fwd_sel       : std_logic;   -- the RAMs' read takes the buffer's bytes
+   signal sb_fwd_d         : std_logic := '0';
+   signal sb_fwd_q         : std_logic_vector(63 downto 0);
+   -- The doubleword port b read last cycle: the load's own is good whatever
+   -- ram_stale says.
+   signal sb_rd_addr_r     : std_logic_vector(IDX_HI - 3 downto 0) := (others => '0');
+   signal sb_rd_ok         : std_logic;
    signal st_direct_a      : std_logic;   -- a store in IDLE may write the RAMs itself
    -- synthesis translate_off
    signal ram_rd_1         : std_logic_vector(IDX_HI - 3 downto 0) := (others => '0');
@@ -600,6 +731,36 @@ architecture arch of cpu_datacache is
 
    signal force_wb   : std_logic := '0';
    signal wb_done    : std_logic := '0';
+
+   -- EARLY_RESTART; see EARLY RESTART. req_r is this cache's fill request,
+   -- registered; ram_request is it, or a held one, once it may leave.
+   -- tail_gnt_1x toggles at every fill grant and tail_arr_1x marks the qwords
+   -- of the current fill written so far, on clk1x; tail_gnt_d and tail_arr_d
+   -- are their clk93 copies, a cycle late, and tail_arr_dd a cycle later.
+   signal req_r          : std_logic := '0';
+   signal fill_done_mine : std_logic;
+   signal tail_gnt_1x    : std_logic := '0';
+   signal tail_arr_1x    : std_logic_vector(3 downto 0) := (others => '0');
+   signal tail_gnt_d     : std_logic := '0';
+   signal tail_arr_d     : std_logic_vector(3 downto 0) := (others => '0');
+   signal tail_arr_dd    : std_logic_vector(3 downto 0) := (others => '0');
+   signal tail_gnt_at    : std_logic := '0';
+   -- tail: a line is landing behind an early answer - its set, way and line;
+   -- tail_done: its completion has come; tail_held: a fill request raised
+   -- meanwhile that has not left.
+   signal tail           : std_logic := '0';
+   signal tail_idx       : unsigned(SET_BITS - 1 downto 0) := (others => '0');
+   signal tail_way       : std_logic := '0';
+   signal tail_line      : unsigned(26 downto 0) := (others => '0');
+   signal tail_done      : std_logic := '0';
+   signal tail_held      : std_logic := '0';
+   -- The read-ahead the answered load would have asked for at its
+   -- completion, and whether the line after has missed meanwhile.
+   signal tail_ra_ok     : std_logic := '0';
+   signal tail_next_miss : std_logic := '0';
+   signal tail_hit       : std_logic;
+   signal tail_blk       : std_logic;
+   signal tail_go        : std_logic;
    signal fill_beat_seen : std_logic := '0';
    signal perf_miss_i    : std_logic;
    signal last_miss_line : unsigned(26 downto 0) := (others => '0');
@@ -629,12 +790,18 @@ architecture arch of cpu_datacache is
    -- The miss behind a write-back fills from the staged line.
    signal fillRA         : std_logic := '0';
    signal ra_qword       : std_logic_vector(63 downto 0);
+   signal ra_qword_ld    : std_logic_vector(63 downto 0);
+   signal ra_ans         : std_logic;
+   signal rd_q           : std_logic_vector(63 downto 0);
 
 begin
 
    debug_state <= std_logic_vector(to_unsigned(tState'pos(state), 5));
    clear_busy  <= '1' when (state = CLEARCACHE) else '0';
-   fill_last_q <= '1' when (tag_read_addr(4 downto 3) = "11") else '0';
+   fill_last_q <= '1' when (tag_read_addr(4 downto 3) = (fill_start xor "11")) else '0';
+   -- Not for a miss served from the read-ahead copy: its line asks nothing
+   -- of the bridge.
+   wb_hold     <= wb_hold_r and (not fillRA);
    fill_grant <= ram_grant and ram_active;
 
    -- Exactly the IDLE branch that starts a fill, so one cycle per miss: the
@@ -653,6 +820,7 @@ begin
    -- state = IDLE with read_ena/write_ena, so RW_addr holds this access's
    -- address in the same cycle.
    perf_miss_low <= perf_miss_i when (RW_addr(31 downto 19) = 0) else '0';
+   perf_miss_fb  <= perf_miss_i and RW_fb;
    perf_miss_i <= '1' when (state = IDLE and
                           (read_ena = '1' or write_ena = '1') and
                           read_hit = '0' and
@@ -664,7 +832,7 @@ begin
    perf_way_slow  <= '1' when (state = WAYFIX) else '0';
 
    perf_wb_line     <= '1' when (state = WRITEBACK1WRITE) else '0';
-   perf_fill_store  <= '1' when (state = FILL and ram_done = '1' and writeMode = '1') else '0';
+   perf_fill_store  <= '1' when (state = FILL and fill_done_mine = '1' and writeMode = '1') else '0';
    perf_fill_skip   <= '1' when (state = ALLOC) else '0';
    -- A miss in the IDLE branch that fills a resident line.
    perf_fill_absent <= perf_miss_i and line_hit;
@@ -682,11 +850,152 @@ begin
                ra_data(127 downto  64) when (tag_read_addr(4 downto 3) = "01") else
                ra_data(191 downto 128) when (tag_read_addr(4 downto 3) = "10") else
                ra_data(255 downto 192);
+   -- RA_ANSWER: the load's own qword of the staged line, and the cycle it
+   -- is answered from it - FILLRA_COPY's last, whose write ends the copy.
+   ra_qword_ld <= ra_data( 63 downto   0) when (tag_addr_low(4 downto 3) = "00") else
+                  ra_data(127 downto  64) when (tag_addr_low(4 downto 3) = "01") else
+                  ra_data(191 downto 128) when (tag_addr_low(4 downto 3) = "10") else
+                  ra_data(255 downto 192);
+   ra_ans <= '1' when (RA_ANSWER and state = FILLRA_COPY and writeMode = '0' and
+                       tag_read_addr(4 downto 3) = "11") else '0';
+   rd_q   <= ra_qword_ld when (ra_ans = '1') else sb_fwd_q;
+
+   -- SB_FORWARD: see "THE STORE BUFFER".
+   sb_rd_ok   <= '1' when (ram_stale = '0' or
+                           sb_rd_addr_r = std_logic_vector(tag_addr_1(IDX_HI downto 3))) else '0';
+   sb_fwd     <= '1' when (SB_FORWARD and STORE_BUFFER and state = IDLE and read_ena = '1' and
+                           read_hit = '1' and fast_hit = '1' and sb_same = '1' and
+                           sb_rd_ok = '1' and slow_on = '0' and tail_blk = '0') else '0';
+   sb_fwd_sel <= '1' when (SB_FORWARD and STORE_BUFFER and state = IDLE and sb_same = '1' and
+                           pred_way = sb_way) else '0';
+   sb_fwd_bytes : for b in 0 to 7 generate
+      sb_fwd_q(b * 8 + 7 downto b * 8) <=
+         sb_data(b * 8 + 7 downto b * 8) when (sb_fwd_sel = '1' and sb_be(b) = '1') else
+         cache_q_b(b * 8 + 7 downto b * 8);
+   end generate;
+
+   process (clk93)
+   begin
+      if rising_edge(clk93) then
+         sb_rd_addr_r <= cache_address_b;
+      end if;
+   end process;
    perf_ra_used <= '1' when (state = FILLRA_WAIT and ra_state = RA_VALID and
                              ra_poison_now = '0' and
                              ra_line = ram_reqAddr(31 downto 5)) else '0';
 
    ce_fetch <= '1' when (stall = 0 and ce_93 = '1') else '0';
+
+   -- EARLY_RESTART. The landing line's own completion is not this fill's; a
+   -- request raised during the tail leaves when it may (tail_q_ok) or once
+   -- the tail has landed. tail_blk: an access in IDLE to a qword of the
+   -- landing line that is not in yet. tail_go: the fill's load can be
+   -- answered now - a whole-line load fill, its grant seen, its qword in.
+   fill_done_mine <= ram_done when (not EARLY_RESTART) else (ram_done and not tail);
+   ram_request    <= req_r when (not EARLY_RESTART) else
+                     ((req_r or tail_held) and ((not tail) or tail_q_ok));
+   tail_hit <= '1' when (EARLY_RESTART and tail = '1' and
+                         tag_addr_1(IDX_HI downto 5) = tail_idx and
+                         ((tail_way = '1' and line_hit_w(1) = '1') or
+                          (tail_way = '0' and line_hit_w(0) = '1'))) else '0';
+   tail_blk <= '1' when (tail_hit = '1' and state = IDLE and
+                         (read_ena = '1' or write_ena = '1') and
+                         tail_arr_dd(to_integer(tag_addr_1(4 downto 3))) = '0') else '0';
+   tail_go  <= '1' when (EARLY_RESTART and state = FILL and tail = '0' and
+                         req_r = '0' and writeMode = '0' and isWB = '0' and
+                         fill_mask = "1111" and write_through_in = '0' and
+                         force_wb = '0' and slow_on = '0' and
+                         tail_gnt_d /= tail_gnt_at and
+                         tail_arr_d(to_integer(tag_read_addr(4 downto 3))) = '1') else '0';
+
+   -- synthesis translate_off
+   -- The dual-clock data RAMs' rule, asserted: no port b access is used
+   -- within a clk1x period of a port a write to the same word of the same
+   -- way - not a load's read that is answered from, not a store's write.
+   -- A read is answered (read_done) from the read on the edge that began
+   -- the cycle, at the address presented the cycle before; an answer from
+   -- the read-ahead's staging register (ra_ans) reads no RAM. And a write-back
+   -- stages its line as it was: no read of its four words (WRITEBACK1WRITE ..
+   -- WRITEBACK4WRITE take them) comes at or after a write of the word by a
+   -- fill granted since the write-back began - its own miss's fill, with
+   -- FILL_AT_MISS. Checked while the two clocks' edges are aligned, as they
+   -- are on hardware: the design counts a qword in by clk93 edges after
+   -- clk1x's, which holds the rule only for that relation.
+   process (clk1x, clk93)
+      type t_wtime is array (0 to 2 ** (SET_BITS + 2) - 1) of time;
+      variable wtime    : t_wtime := (others => -1 sec);
+      variable wtime1   : t_wtime := (others => -1 sec);
+      variable addr_q   : integer := 0;
+      variable p1x      : time := 20 ns;
+      variable last1x   : time := 0 ns;
+      variable p93      : time := 10 ns;
+      variable last93   : time := 0 ns;
+      variable used_way : std_logic;
+      variable a        : integer;
+      variable wt       : time;
+      variable aligned  : boolean := false;
+      variable st_prev  : tState := IDLE;
+      variable wb_from  : time := 0 ns;
+      variable wb_gnt   : time := time'high;
+   begin
+      if rising_edge(clk1x) then
+         if (last1x > 0 ns) then p1x := now - last1x; end if;
+         last1x := now;
+         aligned := (now - last93 = 0 ns) or (now - last93 = p93);
+         a := to_integer(unsigned(cache_ram_addr_a));
+         if (cache_wr_a_w(0) = '1') then wtime(a)  := now; end if;
+         if (cache_wr_a_w(1) = '1') then wtime1(a) := now; end if;
+         if (fill_grant = '1' and wb_gnt = time'high and now > wb_from) then
+            wb_gnt := now;
+         end if;
+      end if;
+      if rising_edge(clk93) then
+         if (last93 > 0 ns) then p93 := now - last93; end if;
+         last93 := now;
+         if (state = WRITEBACK1ADDR and st_prev /= WRITEBACK1ADDR) then
+            wb_from := now - p93;
+            wb_gnt  := time'high;
+         end if;
+         st_prev := state;
+      end if;
+      if rising_edge(clk93) and SS_reset = '0' and aligned then
+         if (read_done = '1' and ra_ans = '0') then
+            if (state = IDLE) then used_way := pred_way; else used_way := data_way; end if;
+            if (used_way = '0') then wt := wtime(addr_q); else wt := wtime1(addr_q); end if;
+            assert (now - p93) - wt >= p1x or wt > now - p93
+               report "cpu_datacache: a load answered from a word within a clk1x period of its fill write (word " &
+                      integer'image(addr_q) & ", way " & std_logic'image(used_way) & ", read " &
+                      time'image((now - p93) - wt) & " after the write, in " & tState'image(state) & ")"
+               severity failure;
+         end if;
+         a := to_integer(unsigned(cache_address_b));
+         if (cache_we_w(0) = '1') then
+            assert now - wtime(a) >= p1x
+               report "cpu_datacache: a store written within a clk1x period of its word's fill write (word " &
+                      integer'image(a) & ", " & time'image(now - wtime(a)) & " after it, in " &
+                      tState'image(state) & ")"
+               severity failure;
+         end if;
+         if (cache_we_w(1) = '1') then
+            assert now - wtime1(a) >= p1x
+               report "cpu_datacache: a store written within a clk1x period of its word's fill write (word " &
+                      integer'image(a) & ", " & time'image(now - wtime1(a)) & " after it, in " &
+                      tState'image(state) & ")"
+               severity failure;
+         end if;
+         if (state = WRITEBACK1WRITE or state = WRITEBACK2WRITE or
+             state = WRITEBACK3WRITE or state = WRITEBACK4WRITE) then
+            if (data_way = '0') then wt := wtime(addr_q); else wt := wtime1(addr_q); end if;
+            assert not (wt >= wb_gnt and wt <= now - p93)
+               report "cpu_datacache: a write-back staged a word its miss's fill had already written (word " &
+                      integer'image(addr_q) & ", way " & std_logic'image(data_way) & ", in " &
+                      tState'image(state) & ")"
+               severity failure;
+         end if;
+         addr_q := to_integer(unsigned(cache_address_b));
+      end if;
+   end process;
+   -- synthesis translate_on
 
    ------------------ tags
 
@@ -702,7 +1011,7 @@ begin
       -- if with the bytes partial stores already wrote it now covers all of it.
       tag_wren_w(w) <= '1' when (tag_wren_cmd = '1' and tag_way_cmd(w) = '1') else
                        '1' when (tag_wren_cmd = '0' and state = IDLE and
-                                 write_ena = '1' and hit_w(w) = '1') else
+                                 write_ena = '1' and hit_w(w) = '1' and tail_blk = '0') else
                        '0';
       tag_wdata(w)  <= tag_data_cmd when (tag_wren_cmd = '1') else
                        (tag_w(w)(57 downto 26) or store_bytes) &
@@ -787,7 +1096,10 @@ begin
    -- the whole line straight after its fill, so neither skips it.
    skip_ok     <= '1' when (store_ok = '1' and write_through_in = '0' and force_wb = '0') else '0';
    -- Replace an invalid way first, else the least recently used one.
-   victim_way <= '0' when (tag_w(0)(20) = '0') else
+   -- Never the line landing behind an early answer.
+   victim_way <= (not tail_way) when (EARLY_RESTART and tail = '1' and
+                                      tag_addr_1(IDX_HI downto 5) = tail_idx) else
+                 '0' when (tag_w(0)(20) = '0') else
                  '1' when (tag_w(1)(20) = '0') else
                  not pred_way;
 
@@ -866,6 +1178,7 @@ begin
             fill_way_2x    <= data_way;
             fill_mask_2x   <= fill_mask;
             fill_bytes_2x  <= fill_bytes;
+            fill_start_2x  <= fill_start;
             fill_beat_2x   <= (others => '0');
             if (ddr3_DOUT_READY = '1') then
                fill_beat_2x <= "01";
@@ -884,12 +1197,33 @@ begin
       end if;
    end process;
 
-   cache_ram_addr_a <= std_logic_vector(fill_line_saved & "00") when (fill_grant = '1') else
-                       std_logic_vector(fill_line_2x & fill_beat_2x);
+   -- EARLY_RESTART: the grants and the current fill's qwords written, as
+   -- port a writes them.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if (reset_1x = '1') then
+            tail_arr_1x <= (others => '0');
+         elsif (fill_grant = '1') then
+            tail_gnt_1x <= not tail_gnt_1x;
+            tail_arr_1x <= "0000";
+            if (ddr3_DOUT_READY = '1') then
+               tail_arr_1x(to_integer(fill_start)) <= '1';
+            end if;
+         elsif (fill_active_2x = '1' and ddr3_DOUT_READY = '1' and ram_active = '1') then
+            tail_arr_1x(to_integer(fill_q_2x)) <= '1';
+         end if;
+      end if;
+   end process;
+
+   -- Beat k writes qword k XOR the fill's first (CWF_FB; 0 otherwise).
+   fill_q_2x        <= fill_beat_2x xor fill_start_2x;
+   cache_ram_addr_a <= std_logic_vector(fill_line_saved & fill_start) when (fill_grant = '1') else
+                       std_logic_vector(fill_line_2x & fill_q_2x);
 
    -- A fill of a resident line's absent qwords must not overwrite the qwords
    -- the CPU stored: each beat writes only if its qword is in the fill's mask.
-   fill_beat_now    <= "00" when (fill_grant = '1') else fill_beat_2x;
+   fill_beat_now    <= fill_start when (fill_grant = '1') else fill_q_2x;
    fill_mask_now    <= fill_mask when (fill_grant = '1') else fill_mask_2x;
    cache_wr_a       <= (fill_active_2x or fill_grant) and ddr3_DOUT_READY and ram_active and
                        fill_mask_now(to_integer(fill_beat_now));
@@ -939,18 +1273,18 @@ begin
                             sb_addr = tag_addr_1(IDX_HI downto 3)) else '0';
    st_direct_a <= '1' when (not STORE_BUFFER or sb_ok = '0' or sb_same = '1') else '0';
    sb_park     <= '1' when (state = IDLE and write_ena = '1' and read_hit = '1' and sb_ok = '1' and
-                            (sb_valid = '0' or sb_same = '0')) else '0';
+                            tail_blk = '0' and (sb_valid = '0' or sb_same = '0')) else '0';
    sb_merge    <= '1' when (state = IDLE and write_ena = '1' and read_hit = '1' and sb_ok = '1' and
-                            sb_same = '1' and hit_way = sb_way) else '0';
+                            tail_blk = '0' and sb_same = '1' and hit_way = sb_way) else '0';
    sb_drain_idle <= '1' when (STORE_BUFFER and state = IDLE and sb_valid = '1' and
                               ((read_ena = '0' and write_ena = '0' and CacheCommandEna = '0' and
                                 ce_fetch = '1' and next_load = '0') or
                                (write_ena = '1' and sb_ok = '1' and sb_same = '0') or
-                               (read_ena = '1' and sb_same = '1') or
+                               (read_ena = '1' and sb_same = '1' and sb_fwd = '0') or
                                CacheCommandEna = '1')) else '0';
    sb_drain    <= '1' when (sb_drain_idle = '1' or
                             (STORE_BUFFER and sb_valid = '1' and
-                             ((state = FILL and ram_request = '1') or
+                             ((state = FILL and req_r = '1') or
                               state = WRITEBACK1ADDR or state = FILLRA_WAIT))) else '0';
 
    cache_address_b <= std_logic_vector(sb_addr) when (sb_drain = '1') else
@@ -992,18 +1326,20 @@ begin
    -- A store writes the way that hit; the store that caused a fill writes the
    -- filled way once the line is in, and a store that skipped it in ALLOC.
    cache_we_w(0)   <= '1' when ((state = IDLE and hit_w(0) = '1' and write_ena = '1' and
-                                 sb_park = '0' and sb_merge = '0') or
+                                 sb_park = '0' and sb_merge = '0' and tail_blk = '0') or
+                                (state = TAIL_STORE and data_way = '0') or
                                 (sb_drain = '1' and sb_way = '0') or
-                                (writeMode = '1' and state = FILL and ram_done = '1' and
+                                (writeMode = '1' and state = FILL and fill_done_mine = '1' and
                                  data_way = '0') or
                                 (state = ALLOC and data_way = '0') or
                                 (state = FILLRA_COPY and data_way = '0') or
                                 (writeMode = '1' and state = FILLRA_DONE and
                                  data_way = '0')) else '0';
    cache_we_w(1)   <= '1' when ((state = IDLE and hit_w(1) = '1' and write_ena = '1' and
-                                 sb_park = '0' and sb_merge = '0') or
+                                 sb_park = '0' and sb_merge = '0' and tail_blk = '0') or
+                                (state = TAIL_STORE and data_way = '1') or
                                 (sb_drain = '1' and sb_way = '1') or
-                                (writeMode = '1' and state = FILL and ram_done = '1' and
+                                (writeMode = '1' and state = FILL and fill_done_mine = '1' and
                                  data_way = '1') or
                                 (state = ALLOC and data_way = '1') or
                                 (state = FILLRA_COPY and data_way = '1') or
@@ -1014,35 +1350,41 @@ begin
                                     state = IDLE and write_ena = '1' and
                                     fifo_block = '0') else
                        wb_done when (force_wb = '1') else
-                       '1'     when ((state = IDLE and read_hit = '1' and write_ena = '1') or (writeMode = '1' and state = FILL and ram_done = '1')) else
+                       '1'     when (state = TAIL_STORE) else
+                       '1'     when ((state = IDLE and read_hit = '1' and write_ena = '1' and tail_blk = '0') or
+                                     (writeMode = '1' and state = FILL and fill_done_mine = '1')) else
                        '1'     when (state = ALLOC) else
                        '1'     when (writeMode = '1' and state = FILLRA_DONE) else
                        '0';
 
    read_busy       <= '1' when (state = READWAIT or state = WAITSLOW or state = FILL or
                                 state = WAYFIX or state = FILLRA_WAIT or state = REREAD or
-                                state = FILLRA_COPY or state = FILLRA_DONE) else '0';
+                                state = FILLRA_COPY or state = FILLRA_DONE or
+                                state = TAIL_WAIT or state = TAIL_ANS or state = TAIL_STORE) else '0';
 
-   read_done       <= '1' when (state = IDLE and ram_stale = '0' and fast_hit = '1' and read_ena = '1' and
-                                slow_on = '0' and sb_same = '0') else
+   read_done       <= '1' when (sb_fwd = '1') else
+                      '1' when (state = IDLE and ram_stale = '0' and fast_hit = '1' and read_ena = '1' and
+                                slow_on = '0' and sb_same = '0' and tail_blk = '0') else
+                      '1' when (state = TAIL_ANS) else
                       '1' when (state = READWAIT) else
                       '1' when (state = WAYFIX) else
                       '1' when (state = WAITSLOW and slowcnt = 0) else
-                      '1' when (writeMode = '0' and state = FILL and ram_done = '1') else
+                      '1' when (writeMode = '0' and state = FILL and fill_done_mine = '1') else
+                      '1' when (ra_ans = '1') else
                       '0';
 
    -- A load answered outside IDLE may have the next instruction's RW_addr by
    -- then (LOAD_INTERLOCK); rd_low is its own.
    rd_sel          <= RW_addr(2 downto 0) when (not LOAD_INTERLOCK or state = IDLE) else rd_low;
 
-   read_data       <= cache_q_b                        when (rd_sel = "000") else
-                      8x"0"  & cache_q_b(63 downto  8) when (rd_sel = "001") else
-                      16x"0" & cache_q_b(63 downto 16) when (rd_sel = "010") else
-                      24x"0" & cache_q_b(63 downto 24) when (rd_sel = "011") else
-                      32x"0" & cache_q_b(63 downto 32) when (rd_sel = "100") else
-                      40x"0" & cache_q_b(63 downto 40) when (rd_sel = "101") else
-                      48x"0" & cache_q_b(63 downto 48) when (rd_sel = "110") else
-                      56x"0" & cache_q_b(63 downto 56); -- when (rd_sel = "111")
+   read_data       <= rd_q                        when (rd_sel = "000") else
+                      8x"0"  & rd_q(63 downto  8) when (rd_sel = "001") else
+                      16x"0" & rd_q(63 downto 16) when (rd_sel = "010") else
+                      24x"0" & rd_q(63 downto 24) when (rd_sel = "011") else
+                      32x"0" & rd_q(63 downto 32) when (rd_sel = "100") else
+                      40x"0" & rd_q(63 downto 40) when (rd_sel = "101") else
+                      48x"0" & rd_q(63 downto 48) when (rd_sel = "110") else
+                      56x"0" & rd_q(63 downto 56); -- when (rd_sel = "111")
 
    CachecommandStall <= '1' when (CacheCommandEna = '1' and CacheCommand = 5x"01") else
                         '1' when (CacheCommandEna = '1' and CacheCommand = 5x"05") else
@@ -1057,7 +1399,7 @@ begin
    begin
       if rising_edge(clk93) then
 
-         ram_request       <= '0';
+         req_r       <= '0';
          writeback_ena     <= '0';
          ra_request        <= '0';
          perf_ra_issue     <= '0';
@@ -1136,12 +1478,23 @@ begin
          -- buffered store; nothing reads, copies over or fills a line while a
          -- store to it waits; a drain never shares the port with a store's
          -- own write.
-         if (SS_reset = '0' and state = IDLE and read_done = '1' and sb_same = '1') then
+         if (SS_reset = '0' and state = IDLE and read_done = '1' and sb_same = '1' and sb_fwd = '0') then
             report "cpu_datacache: a load hit in IDLE on the buffered doubleword" severity failure;
+         end if;
+         -- SB_FORWARD: a forwarded load reads its own doubleword, in the way
+         -- that hit, and never answers without the store buffer's rule; and
+         -- it is answered once, so the cache stays in IDLE after it.
+         if (SS_reset = '0' and sb_fwd = '1' and
+             (sb_rd_ok = '0' or hit_way /= pred_way or not STORE_BUFFER or sb_valid = '0')) then
+            report "cpu_datacache: a load forwarded from the store buffer without its conditions" severity failure;
+         end if;
+         sb_fwd_d <= sb_fwd;
+         if (SS_reset = '0' and sb_fwd_d = '1' and state /= IDLE) then
+            report "cpu_datacache: a load forwarded from the store buffer left IDLE, to be answered again" severity failure;
          end if;
          if (SS_reset = '0' and sb_valid = '1' and
              (state = WRITEBACK1READ or state = FILLRA_COPY or
-              (state = FILL and ram_done = '1') or (state = FILLRA_DONE and writeMode = '1'))) then
+              (state = FILL and fill_done_mine = '1') or (state = FILLRA_DONE and writeMode = '1'))) then
             report "cpu_datacache: a line read or written while a store waits in the buffer" severity failure;
          end if;
          if (SS_reset = '0' and state = ALLOC and sb_valid = '1' and sb_way = data_way and
@@ -1162,7 +1515,7 @@ begin
          if (state = ALLOC and (writeMode /= '1' or (write_be_1 /= x"FF" and alloc_part_1 = '0'))) then
             report "cpu_datacache: ALLOC for an access that is neither a 64-bit store nor a partial framebuffer store" severity failure;
          end if;
-         if (state = FILL and ram_request = '1' and fill_mask = "0000") then
+         if (state = FILL and req_r = '1' and fill_mask = "0000") then
             report "cpu_datacache: a fill with no qword to write" severity failure;
          end if;
          -- The copy is a whole line into a victim: never around present qwords.
@@ -1251,6 +1604,58 @@ begin
             end if;
          end if;
 
+         -- EARLY_RESTART: the arrivals a cycle and two late, the tail's
+         -- completion, a request held through it, and its end. The line
+         -- after the tail's missing during it, this cycle's miss included,
+         -- makes the tail's read-ahead pointless: that line is being filled.
+         tail_gnt_d  <= tail_gnt_1x;
+         tail_arr_d  <= tail_arr_1x;
+         tail_arr_dd <= tail_arr_d;
+         if (EARLY_RESTART and tail = '1' and perf_miss_i = '1' and
+             RW_addr(31 downto 5) = tail_line + 1) then
+            tail_next_miss <= '1';
+         end if;
+         if (EARLY_RESTART and tail = '1' and ram_done = '1') then
+            tail_done <= '1';
+         end if;
+         if (EARLY_RESTART and tail = '1' and req_r = '1' and tail_q_ok = '0') then
+            tail_held <= '1';
+         elsif (tail = '0' or tail_q_ok = '1') then
+            tail_held <= '0';
+         end if;
+         if (EARLY_RESTART and tail = '1' and (tail_done = '1' or ram_done = '1') and
+             tail_arr_d = "1111") then
+            tail      <= '0';
+            tail_done <= '0';
+            if (tail_ra_ok = '1' and tail_next_miss = '0' and ra_state /= RA_FLIGHT and
+                not (perf_miss_i = '1' and RW_addr(31 downto 5) = tail_line + 1)) then
+               ra_state      <= RA_FLIGHT;
+               ra_poison     <= '0';
+               ra_line       <= tail_line + 1;
+               ra_reqAddr    <= (tail_line + 1) & "00000";
+               ra_request    <= '1';
+               perf_ra_issue <= '1';
+            end if;
+         end if;
+         -- synthesis translate_off
+         if (EARLY_RESTART and SS_reset = '0' and tail = '1' and fill_grant = '1') then
+            report "cpu_datacache: a fill granted while the tail before it was still landing" severity failure;
+         end if;
+         if (EARLY_RESTART and SS_reset = '0' and tail = '1') then
+            for w in 0 to 1 loop
+               if (cache_we_w(w) = '1' and (w = 1) = (tail_way = '1') and
+                   cache_address_b(IDX_HI - 3 downto 2) = std_logic_vector(tail_idx) and
+                   tail_arr_1x(to_integer(unsigned(cache_address_b(1 downto 0)))) = '0') then
+                  report "cpu_datacache: a store wrote a qword of the landing line before it came" severity failure;
+               end if;
+            end loop;
+            if (state = IDLE and read_done = '1' and tail_hit = '1' and
+                tail_arr_dd(to_integer(tag_addr_1(4 downto 3))) = '0') then
+               report "cpu_datacache: a load answered from a qword of the landing line before it came" severity failure;
+            end if;
+         end if;
+         -- synthesis translate_on
+
          slow    <= unsigned(slow_in);
          slow_on <= '0';
          if (slow > 0) then
@@ -1264,12 +1669,30 @@ begin
          if (SS_reset = '1') then
             state          <= CLEARCACHE;
             clearAddr      <= (others => '0');
+            tail           <= '0';
+            tail_done      <= '0';
+            tail_held      <= '0';
          else
+
+            -- FILL_AT_MISS: the fill's beats and completion while the victim is
+            -- staged; FILL finds it done.
+            if (fam_req_r = '1' and state /= FILL) then
+               if (fill_done_mine = '1') then
+                  fam_done_r <= '1';
+               end if;
+               if (ddr3_DOUT_READY = '1' and fill_active_2x = '1') then
+                  fill_beat_seen <= '1';
+               end if;
+            end if;
 
             case(state) is
 
                when IDLE =>
                   writeMode      <= write_ena;
+                  ff_miss_r      <= '0';
+                  wb_hold_r      <= '0';
+                  fam_req_r      <= '0';
+                  fam_done_r     <= '0';
                   write_be_1     <= write_be_rot;
                   write_data_1   <= write_data_rot;
                   fillNext       <= '0';
@@ -1287,6 +1710,13 @@ begin
                   allocNext      <= '0';
                   fillRA         <= '0';
                   ram_reqAddr    <= RW_addr(31 downto 0);
+                  -- Bits 4..3 name the fill's first qword (CWF_FB).
+                  if (CWF_FB and RW_fb = '1') then
+                     fill_start  <= RW_addr(4 downto 3);
+                  else
+                     ram_reqAddr(4 downto 0) <= "00000";
+                     fill_start  <= "00";
+                  end if;
                   tag_data_cmd   <= x"00000000" & "0000" & (write_ena and (not write_through_in)) &
                                     '1' & std_logic_vector(RW_addr(31 downto 12)); -- default for fill
                   tag_addr_cmd   <= std_logic_vector(tag_addr_1(IDX_HI downto 5));
@@ -1311,6 +1741,10 @@ begin
                      -- path without allocating a cache line.
                      state <= IDLE;
 
+                  elsif (tail_blk = '1') then
+                     -- A qword of the landing line that is not in yet.
+                     state <= TAIL_WAIT;
+
                   elsif ((read_ena = '1' or write_ena = '1') and read_hit = '0' and
                          line_hit = '1') then
                      -- The line is here but this qword is not: a load of it,
@@ -1318,7 +1752,7 @@ begin
                      -- qwords only - nothing is evicted, so nothing is written
                      -- back - and the line keeps its dirty bit.
                      state          <= FILL;
-                     ram_request    <= '1';
+                     req_r    <= '1';
                      fill_beat_seen <= '0';
                      fill_mask      <= hit_absent;
                      fill_bytes     <= hit_bytes;
@@ -1351,6 +1785,17 @@ begin
                         state          <= WRITEBACK1ADDR;
                         tag_read_addr(4 downto 0) <= "00000";
                         fillNext       <= '1';
+                        if (FILL_FIRST and RW_fb = '1' and skip_ok = '0') then
+                           ff_miss_r   <= '1';
+                           -- FILL_AT_MISS: ask for it now - a fill, not a
+                           -- read-ahead copy.
+                           if (FILL_AT_MISS and ra_match = '0' and force_wb = '0' and
+                               fifo_block = '0') then
+                              req_r          <= '1';
+                              fam_req_r      <= '1';
+                              fill_beat_seen <= '0';
+                           end if;
+                        end if;
                         allocNext      <= skip_ok;
                         fillRA         <= ra_match and (not skip_ok) and (not force_wb);
                         -- Drop a read-ahead copy of the VICTIM now. A store to a
@@ -1379,7 +1824,7 @@ begin
                         state          <= FILLRA_WAIT;
                      else
                         state          <= FILL;
-                        ram_request    <= '1';
+                        req_r    <= '1';
                         fill_beat_seen <= '0';
                         if (write_ena = '1' and force_wb = '1') then
                            isWB <= '1';
@@ -1403,10 +1848,14 @@ begin
                      end if;
 
                   elsif (read_ena = '1' and read_hit = '1' and sb_same = '1') then
-                     -- The buffered doubleword: the buffer drains at this edge
-                     -- and the load reads it back.
-                     state     <= REREAD;
-                     reread_wf <= '0';
+                     -- The buffered doubleword: answered here from the buffer
+                     -- (sb_fwd) - and taken by no branch below, though
+                     -- ram_stale may be set - or the buffer drains at this
+                     -- edge and the load reads it back.
+                     if (sb_fwd = '0') then
+                        state     <= REREAD;
+                        reread_wf <= '0';
+                     end if;
 
                   elsif (ram_stale = '1' and read_ena = '1' and read_hit = '1') then
                      state <= READWAIT;
@@ -1508,8 +1957,9 @@ begin
                   end if;
 
                when FILL =>
-                  if (ram_request = '1') then
+                  if (req_r = '1') then
                      tag_wren_cmd   <= '1';
+                     tail_gnt_at    <= tail_gnt_d;
                   end if;
                   -- ddr3_DOUT_READY is SHARED with the instruction cache
                   -- (cpu.vhd feeds both from one signal), so an unqualified
@@ -1519,7 +1969,7 @@ begin
                   if (ddr3_DOUT_READY = '1' and fill_active_2x = '1') then
                      fill_beat_seen <= '1';
                   end if;
-                  if (ram_done = '1') then
+                  if (fill_done_mine = '1' or fam_done_r = '1') then
                      state          <= IDLE;
                      if (isWB = '1') then
                         state          <= WRITEBACK1ADDR; 
@@ -1537,8 +1987,43 @@ begin
                         ra_request    <= '1';
                         perf_ra_issue <= '1';
                      end if;
+                  elsif (tail_go = '1') then
+                     -- Answer now; the rest of the line lands behind.
+                     state          <= TAIL_ANS;
+                     tail           <= '1';
+                     tail_done      <= '0';
+                     tail_next_miss <= '0';
+                     tail_idx       <= fill_line_saved;
+                     tail_way       <= data_way;
+                     tail_line      <= ram_reqAddr(31 downto 5);
+                     tail_ra_ok     <= '0';
+                     if (READ_AHEAD and ra_arm = '1' and
+                         ram_reqAddr(11 downto 5) /= "1111111") then
+                        tail_ra_ok <= '1';
+                     end if;
                   end if;
-                  
+
+               -- The data RAMs read tag_read_addr, the access's own qword, as
+               -- in every state but IDLE.
+               when TAIL_ANS =>
+                  state <= IDLE;
+
+               when TAIL_WAIT =>
+                  if (tail = '0' or
+                      tail_arr_d(to_integer(tag_read_addr(4 downto 3))) = '1') then
+                     if (writeMode = '1') then
+                        state        <= TAIL_STORE;
+                        tag_wren_cmd <= '1';
+                     else
+                        state        <= TAIL_ANS;
+                     end if;
+                  end if;
+
+               -- One cycle, entered with tag_wren_cmd set: the store's tag
+               -- rewrite and its data, as a store hit in IDLE writes them.
+               when TAIL_STORE =>
+                  state <= IDLE;
+
                when READWAIT =>
                   state <= IDLE;
                   
@@ -1548,7 +2033,18 @@ begin
                   end if;
                   
                when WRITEBACK1ADDR =>
-                  if (fifo_block = '0') then
+                  -- FILL_AT_MISS: the fill was asked for as this state was
+                  -- entered; its grant is judged from here, as from FILL's
+                  -- first cycle. And the victim is staged at once: the queue
+                  -- was empty at the miss and only this cache stages into it,
+                  -- while the write FIFO now holds the fill's own request.
+                  if (req_r = '1') then
+                     tail_gnt_at <= tail_gnt_d;
+                  end if;
+                  -- The landing line is written back once it has landed.
+                  if ((fifo_block = '0' or fam_req_r = '1') and
+                      not (EARLY_RESTART and tail = '1' and
+                           writeback_addr(31 downto 5) = tail_line)) then
                      state <= WRITEBACK1READ;
                   end if;
                
@@ -1595,6 +2091,9 @@ begin
 
                when WRITEBACK4WRITE =>
                   state          <= WRITEBACKDONE;
+                  -- The last word is staged this cycle: hold the line behind
+                  -- the fill from now (FILL_FIRST).
+                  wb_hold_r      <= ff_miss_r;
                   writeback_ena  <= '1';
                   if LITTLE_ENDIAN then
                      writeback_data <= cache_q_b;
@@ -1609,10 +2108,14 @@ begin
                   -- holds the line's mask with them: an ALLOC, which asks
                   -- nothing of memory, need not wait for the line to cross.
                   -- Anything that does - a FILL, a read-ahead copy - still
-                  -- waits, and a later miss's write-back waits for the queue
-                  -- in WRITEBACK1ADDR.
+                  -- waits, unless wb_hold keeps the staged line behind it
+                  -- (FILL_FIRST); a later miss's write-back waits for the
+                  -- queue in WRITEBACK1ADDR. A fill asked for at the miss
+                  -- (FILL_AT_MISS) is not asked for again: only its tag is
+                  -- written, as FILL writes it when it asks.
                   if (fifo_block = '0' or
-                      (WB_EARLY and fillNext = '1' and allocNext = '1')) then
+                      (WB_EARLY and fillNext = '1' and allocNext = '1') or
+                      (FILL_FIRST and fillNext = '1' and ff_miss_r = '1')) then
                      fillNext <= '0';
                      if (fillNext = '1' and allocNext = '1') then
                         -- The victim is out; take the line without its fill.
@@ -1620,9 +2123,12 @@ begin
                         tag_wren_cmd <= '1';
                      elsif (fillNext = '1' and fillRA = '1') then
                         state        <= FILLRA_WAIT;
+                     elsif (fillNext = '1' and fam_req_r = '1') then
+                        state        <= FILL;
+                        tag_wren_cmd <= '1';
                      elsif (fillNext = '1') then
                         state       <= FILL;
-                        ram_request <= '1';
+                        req_r <= '1';
                         -- The IDLE -> FILL path clears this, and so must
                         -- this one: left set from the previous fill, the
                         -- wait for the first beat of a fill that follows a
@@ -1694,23 +2200,29 @@ begin
                      end if;
                   elsif (ra_state = RA_NONE or ra_line /= ram_reqAddr(31 downto 5)) then
                      state          <= FILL;
-                     ram_request    <= '1';
+                     req_r    <= '1';
                      fill_beat_seen <= '0';
                   end if;
 
                -- A qword a cycle into the victim's way, qword 0 first. The
-               -- tag goes in with the first, as a fill's does.
+               -- tag goes in with the first, as a fill's does. With RA_ANSWER
+               -- a load is answered in the last (ra_ans), and the cache is
+               -- done.
                when FILLRA_COPY =>
                   if (tag_read_addr(4 downto 3) = "11") then
                      state                     <= FILLRA_DONE;
+                     if (RA_ANSWER and writeMode = '0') then
+                        state                  <= IDLE;
+                     end if;
                      tag_read_addr(4 downto 0) <= tag_addr_low;
                   else
                      tag_read_addr(4 downto 3) <= tag_read_addr(4 downto 3) + 1;
                   end if;
 
-               -- A store lands its own data now; a load reads its qword back
-               -- through READWAIT, whose RAM read this cycle presents. (A
-               -- load asked for the line after as the copy began.)
+               -- A store lands its own data now; a load, without RA_ANSWER,
+               -- reads its qword back through READWAIT, whose RAM read this
+               -- cycle presents. (A load asked for the line after as the copy
+               -- began.)
                when FILLRA_DONE =>
                   if (writeMode = '1') then
                      state <= IDLE;

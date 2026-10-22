@@ -3,7 +3,7 @@
 
 // Burst-capable 16-bit SDRAM controller for Killer Instinct.
 //
-// Four design choices provide the required throughput:
+// Five design choices provide the required throughput:
 //
 // 1. ADDRESS DECOMPOSITION. The controller uses col = addr[9:1],
 //    row = addr[22:10], bank = addr[24:23], so 512
@@ -16,9 +16,12 @@
 //    is one word per clock.
 //
 // 3. NO CLOCK THE DEVICE DOES NOT NEED. A row change issues PRECHARGE, waits
-//    out tRP and issues ACTIVE from S_IDLE on the next clock, and a read
-//    releases on the edge that captures its last word. ki_sdram_adapter
-//    launches an arriving request directly and passes words straight through.
+//    out tRP and issues ACTIVE from S_IDLE on the next clock, a read that
+//    hits the open row issues its first READ from S_IDLE itself (HIT_READ) -
+//    the direct port's qword read on the edge that takes it (FAST_ISSUE) -
+//    and a read releases on the edge that captures its last word.
+//    ki_sdram_adapter launches an arriving request directly and passes words
+//    straight through.
 //
 // 4. THE ROW CLOSES WHEN IDLE. With nothing pending and tRAS met, S_IDLE
 //    precharges every bank, so the next access to another row starts with
@@ -27,6 +30,23 @@
 //    row; one to the row just closed pays ACTIVE and tRCD instead of hitting
 //    it. A write has already waited out tWR in S_TURNAROUND before S_IDLE
 //    sees it.
+//
+//    The exception is a qword read on the direct port - an uncached load's.
+//    Its row stays open for ROW_HOLD idle clocks first: such loads come in
+//    runs through one row, and the next then hits it. Any request taken
+//    ends the hold, so only that read leaves a row open, and refresh still
+//    closes it.
+//
+// 5. A SECOND PORT FOR THE CPU'S READS. A toggle on fast_tog asks for one
+//    16-word read at fast_addr - a cache line - or, with fast_addr's bit 0
+//    set, a 4-word one, a qword; no SDRAM address uses bit 0. It is taken
+//    into req_* on the first clock that sees it with nothing pending, and
+//    its words come back on fast_valid instead of dout_valid. The CPU uses it
+//    only when nothing of its own is in the bridge's path (cpu.vhd,
+//    fast_path_clear), so nothing else can be waiting for this controller
+//    then. A second request may toggle while the first is being served (a
+//    fill queued behind it, cpu.vhd's fast_go_q, asked for once the first's
+//    first word is back); it is taken when the first has drained.
 //
 // Writes burst up to 16 words. A write burst needs no streaming handshake
 // because the payload is presented all at once: `din` is 16 words wide - one
@@ -61,7 +81,19 @@ module ki_sdram_burst #(
   parameter [3:0] T_WR  = 4'd2,
   parameter [2:0] CAS_LATENCY = 3'd2,
   parameter [14:0] STARTUP_CYCLES = 15'd12000,  // 120 us, >= 100 us
-  parameter [12:0] REFRESH_PERIOD = 13'd730     // 7.3 us, < 7.8 us
+  parameter [12:0] REFRESH_PERIOD = 13'd730,    // 7.3 us, < 7.8 us
+  // Idle clocks a row stays open after a direct qword read (design choice
+  // 4); 0 closes it at once, as after any other access.
+  parameter [5:0] ROW_HOLD = 6'd32,
+  // A read hitting the open row issues its first READ from S_IDLE, not a
+  // clock later from S_READ (design choice 3).
+  parameter bit HIT_READ = 1'b1,
+  // The direct port's qword read hitting the open row issues its first READ
+  // on the edge that takes it, its row compared as it arrives, not a clock
+  // later from req_* (design choice 3). The port's inputs come from the
+  // CPU's clock and have two controller clocks to settle (KillerInstinct.sdc).
+  // A line read still waits a clock in req_*.
+  parameter bit FAST_ISSUE = 1'b1
 ) (
   input  wire         init,
   input  wire         clk,
@@ -103,7 +135,14 @@ module ki_sdram_burst #(
   input  wire [255:0] din,       // up to 16 words, low word first
   input  wire         we,
   input  wire         rd,
-  output logic        ready = 1'b0
+  output logic        ready = 1'b0,
+
+  // The CPU's direct fill port; see design choice 5. fast_tog and fast_addr
+  // come from the CPU's clock, which runs at this one's frequency 0.5 ns
+  // earlier; KillerInstinct.sdc gives that path two of these clocks.
+  input  wire         fast_tog,
+  input  wire  [24:0] fast_addr,
+  output logic        fast_valid = 1'b0
 );
   // Bounded by the width of `din`, not by DRAM. A 32-byte cache line is
   // 16 words, and issuing it as ONE burst instead of four 4-word ones saves
@@ -159,10 +198,17 @@ module ki_sdram_burst #(
   wire rc_ok  = (act_age >= T_RC);
 
   logic        open_valid = 1'b0;
+  // Idle clocks the open row is still held; see ROW_HOLD.
+  logic  [5:0] hold_cnt = 6'd0;
   logic [12:0] open_row = '0;
   logic  [1:0] open_bank = 2'b00;
 
   logic [24:0] req_addr = '0;
+  // The transaction in req_* is the direct port's: its words go out on
+  // fast_valid. Changes only when a request is taken, after the last word of
+  // the one before.
+  logic        req_fast = 1'b0;
+  logic        fast_seen = 1'b0;
   logic [255:0] req_din = '0;
   logic [31:0] req_wtbt = 32'h0000_0000;
   logic  [4:0] req_burst = 5'd1;
@@ -230,6 +276,17 @@ module ki_sdram_burst #(
   wire        new_we    = we && !old_we;
   wire        new_req   = new_rd || new_we;
 
+  // The direct port's request as it arrives, before req_* holds it, and
+  // whether S_IDLE starts it on this edge (FAST_ISSUE): a qword read to the
+  // open row, with nothing pending and no refresh due.
+  wire  [8:0] fast_col   = fast_addr[9:1];
+  wire [12:0] fast_row   = fast_addr[22:10];
+  wire  [1:0] fast_bank  = fast_addr[24:23];
+  wire        fast_take  = !init && (fast_tog != fast_seen) && ready && !pending && !new_req;
+  wire        fast_issue = FAST_ISSUE && HIT_READ && fast_take && fast_addr[0] &&
+                           (state == S_IDLE) && !refresh_due && open_valid &&
+                           (fast_row == open_row) && (fast_bank == open_bank);
+
   // One register stage between the command decode and the SDRAM output
   // cells. The path `old_we -> command[2]` is long, and a large part of it is
   // a SINGLE interconnect hop from the last decode LUT to command[2] - that
@@ -272,6 +329,7 @@ module ki_sdram_burst #(
     cmd_d <= CMD_NOP;
     dqoe_d <= 1'b0;
     dout_valid <= 1'b0;
+    fast_valid <= 1'b0;
 
     // Saturating, so an idle controller cannot wrap back under a floor. The
     // ACTIVE branch below resets it, and because `command` is registered the
@@ -287,7 +345,8 @@ module ki_sdram_burst #(
     cas_d3 <= cas_d2;
     if (cas_take) begin
       dout <= dq_stg;
-      dout_valid <= 1'b1;
+      if (req_fast) fast_valid <= 1'b1;
+      else dout_valid <= 1'b1;
       beats_out <= beats_out - 1'b1;
     end
 
@@ -334,6 +393,7 @@ module ki_sdram_burst #(
             state <= S_REFRESH;
           end
         end else if (pending) begin
+          hold_cnt <= 6'd0;
           if (req_row_hit) begin
             // ROW HIT: the row is already ACTIVE, so no ACTIVE and no tRCD.
             pending <= 1'b0;
@@ -343,6 +403,18 @@ module ki_sdram_burst #(
             beats_out <= req_we ? 5'd0 : req_burst;
             wr_index <= 4'd0;
             state <= req_we ? S_WRITE : S_READ;
+            if (HIT_READ && !req_we) begin
+              // The first READ now, as S_READ would issue it a clock later;
+              // S_READ goes on from the second.
+              cmd_d <= CMD_READ;
+              a_d <= {2'b00, 2'b00, req_col};   // A[10]=0: no auto-precharge
+              dqmh_d <= 1'b0;
+              dqml_d <= 1'b0;
+              cas_pipe[CAS_LATENCY] <= 1'b1;
+              col <= req_col + 1'b1;
+              if (req_burst <= 1) state <= S_READ_DRAIN;
+              else beats_left <= req_burst - 1'b1;
+            end
           end else if (open_valid && ras_ok) begin
             // Row change: PRECHARGE now, and back here once tRP has passed,
             // with no row open, to issue the ACTIVE below. The request stays
@@ -369,6 +441,24 @@ module ki_sdram_burst #(
             wait_cnt <= T_RCD - 4'd1;
             state <= S_RCD;
           end
+        end else if (fast_issue) begin
+          // The direct port's qword read, arriving on this edge: the ROW HIT
+          // branch above, from the request itself (FAST_ISSUE).
+          hold_cnt <= 6'd0;
+          ba_d <= fast_bank;
+          beats_out <= 5'd4;
+          wr_index <= 4'd0;
+          cmd_d <= CMD_READ;
+          a_d <= {2'b00, 2'b00, fast_col};   // A[10]=0: no auto-precharge
+          dqmh_d <= 1'b0;
+          dqml_d <= 1'b0;
+          cas_pipe[CAS_LATENCY] <= 1'b1;
+          col <= fast_col + 1'b1;
+          beats_left <= 5'd3;
+          state <= S_READ;
+        end else if (open_valid && hold_cnt != 6'd0) begin
+          // A direct qword read's row, held for the next of its run.
+          hold_cnt <= hold_cnt - 6'd1;
         end else if (open_valid && ras_ok) begin
           // Nothing waiting: close the row now, so the next access to another
           // row does not wait for it. A request arriving during tRP stays
@@ -417,6 +507,7 @@ module ki_sdram_burst #(
         if ((beats_out == 0) || ((beats_out == 5'd1) && cas_take)) begin
           ready <= 1'b1;
           state <= S_IDLE;               // row open until S_IDLE closes it
+          hold_cnt <= (req_fast && req_burst == 5'd4) ? ROW_HOLD : 6'd0;
         end
       end
 
@@ -495,7 +586,9 @@ module ki_sdram_burst #(
 
     // Edge-detected request capture, matching the stock controller's contract.
     // Every request is held in req_* and left pending; S_IDLE acts on it from
-    // there on a later clock.
+    // there on a later clock - but for the direct port's qword read that
+    // S_IDLE started on this edge (FAST_ISSUE), which is held but not
+    // pending.
     old_we <= we;
     if (new_we) begin
       req_addr <= addr;
@@ -506,6 +599,7 @@ module ki_sdram_burst #(
                    (burst > MAX_WRITE_BURST) ? MAX_WRITE_BURST : burst;
       pending <= 1'b1;
       ready <= 1'b0;
+      req_fast <= 1'b0;
     end
 
     old_rd <= rd;
@@ -515,13 +609,34 @@ module ki_sdram_burst #(
       req_burst <= (burst == 0) ? 5'd1 : burst;
       pending <= 1'b1;
       ready <= 1'b0;
+      req_fast <= 1'b0;
+    end
+
+    // The direct port. Taken only with nothing pending and no request on the
+    // adapter's port this clock; otherwise it waits.
+    if (fast_take) begin
+      req_addr <= {fast_addr[24:1], 1'b0};
+      req_we <= 1'b0;
+      req_burst <= fast_addr[0] ? 5'd4 : 5'd16;
+      pending <= !fast_issue;
+      ready <= 1'b0;
+      req_fast <= 1'b1;
+      fast_seen <= fast_tog;
     end
 
 `ifndef SYNTHESIS
     // One request at a time: the adapter launches only on `ready`, which the
     // capture above lowers. A second edge while one is pending would be lost.
+    // A line read starts at a line, a qword read at a qword.
+    if (!init && (fast_tog != fast_seen) && ready && !pending && !new_req &&
+        (fast_addr[0] ? (fast_addr[2:1] != 2'd0) : (fast_addr[4:0] != 5'd0))) begin
+      $error("ki_sdram_burst: a direct read of %07h, which is not a %s",
+             fast_addr, fast_addr[0] ? "qword" : "line");
+      $fatal(1);
+    end
     if (!init && new_req && pending) begin
-      $error("ki_sdram_burst: a request arrived while another was pending");
+      $error("ki_sdram_burst: a request arrived while another was pending%s",
+             req_fast ? " - the direct port's" : "");
       $fatal(1);
     end
     if (!init && new_rd && new_we) begin

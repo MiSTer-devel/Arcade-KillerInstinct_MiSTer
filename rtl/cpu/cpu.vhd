@@ -34,6 +34,32 @@ entity cpu is
       -- A store that hits parks in a one-entry buffer and is written to the
       -- data RAMs when the port is free; see cpu_datacache.vhd's STORE_BUFFER.
       DCACHE_STORE_BUFFER   : boolean := false;
+      -- A load of the buffered doubleword is answered with the buffer's bytes
+      -- merged in, rather than draining the buffer and re-reading; see
+      -- cpu_datacache.vhd's SB_FORWARD. Needs DCACHE_STORE_BUFFER.
+      DCACHE_SB_FORWARD     : boolean := false;
+      -- A load miss is answered as soon as its own qword is in, the rest of
+      -- the line landing while the CPU runs on, and a demand fill raised
+      -- meanwhile may queue behind it on the direct fill path; see
+      -- cpu_datacache.vhd's EARLY_RESTART and fast_go_q.
+      DCACHE_EARLY_RESTART  : boolean := false;
+      -- A load missing on the staged read-ahead line is answered in the
+      -- copy's last cycle, from the staging register; see cpu_datacache.vhd's
+      -- RA_ANSWER.
+      DCACHE_RA_ANSWER      : boolean := false;
+      -- A framebuffer line is filled from its access's qword, in sub-block
+      -- order; see cpu_datacache.vhd's CWF_FB.
+      DCACHE_CWF_FB         : boolean := false;
+      -- A framebuffer miss with a dirty victim is filled before the victim is
+      -- written back; see cpu_datacache.vhd's FILL_FIRST and wb_hold.
+      DCACHE_FILL_FIRST     : boolean := false;
+      -- With DCACHE_FILL_FIRST, that fill is asked for at the miss and the
+      -- victim staged while it comes; see cpu_datacache.vhd's FILL_AT_MISS.
+      DCACHE_FILL_AT_MISS   : boolean := false;
+      -- An uncached load on the direct port completes on the edge its done
+      -- is seen, the qword straight into mem_finished_dataRot: it is always
+      -- qword-aligned, so the rotation's two stages have nothing to do.
+      UNC_FAST_DONE         : boolean := false;
       -- The crossing to the bridge as a SYNCHRONOUS 2:1 handshake: clk1x reads
       -- the mailbox's request, and clk93 its acknowledge, the write-back line
       -- release and the response FIFO's write pointer, straight from the
@@ -47,6 +73,13 @@ entity cpu is
       -- takes no load-delay bubble, as on the R4600, and merges into that
       -- load's result in stage 4. Needs LOAD_INTERLOCK. See merge_bypass.
       LOAD_MERGE_BYPASS     : boolean := false;
+      -- A clean data-cache demand miss, the cache's read-ahead line fetch and
+      -- an uncached 64-bit load of SDRAM RAM ask ki_sdram_burst's second port
+      -- straight from clk93 when nothing of the CPU's is in the bridge's
+      -- path; see fast_go.
+      -- Needs SYNC_CROSSING: the test reads clk1x's state across its timed
+      -- 2:1 crossing.
+      DIRECT_FILL           : boolean := false;
       -- Narrow the COP0 exception-address capture to the 32-bit KI contract.
       ADDR32_ONLY           : boolean := false;
       -- Drop trap instructions from the exception logic while retaining the
@@ -219,6 +252,13 @@ entity cpu is
       -- lost to exactly one class, so together they sum to the total. Keep it
       -- that way.
       debug_perf_events       : out std_logic_vector(11 downto 0);
+      -- Where the low-memory misses and cached stall went, for the PROF
+      -- page's slowest frame: 0 misses to a framebuffer page (FM), 1 cached
+      -- stall4 cycles of a load or store to one (DF), 2 misses to the rest of
+      -- the low 512 KiB - the board's SRAM region (SM), 3 cached stall4
+      -- cycles of a load or store there (DS). FM + SM is LM; what DC leaves
+      -- is main RAM's, and any CACHE command's.
+      debug_perf_mem          : out std_logic_vector(3 downto 0);
       debug_ds_first          : out std_logic_vector(31 downto 0) := (others => '0');
       debug_trace_frozen      : out std_logic := '0';
       debug_trace_trigger     : in  std_logic := '0';
@@ -240,6 +280,10 @@ entity cpu is
       -- i for the qword at offset 8i: a line whose store-miss fill was skipped
       -- holds nothing for the qwords it never stored.
       mem_line_write        : out std_logic := '0';
+      -- The read is the data cache's read-ahead line fetch (a line fetch the
+      -- cache staged, not one a miss asked for), valid with mem_request. The
+      -- bridge reads a framebuffer line for it at a word per two cycles.
+      mem_line_ra           : out std_logic := '0';
       mem_line_data         : out std_logic_vector(255 downto 0) := (others => '0');
       -- Which BYTES of mem_line_data to write, bit 8i+j for byte j of qword
       -- i, valid with it. Every byte of a qword mem_writeMask names, except
@@ -251,6 +295,19 @@ entity cpu is
       rdram_done            : in  std_logic;
       ddr3_DOUT             : in  std_logic_vector(63 downto 0);
       ddr3_DOUT_READY       : in  std_logic;
+      -- The direct fill path (DIRECT_FILL); see fast_go and ki_fast_fill.sv.
+      -- fast_ok is the bridge's: nothing of the CPU's that touches SDRAM in
+      -- flight or held there. A request is a toggle with the line's physical
+      -- address beside it; the line comes back as four beats on clk1x and a
+      -- done toggle.
+      fast_ok               : in  std_logic := '0';
+      fast_req_tog          : out std_logic := '0';
+      fast_req_line         : out std_logic_vector(31 downto 0) := (others => '0');
+      fast_window           : in  std_logic := '0';
+      fast_beat             : in  std_logic := '0';
+      fast_first            : in  std_logic := '0';
+      fast_qword            : in  std_logic_vector(63 downto 0) := (others => '0');
+      fast_done_tog         : in  std_logic := '0';
       
       ram_done              : in  std_logic;
       ram_rnw               : in  std_logic;
@@ -278,6 +335,33 @@ architecture arch of cpu is
    constant FB0_HIGH : unsigned(31 downto 0) := x"00055800";
    constant FB1_LOW  : unsigned(31 downto 0) := x"00058000";
    constant FB1_HIGH : unsigned(31 downto 0) := x"0007D800";
+   -- SDRAM RAM as ki_board_pkg places it: low RAM outside the framebuffer
+   -- windows above, and main RAM with its alias.
+   constant LOW_RAM_LAST    : unsigned(31 downto 0) := x"0007FFFF";
+   constant MAIN_RAM_BASE   : unsigned(31 downto 0) := x"08000000";
+   constant MAIN_ALIAS_LAST : unsigned(31 downto 0) := x"088FFFFF";
+   constant FAST_ON         : boolean := DIRECT_FILL and SYNC_CROSSING;
+
+   -- A line of SDRAM RAM: one the direct fill path may fetch.
+   function is_sdram_line(line : unsigned(31 downto 0)) return std_logic is
+   begin
+      if (line < FB0_LOW or
+          (line >= FB0_HIGH and line < FB1_LOW) or
+          (line >= FB1_HIGH and line <= LOW_RAM_LAST) or
+          (line >= MAIN_RAM_BASE and line <= MAIN_ALIAS_LAST)) then
+         return '1';
+      end if;
+      return '0';
+   end function;
+
+   function is_fb_line(line : unsigned(31 downto 0)) return std_logic is
+   begin
+      if ((line >= FB0_LOW and line < FB0_HIGH) or
+          (line >= FB1_LOW and line < FB1_HIGH)) then
+         return '1';
+      end if;
+      return '0';
+   end function;
 
    function bus_to_cpu16(inval : std_logic_vector(15 downto 0)) return unsigned is
    begin
@@ -696,6 +780,8 @@ architecture arch of cpu is
    signal datacache_fill_done          : std_logic := '0';
    signal datacache_fill_due           : std_logic := '0';
    signal datacache_fill_last          : std_logic;
+   -- The staged write-back waits behind its miss's fill (DCACHE_FILL_FIRST).
+   signal datacache_wb_hold            : std_logic;
 
    -- Independent clk93-domain ownership scoreboard. The main transaction
    -- FIFO carries a sequence tag to clk1x and back; this queue records what
@@ -1284,6 +1370,12 @@ architecture arch of cpu is
    signal perf_ld_indep                : std_logic;
    signal perf_st4_region              : std_logic_vector(1 downto 0) := "00";
    signal perf_exec_region             : std_logic_vector(1 downto 0);
+   -- The stage 3 access is in the low 512 KiB but not a framebuffer page:
+   -- the board's SRAM region outside them. Latched into stage 4 beside
+   -- perf_st4_region.
+   signal perf_exec_sram               : std_logic;
+   signal perf_st4_sram                : std_logic := '0';
+   signal perf_dc                      : std_logic;
    signal perf_uc                      : std_logic;
    signal perf_uc_load                 : std_logic;
    signal perf_uc_write                : std_logic;
@@ -1330,6 +1422,49 @@ architecture arch of cpu is
    signal DATACACHEON_intern           : std_logic := '0';
    signal DATACACHETLBON_intern        : std_logic := '0';
    signal datacache_request            : std_logic;
+   signal datacache_request_raw        : std_logic;
+   -- The direct fill path; see fast_go. fast_busy: a direct read is
+   -- outstanding (fast_out).
+   -- fast_go_q: a demand fill queued behind the landing line of the one
+   -- outstanding (DCACHE_EARLY_RESTART); fast_tail_q_ok says to the data
+   -- cache that its request may leave so. fast_first_seen: the newest
+   -- request's first beat has come, so the controller has taken it.
+   -- fast_path_quiet: nothing of the CPU's in the bridge's path.
+   -- fast_ra_go: the read-ahead's line fetch takes it, and fast_is_ra_r
+   -- marks the one outstanding as the read-ahead's.
+   signal fast_go                      : std_logic;
+   signal fast_ra_go                   : std_logic;
+   signal fast_path_clear              : std_logic;
+   signal fast_busy                    : std_logic;
+   signal fast_line_ok                 : std_logic;
+   signal fast_ra_line_ok              : std_logic;
+   signal fast_line                    : unsigned(31 downto 0);
+   signal fast_ra_line                 : unsigned(31 downto 0);
+   signal fast_tog_r                   : std_logic := '0';
+   signal fast_is_ra_r                 : std_logic := '0';
+   signal fast_window_dc               : std_logic;
+   -- An uncached 64-bit load takes it (fast_unc_go), fast_is_unc_r marks the
+   -- one outstanding as such, and fast_unc_q_1x is its qword, taken at its
+   -- one beat.
+   signal fast_unc_go                  : std_logic;
+   signal fast_unc_ok                  : std_logic;
+   signal fast_is_unc_r                : std_logic := '0';
+   signal fast_unc_q_1x                : std_logic_vector(63 downto 0) := (others => '0');
+   signal fast_line_r                  : unsigned(31 downto 0) := (others => '0');
+   signal fast_done_seen               : std_logic := '0';
+   signal fast_out                     : integer range 0 to 2 := 0;
+   signal fast_first_seen              : std_logic := '0';
+   signal fast_path_quiet              : std_logic;
+   signal fast_q_clear                 : std_logic;
+   signal fast_tail_q_ok               : std_logic;
+   signal fast_go_q                    : std_logic;
+   -- clk1x's transaction writes a line back into the framebuffer, which the
+   -- direct path may run beside (fast_path_clear).
+   signal mem_line_fb                  : std_logic := '0';
+   signal dc_active                    : std_logic;
+   signal dc_grant                     : std_logic;
+   signal dc_ready                     : std_logic;
+   signal dc_dout                      : std_logic_vector(63 downto 0);
    signal datacache_active             : std_logic := '0';
    signal datacache_reqAddr            : unsigned(31 downto 0);
    signal datacache_readena            : std_logic;
@@ -1342,6 +1477,7 @@ architecture arch of cpu is
    signal datacache_CmdStall           : std_logic;
    signal datacache_perf_miss          : std_logic;
    signal datacache_perf_miss_low      : std_logic;
+   signal datacache_perf_miss_fb       : std_logic;
    signal datacache_perf_fill_wait     : std_logic;
    signal datacache_perf_stride_hit    : std_logic;
    signal datacache_perf_wb_line       : std_logic;
@@ -1810,6 +1946,8 @@ begin
       "11" when (executeMemAddress(28 downto 22) = "1111111") else -- 0x1FCxxxxx, boot ROM
       "00";                                                        -- RAM, anything else
 
+   perf_exec_sram <= '1' when (executeMemAddress(31 downto 19) = 0 and executeMemFB = '0') else '0';
+
    perf_uc       <= stall4 and (not writeback_UseCache);
    perf_uc_write <= perf_uc and writebackMemWrite;
    perf_uc_load  <= perf_uc and (not writebackMemWrite) and perf_st4_read;
@@ -1853,6 +1991,15 @@ begin
    -- put in S3's slot. Row 14 of the Perf page shows S3 directly for both
    -- frames, and it is a term of the CY - RT = S4 + MD + S3 + S1 + LB
    -- identity. Repurposing it would corrupt both.
+   -- A cached stall charged by the region of the load or store in stage 4.
+   -- A CACHE command's index address is not a data address, so its stall
+   -- is left out: it stays in what DC - DF - DS leaves, with main RAM's.
+   perf_dc <= stall4 and writeback_UseCache and (perf_st4_read or writebackMemWrite);
+   debug_perf_mem <= (perf_dc and perf_st4_sram) &                    -- 3 DS
+                     (datacache_perf_miss_low and not datacache_perf_miss_fb) & -- 2 SM
+                     (perf_dc and perf_st4_region(0) and not perf_st4_region(1)) & -- 1 DF
+                     datacache_perf_miss_fb;                          -- 0 FM
+
    debug_perf_events <= perf_ld_indep &                   -- 11 DI
                         datacache_perf_miss_low &         -- 10 LM
                         perf_lost_lb &                    -- 9 LB
@@ -1897,6 +2044,9 @@ begin
          datacache_fill_done      <= datacache_fill_due;
          datacache_fill_due       <= '0';
          datacache_ra_done        <= '0';
+         -- Followed in reset too, so a direct fill that ends during one
+         -- leaves nothing outstanding after it.
+         fast_done_seen           <= fast_done_tog;
          
          if (reset_93 = '1') then
          
@@ -2070,8 +2220,10 @@ begin
                  mem4_request = '1' or
                  writefifo_schedule_ready = '0')) then
                datacache_request_latched <= '1';
+               -- Bits 4..3 are the fill's first qword (DCACHE_CWF_FB), zero
+               -- for every other fill.
                datacache_address_latched <=
-                  datacache_reqAddr(31 downto 5) & "00000";
+                  datacache_reqAddr(31 downto 3) & "000";
             end if;
 
             if (datacache_wb_sched = '1' or
@@ -2100,8 +2252,11 @@ begin
                   writefifo_issue_pending <= '0';
                   writefifo_issue_wb      <= '0';
                end if;
-            elsif (datacache_wb_fifo_count = 4 and wb_line_issued = '0') then
-               -- The complete line goes out as ONE transaction. Its four words
+            elsif (datacache_wb_fifo_count = 4 and wb_line_issued = '0' and
+                   datacache_wb_hold = '0') then
+               -- The complete line goes out as ONE transaction - once its
+               -- miss's fill has gone, if that fill goes first
+               -- (datacache_wb_hold). Its four words
                -- stay in the staging queue - slot 0 is the line base, because
                -- the queue is empty when a write-back starts and its pointer
                -- wraps after exactly four beats - and the clk1x side reads
@@ -2152,7 +2307,7 @@ begin
                   if (datacache_request = '1') then
                      datacache_request_latched <= '1';
                      datacache_address_latched <=
-                        datacache_reqAddr(31 downto 5) & "00000";
+                        datacache_reqAddr(31 downto 3) & "000";
                   else
                      datacache_request_latched <= '0';
                   end if;
@@ -2198,7 +2353,7 @@ begin
                 writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
                 writefifo_Din(116)           <= '0';
                writefifo_Din(117)           <= '0';
-             elsif (mem4_request = '1' and writefifo_mem4_ready = '1') then
+             elsif (mem4_request = '1' and writefifo_mem4_ready = '1' and fast_unc_go = '0') then
                 writefifo_issue_pending      <= '1';
                 writefifo_issue_wb           <= '0';
                 writefifo_Din( 95 downto 64) <= std_logic_vector(mem4_address);
@@ -2214,7 +2369,7 @@ begin
                 writefifo_issue_pending      <= '1';
                 writefifo_issue_wb           <= '0';
                 writefifo_Din( 95 downto 64) <=
-                  std_logic_vector(datacache_reqAddr(31 downto 5)) & "00000";
+                  std_logic_vector(datacache_reqAddr(31 downto 3)) & "000";
                writefifo_Din(104)           <= '1';
                writefifo_Din(105)           <= '1';
                writefifo_Din(106)           <= '1';
@@ -2240,7 +2395,7 @@ begin
                      "000" & std_logic_vector(mem1_address(28 downto 5)) & "00000";
                end if;
              elsif (DCRA_ON and datacache_ra_pending = '1' and
-                    writefifo_mem4_ready = '1') then
+                    writefifo_mem4_ready = '1' and fast_ra_go = '0') then
                 -- The data cache's read-ahead, below everything: a line fetch
                 -- (117) marked as the cache's (107), so clk1x captures its four
                 -- qwords as a line rather than giving them to the cache as a
@@ -2258,10 +2413,57 @@ begin
                 writefifo_Din(117)           <= '1';
                 datacache_ra_pending         <= '0';
             end if;
+            if (fast_ra_go = '1') then
+               datacache_ra_pending <= '0';
+            end if;
             if (DCRA_ON and datacache_ra_request = '1') then
                datacache_ra_pending <= '1';
             end if;
             
+            -- A direct read leaves here, and its completion comes back here:
+            -- a demand fill's as ram_done, with the same last-qword hold a
+            -- bridge fill's takes below; a read-ahead's as ra_done with
+            -- line_fill_1x, as a bridge read-ahead's comes; an uncached
+            -- load's into the rotation below, as a bridge one's goes. An
+            -- uncached load asks for its qword, bit 0 set to say so.
+            -- Direct reads outstanding, and the newest one's first beat.
+            if ((fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1') and
+                fast_done_tog = fast_done_seen) then
+               fast_out <= fast_out + 1;
+            elsif (not (fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1') and
+                   fast_done_tog /= fast_done_seen) then
+               fast_out <= fast_out - 1;
+            end if;
+            if (fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1') then
+               fast_first_seen <= '0';
+            elsif (fast_window = '1' and fast_first = '1') then
+               fast_first_seen <= '1';
+            end if;
+            if (fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1') then
+               fast_tog_r    <= not fast_tog_r;
+               fast_is_ra_r  <= fast_ra_go;
+               fast_is_unc_r <= fast_unc_go;
+               if (fast_unc_go = '1') then
+                  fast_line_r <= mem4_address(31 downto 3) & "001";
+               elsif (fast_ra_go = '1') then
+                  fast_line_r <= fast_ra_line;
+               else
+                  fast_line_r <= fast_line;
+               end if;
+            end if;
+            if (fast_done_tog /= fast_done_seen) then
+               if (fast_is_unc_r = '1') then
+                  null;   -- after the response FIFO's own completions, below
+               elsif (fast_is_ra_r = '1') then
+                  datacache_ra_data <= line_fill_1x;
+                  datacache_ra_done <= '1';
+               elsif (datacache_fill_last = '1') then
+                  datacache_fill_due <= '1';
+               else
+                  datacache_fill_done <= '1';
+               end if;
+            end if;
+
             -- The FIFO holds its head until resp_take pops it, so the payload
             -- is stable here.
             --
@@ -2322,6 +2524,21 @@ begin
                      -- data this side still has to rotate. Two more cycles.
                      response_cdc_pending_93 <= '1';
                   end if;
+               end if;
+            end if;
+            -- A direct uncached load's, the same way. It is the only memory
+            -- operation of the CPU's outstanding, so nothing above is using
+            -- the rotation (asserted). With UNC_FAST_DONE it skips it: a
+            -- qword-aligned load's rotation is none (read4_uncachedRot "00"
+            -- for every load type at a qword address), so it completes on
+            -- this edge.
+            if (fast_done_tog /= fast_done_seen and fast_is_unc_r = '1') then
+               mem_finished_dataRead   <= fast_unc_q_1x;
+               if (UNC_FAST_DONE) then
+                  mem_finished_dataRot <= fast_unc_q_1x;
+                  mem_finished_read    <= '1';
+               else
+                  response_cdc_pending_93 <= '1';
                end if;
             end if;
 
@@ -2389,11 +2606,13 @@ begin
        (writefifo_issue_pending = '1' and writefifo_issue_wb = '1') or
        datacache_wb_ena = '1') else '0';
    -- Exactly the scheduler branches through which the write-back pre-empts a
-   -- request: its issue pending, the whole line staged and not yet issued,
+   -- request: its issue pending, the whole line staged and not yet issued
+   -- nor held behind its miss's fill (a held line does not take the cycle,
+   -- so a request then goes out directly and must not be latched as well),
    -- or words still arriving.
    datacache_wb_sched <= '1' when
       ((writefifo_issue_pending = '1' and writefifo_issue_wb = '1') or
-       (datacache_wb_fifo_count = 4 and wb_line_issued = '0') or
+       (datacache_wb_fifo_count = 4 and wb_line_issued = '0' and datacache_wb_hold = '0') or
        (datacache_wb_fifo_count > 0 and datacache_wb_fifo_count < 4) or
        datacache_wb_ena = '1') else '0';
 
@@ -2526,7 +2745,8 @@ begin
             line_done  := false;
             line_armed := false;
          else
-            if (line_active_1x = '1' and resp_fifo_wr = '0') then
+            if ((line_active_1x = '1' or (fast_window = '1' and fast_is_ra_r = '1')) and
+                resp_fifo_wr = '0') then
                line_done  := false;
                line_armed := false;
             end if;
@@ -2588,6 +2808,7 @@ begin
             memoryMuxStage4       <= '0'; 
             memstate              <= MEMSTATE_IDLE;
             mem_line_write        <= '0';
+            mem_line_fb           <= '0';
             wb_line_done_1x       <= '0';
             write_cdc_req_meta_1x <= '0';
             write_cdc_req_sync_1x <= '0';
@@ -2611,6 +2832,21 @@ begin
                   when others => line_fill_1x(255 downto 192) <= ddr3_DOUT;
                end case;
                line_beat_1x <= line_beat_1x + 1;
+            -- A direct read-ahead's, from the direct port, in the same order.
+            -- Only one read-ahead is ever in flight, so the two never meet.
+            elsif (FAST_ON and DCRA_ON and fast_is_ra_r = '1' and fast_window = '1' and
+                   fast_beat = '1') then
+               if (fast_first = '1') then
+                  line_fill_1x(63 downto 0) <= fast_qword;
+                  line_beat_1x <= "01";
+               else
+                  case (line_beat_1x) is
+                     when "01"   => line_fill_1x(127 downto  64) <= fast_qword;
+                     when "10"   => line_fill_1x(191 downto 128) <= fast_qword;
+                     when others => line_fill_1x(255 downto 192) <= fast_qword;
+                  end case;
+                  line_beat_1x <= line_beat_1x + 1;
+               end if;
             end if;
 
             -- The previous transaction ends.
@@ -2627,6 +2863,7 @@ begin
                end if;
                if (mem_line_write = '1') then
                   mem_line_write  <= '0';
+                  mem_line_fb     <= '0';
                end if;
                line_active_1x <= '0';
             end if;
@@ -2661,6 +2898,7 @@ begin
                memory_read_address_1x <= write_cdc_data_93(95 downto 64);
                
                mem_size          <= "001";
+               mem_line_ra       <= '0';
                
                if (write_cdc_data_93(104) = '1' and write_cdc_data_93(107) = '1' and
                    write_cdc_data_93(117) = '0') then
@@ -2681,6 +2919,7 @@ begin
                   -- captured above as they arrive. Not datacache_active
                   -- - the D-cache would take the beats as a fill.
                   mem_size          <= "100";
+                  mem_line_ra       <= '1';
                   line_active_1x  <= '1';
                   line_beat_1x    <= "00";
                end if;
@@ -2693,6 +2932,7 @@ begin
                   -- mailbox's own payload. mem_writeMask carries the
                   -- qwords to write, set above from the payload.
                   mem_line_write <= '1';
+                  mem_line_fb    <= is_fb_line(unsigned(write_cdc_data_93(95 downto 64)));
                   mem_line_bytes <= wb_line_bytes_93;
                   mem_line_data  <= datacache_wb_fifo(3)(63 downto 0) &
                                     datacache_wb_fifo(2)(63 downto 0) &
@@ -4128,14 +4368,19 @@ begin
 
 -- synthesis translate_off
    -- The two must never disagree; a mismatch would index a different cache line
-   -- than the tag compare is checking.
+   -- than the tag compare is checking. While a stall holds the pipeline, a
+   -- jump register's forwarded value can be a load's data still in flight,
+   -- unknown in simulation; no fetch takes it, so the pair is compared only
+   -- when known, and the fetch PC itself must never latch an unknown address.
    process (clk93)
    begin
       if (rising_edge(clk93)) then
-         assert FetchIndex1 = FetchAddr1(13 downto 2)
+         assert is_x(std_logic_vector(FetchAddr1)) or FetchIndex1 = FetchAddr1(13 downto 2)
             report "FetchIndex1 drifted from FetchAddr1(13 downto 2)" severity failure;
-         assert FetchIndex2 = FetchAddr2(13 downto 2)
+         assert is_x(std_logic_vector(FetchAddr2)) or FetchIndex2 = FetchAddr2(13 downto 2)
             report "FetchIndex2 drifted from FetchAddr2(13 downto 2)" severity failure;
+         assert not is_x(std_logic_vector(PC))
+            report "fetch PC latched an unknown address" severity failure;
       end if;
    end process;
 -- synthesis translate_on
@@ -4968,6 +5213,12 @@ begin
       WB_EARLY      => DCACHE_WB_EARLY,
       LOAD_INTERLOCK => LOAD_INTERLOCK,
       STORE_BUFFER  => DCACHE_STORE_BUFFER,
+      SB_FORWARD    => DCACHE_SB_FORWARD,
+      EARLY_RESTART => DCACHE_EARLY_RESTART,
+      RA_ANSWER     => DCACHE_RA_ANSWER,
+      CWF_FB        => DCACHE_CWF_FB,
+      FILL_FIRST    => DCACHE_FILL_FIRST,
+      FILL_AT_MISS  => DCACHE_FILL_AT_MISS,
       READ_AHEAD    => DCACHE_READ_AHEAD
    )
    port map
@@ -4985,14 +5236,15 @@ begin
       force_wb_in       => DATACACHEFORCEWEB,
       write_through_in  => DATACACHEWRITETHROUGH,
       
-      ram_request       => datacache_request,
+      ram_request       => datacache_request_raw,
       ram_reqAddr       => datacache_reqAddr,
-      ram_active        => datacache_active,
-      ram_grant         => rdram_granted2X,
+      ram_active        => dc_active,
+      ram_grant         => dc_grant,
       ram_done          => datacache_fill_done,
       fill_last_q       => datacache_fill_last,
-      ddr3_DOUT         => ddr3_DOUT,      
-      ddr3_DOUT_READY   => ddr3_DOUT_READY,
+      wb_hold           => datacache_wb_hold,
+      ddr3_DOUT         => dc_dout,
+      ddr3_DOUT_READY   => dc_ready,
       
       writeback_ena     => datacache_wb_ena,  
       writeback_addr    => datacache_wb_addr, 
@@ -5032,6 +5284,7 @@ begin
       debug_state       => datacache_debug_state,
       perf_miss         => datacache_perf_miss,
       perf_miss_low     => datacache_perf_miss_low,
+      perf_miss_fb      => datacache_perf_miss_fb,
       perf_fill_wait    => datacache_perf_fill_wait,
       perf_fill_data    => open,
       perf_fill_hold    => open,
@@ -5051,10 +5304,118 @@ begin
       ra_store_addr     => unsigned(writefifo_Din(95 downto 64)),
       perf_ra_issue     => open,
       perf_ra_used      => open,
+      tail_q_ok         => fast_tail_q_ok,
       SS_reset          => SS_reset
    );
 
    stall4Masked <= stall(4 downto 3) & (stall(2) and (not executeStallFromMEM)) & stall(1 downto 0);
+
+   -- THE DIRECT FILL PATH. A data-cache demand fill goes to ki_sdram_burst's
+   -- second port instead of the write FIFO when nothing of the CPU's is
+   -- anywhere in the bridge's path - the write FIFO and its issue register,
+   -- the mailbox, clk1x's transaction, the response FIFO, the write-back
+   -- staging queue, the scheduler's latched requests - and the bridge holds
+   -- and runs nothing of the CPU's (fast_ok). Then no write of the CPU's can
+   -- be on its way to SDRAM beside the fill, and no other request can reach
+   -- the controller before this one is taken: the CPU's next one has the
+   -- whole bridge path to cross first. Lines outside SDRAM RAM - the
+   -- framebuffer pages, the boot ROM - keep the bridge, as does every other
+   -- request.
+   --
+   -- The one exception is a line written back into the framebuffer: it goes
+   -- to the on-chip RAM alone, so it may be clk1x's transaction
+   -- (mem_line_fb), waiting in the bridge or being written there. A miss
+   -- whose victim is a framebuffer line then takes the path while its victim
+   -- is still on its way.
+   --
+   -- The read-ahead's line fetch goes the same way under the same rule
+   -- (fast_ra_go), when no demand miss is asking. A store to its line from
+   -- the request until the line lands makes the copy stale in the cache
+   -- (ra_store), whichever way the line came; one that entered the write
+   -- path before the request is ahead of it, which the rule keeps true.
+   --
+   -- So does an uncached 64-bit load of SDRAM RAM, qword-aligned, as a qword
+   -- read (fast_unc_go), when no demand miss is asking; it waits for every
+   -- store ahead of it like the rest. Narrower loads, I/O, the boot ROM and
+   -- the framebuffer keep the bridge.
+   --
+   -- With DCACHE_EARLY_RESTART a load miss is answered before its line has
+   -- landed, and the CPU may miss again while it lands. That demand fill
+   -- leaves at once, a second direct read behind the first (fast_go_q), when
+   -- the one outstanding is a demand fill whose first beat has come - so the
+   -- controller has taken it, and a second toggle cannot be taken for the
+   -- first - and nothing of the CPU's is in the bridge's path. The controller
+   -- takes the second once the first has drained, and ki_fast_fill opens its
+   -- window once the first's has closed, so the two come back in order and
+   -- the first's completion is the first done toggle. Otherwise the data
+   -- cache holds the request until the line has landed.
+   fast_line       <= datacache_reqAddr(31 downto 5) & "00000";
+   fast_line_ok    <= is_sdram_line(fast_line);
+   fast_ra_line    <= datacache_ra_addr(31 downto 5) & "00000";
+   fast_ra_line_ok <= is_sdram_line(fast_ra_line);
+   fast_busy       <= '1' when (fast_out /= 0) else '0';
+   fast_path_quiet <= '1' when (writefifo_Empty = '1' and writefifo_issue_pending = '0' and
+                                write_cdc_busy_93 = '0' and
+                                (memstate = MEMSTATE_IDLE or mem_line_fb = '1') and
+                                resp_fifo_empty = '1' and response_cdc_pending_93 = '0' and
+                                response_cdc_deliver_93 = '0' and
+                                datacache_request_latched = '0' and mem1_request_latched = '0' and
+                                datacache_wb_fifo_count = 0 and wb_line_issued = '0' and
+                                datacache_wb_ena = '0') else '0';
+   fast_path_clear <= fast_ok and (not fast_busy) and fast_path_quiet;
+   fast_q_clear    <= '1' when (FAST_ON and DCACHE_EARLY_RESTART and fast_out = 1 and
+                                fast_is_ra_r = '0' and fast_is_unc_r = '0' and
+                                fast_first_seen = '1' and fast_ok = '1' and
+                                fast_path_quiet = '1') else '0';
+   fast_tail_q_ok  <= fast_q_clear and fast_line_ok;
+   fast_go_q       <= '1' when (datacache_request_raw = '1' and fast_tail_q_ok = '1') else '0';
+   fast_go         <= '1' when (FAST_ON and datacache_request_raw = '1' and
+                                fast_line_ok = '1' and fast_path_clear = '1') else '0';
+   fast_ra_go      <= '1' when (FAST_ON and DCRA_ON and datacache_ra_pending = '1' and
+                                datacache_request_raw = '0' and fast_unc_go = '0' and
+                                fast_ra_line_ok = '1' and fast_path_clear = '1') else '0';
+   fast_unc_ok     <= '1' when (mem4_req64 = '1' and mem4_address(2 downto 0) = "000" and
+                                is_sdram_line(mem4_address(31 downto 5) & "00000") = '1') else '0';
+   fast_unc_go     <= '1' when (FAST_ON and mem4_request = '1' and mem4_rnw = '1' and
+                                writefifo_mem4_ready = '1' and fast_unc_ok = '1' and
+                                datacache_request_raw = '0' and fast_path_clear = '1') else '0';
+
+   -- A direct uncached load's qword, at its one beat.
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         if (FAST_ON and fast_is_unc_r = '1' and fast_window = '1' and fast_beat = '1') then
+            fast_unc_q_1x <= fast_qword;
+         end if;
+      end if;
+   end process;
+
+-- synthesis translate_off
+   process (clk93)
+   begin
+      if rising_edge(clk93) then
+         -- A bridge read-ahead's completion beside it touches neither.
+         assert not (fast_done_tog /= fast_done_seen and fast_is_unc_r = '1' and
+                     (response_cdc_pending_93 = '1' or response_cdc_deliver_93 = '1' or
+                      (resp_fifo_empty = '0' and resp_fifo_dout(105) = '0')))
+            report "a direct uncached load completed beside another completion"
+            severity failure;
+      end if;
+   end process;
+-- synthesis translate_on
+   datacache_request <= datacache_request_raw and not fast_go and not fast_go_q;
+   fast_req_tog  <= fast_tog_r;
+   fast_req_line <= std_logic_vector(fast_line_r);
+
+   -- The data cache takes a direct demand fill through its usual fill port,
+   -- the window open from the request until the fourth beat. A direct
+   -- read-ahead's window is not the cache's: its beats go to line_fill_1x;
+   -- nor an uncached load's, whose one beat is fast_unc_q_1x.
+   fast_window_dc <= fast_window and not fast_is_ra_r and not fast_is_unc_r;
+   dc_active <= datacache_active or fast_window_dc;
+   dc_grant  <= fast_first when (fast_window_dc = '1') else rdram_granted2X;
+   dc_dout   <= fast_qword when (fast_window_dc = '1') else ddr3_DOUT;
+   dc_ready  <= fast_beat  when (fast_window_dc = '1') else ddr3_DOUT_READY;
 
    -- The instruction in stage 3 is a load, so the data cache's RAM read this
    -- cycle is its own; the store buffer drains only in a cycle when it is not.
@@ -5349,6 +5710,7 @@ begin
                   -- Perf-only, for the uncached split in debug_perf_events.
                   perf_st4_read                <= executeMemReadEnable;
                   perf_st4_region              <= perf_exec_region;
+                  perf_st4_sram                <= perf_exec_sram;
 
                   writeback_COP1_ReadEnable    <= executeCOP1ReadEnable;
                   cop1_stage4_target           <= executeCOP1Target;
