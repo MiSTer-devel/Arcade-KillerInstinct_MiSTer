@@ -32,6 +32,28 @@ entity ki_cpu_core is
       -- A one-entry store buffer in the data cache; see cpu.vhd's
       -- DCACHE_STORE_BUFFER.
       DCACHE_STORE_BUFFER : integer := 1;
+      -- A load of the buffered doubleword is answered from the buffer; see
+      -- cpu.vhd's DCACHE_SB_FORWARD.
+      DCACHE_SB_FORWARD : integer := 1;
+      -- A load miss is answered as soon as its own qword is in, and the next
+      -- demand fill may queue behind the rest of the line; see cpu.vhd's
+      -- DCACHE_EARLY_RESTART.
+      DCACHE_EARLY_RESTART : integer := 1;
+      -- A load missing on the staged read-ahead line is answered from the
+      -- staging register as the copy ends; see cpu.vhd's DCACHE_RA_ANSWER.
+      DCACHE_RA_ANSWER : integer := 1;
+      -- A framebuffer line is filled from its access's qword, in sub-block
+      -- order; see cpu.vhd's DCACHE_CWF_FB.
+      DCACHE_CWF_FB : integer := 1;
+      -- A framebuffer miss with a dirty victim is filled before the victim is
+      -- written back; see cpu.vhd's DCACHE_FILL_FIRST.
+      DCACHE_FILL_FIRST : integer := 1;
+      -- That fill is asked for at the miss, the victim staged while it comes;
+      -- see cpu.vhd's DCACHE_FILL_AT_MISS.
+      DCACHE_FILL_AT_MISS : integer := 1;
+      -- A direct uncached load completes without the rotation; see cpu.vhd's
+      -- UNC_FAST_DONE.
+      UNC_FAST_DONE : integer := 1;
       -- The crossing to the bridge without synchronisers; see cpu.vhd's
       -- SYNC_CROSSING. clk_cpu and clk_core are phase-0 outputs of one PLL
       -- at 2:1, and KillerInstinct.sdc times the paths between them.
@@ -42,7 +64,11 @@ entity ki_cpu_core is
       -- The data cache reads the next line ahead; see cpu.vhd's
       -- DCACHE_READ_AHEAD. KI's heavy frames miss almost always on the line
       -- after the previous miss.
-      DCACHE_READ_AHEAD : integer := 1
+      DCACHE_READ_AHEAD : integer := 1;
+      -- A clean data-cache demand miss fetches its line straight from
+      -- ki_sdram_burst's second port, as do the read-ahead's line fetch and
+      -- an uncached 64-bit load of SDRAM RAM; see cpu.vhd's DIRECT_FILL.
+      DIRECT_FILL : integer := 1
    );
    port
    (
@@ -64,6 +90,8 @@ entity ki_cpu_core is
       mem_dataWrite  : out std_logic_vector(63 downto 0);
       -- A dirty cache line in one request; see cpu.vhd's mem_line_write.
       mem_line_write : out std_logic;
+      -- The read is the data cache's read-ahead; see cpu.vhd's mem_line_ra.
+      mem_line_ra    : out std_logic;
       mem_line_data  : out std_logic_vector(255 downto 0);
       mem_line_bytes : out std_logic_vector(31 downto 0);
       mem_dataRead   : in  std_logic_vector(63 downto 0);
@@ -71,13 +99,27 @@ entity ki_cpu_core is
       cache_grant    : in  std_logic;
       cache_data     : in  std_logic_vector(63 downto 0);
       cache_data_ready : in std_logic;
+      -- The direct fill path; see cpu.vhd's port of the same names. Tied off
+      -- (fast_ok '0'), it is never used.
+      fast_ok        : in  std_logic := '0';
+      fast_req_tog   : out std_logic;
+      fast_req_line  : out std_logic_vector(31 downto 0);
+      fast_window    : in  std_logic := '0';
+      fast_beat      : in  std_logic := '0';
+      fast_first     : in  std_logic := '0';
+      fast_qword     : in  std_logic_vector(63 downto 0) := (others => '0');
+      fast_done_tog  : in  std_logic := '0';
 
       errors         : out std_logic_vector(5 downto 0);
       debug_fetch_pc : out std_logic_vector(31 downto 0);
       debug_retired  : out std_logic_vector(31 downto 0);
       -- WHERE the frame's instructions retired, in seventeen 16-bit fields of
-      -- 256: nine COARSE buckets and eight FINE ones. See PROF_LO below.
-      debug_perf_prof : out std_logic_vector(271 downto 0);
+      -- 256: nine COARSE buckets and eight FINE ones (see PROF_LO below); then
+      -- four more of the same frame: where its low-memory misses and cached
+      -- stall went - fields 17 FM and 19 SM, miss COUNTS as MC and LM are,
+      -- and 18 DF and 20 DS, cycles in units of 256 (cpu.vhd's
+      -- debug_perf_mem).
+      debug_perf_prof : out std_logic_vector(335 downto 0);
       -- Which coarse bucket the fine map currently covers. The page has to
       -- say so, or F0..F7 are eight numbers with no address attached.
       debug_prof_fine : out std_logic_vector(2 downto 0);
@@ -149,6 +191,10 @@ entity ki_cpu_core is
       -- While high, hold the slowest-frame capture cleared. Release it to
       -- start a fresh capture.
       perf_clear              : in  std_logic;
+      -- Which coarse bucket the PROF page's fine map covers: 0 follows the
+      -- slowest frame's hottest bucket; 1 to 8 hold it on B0 to B7, from
+      -- the next window on. A setting from the OSD.
+      prof_fine_sel           : in  std_logic_vector(3 downto 0) := (others => '0');
       -- Per-frame values from ki_memory_bridge. Stable for a whole frame, so
       -- two flops are enough to bring them over; the residual risk is a torn
       -- read in the single cycle they change, once per frame, on a diagnostic.
@@ -193,11 +239,14 @@ architecture rtl of ki_cpu_core is
    -- It follows the hottest coarse bucket rather than a fixed one, so it aims
    -- itself at whichever game is running.
    constant FINE_N       : integer := 8;
+   -- FM, DF, SM, DS; see debug_perf_prof.
+   constant MEM_N        : integer := 4;
    type t_prof is array(0 to PROF_N - 1) of unsigned(23 downto 0);
    type t_fine is array(0 to FINE_N - 1) of unsigned(23 downto 0);
    type t_perf is array(0 to PERF_N - 1) of unsigned(23 downto 0);
    signal perf_cnt       : t_perf := (others => (others => '0'));
    signal perf_events    : std_logic_vector(11 downto 0);
+   signal perf_mem       : std_logic_vector(MEM_N - 1 downto 0);
    signal debug_retired_i : std_logic_vector(31 downto 0);
    signal prof_pc_i       : std_logic_vector(31 downto 0);
    signal prof_valid_i    : std_logic;
@@ -207,6 +256,10 @@ architecture rtl of ki_cpu_core is
    -- harmless, but leaving one control synchronised and its neighbour not is
    -- the kind of inconsistency that reads as an oversight later.
    signal perf_clear_meta : std_logic_vector(1 downto 0) := (others => '0');
+   -- prof_fine_sel crosses the same way. It is a setting, not an event, so
+   -- two flops are all it needs.
+   signal prof_sel_meta   : std_logic_vector(3 downto 0) := (others => '0');
+   signal prof_sel_sync   : std_logic_vector(3 downto 0) := (others => '0');
 begin
    mem_address <= std_logic_vector(address_u);
    mem_size    <= std_logic_vector(size_u);
@@ -247,9 +300,17 @@ begin
          DCACHE_WB_EARLY      => (DCACHE_WB_EARLY /= 0),
          LOAD_INTERLOCK       => (LOAD_INTERLOCK /= 0),
          DCACHE_STORE_BUFFER  => (DCACHE_STORE_BUFFER /= 0),
+         DCACHE_SB_FORWARD    => (DCACHE_SB_FORWARD /= 0),
+         DCACHE_EARLY_RESTART => (DCACHE_EARLY_RESTART /= 0),
+         DCACHE_RA_ANSWER     => (DCACHE_RA_ANSWER /= 0),
+         DCACHE_CWF_FB        => (DCACHE_CWF_FB /= 0),
+         DCACHE_FILL_FIRST    => (DCACHE_FILL_FIRST /= 0),
+         DCACHE_FILL_AT_MISS  => (DCACHE_FILL_AT_MISS /= 0),
+         UNC_FAST_DONE        => (UNC_FAST_DONE /= 0),
          SYNC_CROSSING        => (SYNC_CROSSING /= 0),
          LOAD_MERGE_BYPASS    => (LOAD_MERGE_BYPASS /= 0),
          DCACHE_READ_AHEAD    => (DCACHE_READ_AHEAD /= 0),
+         DIRECT_FILL          => (DIRECT_FILL /= 0),
          -- KI uses the 32-bit exception-address contract.
          ADDR32_ONLY          => true,
          -- KI does not use the optional trap-instruction exception path.
@@ -310,6 +371,7 @@ begin
          debug_eret_flags        => debug_eret_flags,
          debug_ds_count          => debug_ds_count,
          debug_perf_events       => perf_events,
+         debug_perf_mem          => perf_mem,
          debug_ds_first          => debug_ds_first,
          debug_trace_trigger     => debug_trace_trigger,
          mem_request           => mem_request,
@@ -320,6 +382,7 @@ begin
          mem_writeMask         => mem_writeMask,
          mem_dataWrite         => mem_dataWrite,
          mem_line_write        => mem_line_write,
+         mem_line_ra           => mem_line_ra,
          mem_line_data         => mem_line_data,
          mem_line_bytes        => mem_line_bytes,
          mem_dataRead          => mem_dataRead,
@@ -328,6 +391,14 @@ begin
          rdram_done            => '0',
          ddr3_DOUT             => cache_data,
          ddr3_DOUT_READY       => cache_data_ready,
+         fast_ok               => fast_ok,
+         fast_req_tog          => fast_req_tog,
+         fast_req_line         => fast_req_line,
+         fast_window           => fast_window,
+         fast_beat             => fast_beat,
+         fast_first            => fast_first,
+         fast_qword            => fast_qword,
+         fast_done_tog         => fast_done_tog,
          ram_done              => '0',
          ram_rnw               => '1',
          ram_dataRead          => (others => '0'),
@@ -382,6 +453,8 @@ begin
       signal hot_val      : unsigned(23 downto 0) := (others => '0');
       signal hot_idx      : unsigned(2 downto 0)  := (others => '0');
       signal fine_base    : unsigned(2 downto 0)  := (others => '0');
+      type t_mem is array(0 to MEM_N - 1) of unsigned(23 downto 0);
+      signal mem_cnt      : t_mem := (others => (others => '0'));
       -- Which bucket the instruction retiring this cycle belongs to, and
       -- whether it belongs to any. Combinational from the CPU's own retire
       -- condition, so these sum to RT.
@@ -465,15 +538,30 @@ begin
                          " but bucket B" & integer'image(to_integer(fine_base)) &
                          " counted " & integer'image(to_integer(prof_cnt(to_integer(fine_base))))
                   severity error;
+               -- The low-memory split partitions LM exactly, and its stall
+               -- is part of DC.
+               assert resize(mem_cnt(0), 25) + resize(mem_cnt(2), 25) = resize(perf_cnt(12), 25)
+                  report "PROF: FM " & integer'image(to_integer(mem_cnt(0))) &
+                         " + SM " & integer'image(to_integer(mem_cnt(2))) &
+                         " is not LM " & integer'image(to_integer(perf_cnt(12)))
+                  severity error;
+               assert resize(mem_cnt(1), 25) + resize(mem_cnt(3), 25) <= resize(perf_cnt(7), 25)
+                  report "PROF: DF " & integer'image(to_integer(mem_cnt(1))) &
+                         " + DS " & integer'image(to_integer(mem_cnt(3))) &
+                         " is more than DC " & integer'image(to_integer(perf_cnt(7)))
+                  severity error;
             end if;
             -- synthesis translate_on
             perf_flip_meta  <= perf_flip_meta(1 downto 0) & perf_flip;
             perf_clear_meta <= perf_clear_meta(0) & perf_clear;
+            prof_sel_meta   <= prof_fine_sel;
+            prof_sel_sync   <= prof_sel_meta;
 
             if (reset_93_pipe(1) = '1') then
                perf_cnt         <= (others => (others => '0'));
                prof_cnt         <= (others => (others => '0'));
                fine_cnt         <= (others => (others => '0'));
+               mem_cnt          <= (others => (others => '0'));
                hot_val          <= (others => '0');
                hot_idx          <= (others => '0');
                fine_base        <= (others => '0');
@@ -531,6 +619,16 @@ begin
                      debug_perf_prof((PROF_N + i) * 16 + 15 downto (PROF_N + i) * 16)
                         <= std_logic_vector(fine_cnt(i)(23 downto 8));
                   end loop;
+                  -- FM and SM are counts, as MC is; DF and DS cycles, as DC.
+                  for i in 0 to MEM_N - 1 loop
+                     if (i mod 2 = 0) then
+                        debug_perf_prof((PROF_N + FINE_N + i) * 16 + 15 downto (PROF_N + FINE_N + i) * 16)
+                           <= perf_slice(mem_cnt(i), 2);
+                     else
+                        debug_perf_prof((PROF_N + FINE_N + i) * 16 + 15 downto (PROF_N + FINE_N + i) * 16)
+                           <= perf_slice(mem_cnt(i), 7);
+                     end if;
+                  end loop;
                   for i in 0 to PERF_N - 1 loop
                      debug_perf_worst(i * 16 + 15 downto i * 16)
                         <= perf_slice(perf_cnt(i), i);
@@ -539,11 +637,20 @@ begin
                      <= std_logic_vector(retired_cnt(23 downto 8));
                end if;
 
+               -- A bucket chosen from the OSD holds the fine map: the next
+               -- window bins under it, whatever the latch above aimed at. It
+               -- moves only here, at a window end, so the fine bins still sum
+               -- to their bucket.
+               if (unsigned(prof_sel_sync) /= 0) then
+                  fine_base <= resize(unsigned(prof_sel_sync) - 1, 3);
+               end if;
+
                win_flip     <= flip;
                cy_full      <= '0';
                perf_cnt     <= (others => (others => '0'));
                prof_cnt     <= (others => (others => '0'));
                fine_cnt     <= (others => (others => '0'));
+               mem_cnt      <= (others => (others => '0'));
                hot_val      <= (others => '0');
                retired_cnt  <= (others => '0');
                retired_prev <= unsigned(debug_retired_i);
@@ -561,6 +668,9 @@ begin
                prof_cnt(prof_idx) <= bump(prof_cnt(prof_idx), prof_valid_i);
                fine_cnt(fine_idx) <= bump(fine_cnt(fine_idx),
                                           prof_valid_i and fine_hit);
+               for i in 0 to MEM_N - 1 loop
+                  mem_cnt(i) <= bump(mem_cnt(i), perf_mem(i));
+               end loop;
                -- One compare, against the bucket that just moved, never a
                -- 9-way maximum: this design is placement-bound at 100 MHz and
                -- a comparison tree here would not be free. The OT bucket is

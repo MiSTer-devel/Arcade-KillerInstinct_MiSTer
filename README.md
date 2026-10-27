@@ -19,10 +19,6 @@ implements:
 - Original/Full Screen aspect ratios
 - Core Pause
 
-### Known issue
-
-Occasional slowdown
-
 ## Media
 
 ROM and disk data are not included. MRAs are supplied for the dumped KI and
@@ -41,7 +37,7 @@ chdman extracthd -i kinst2.chd -o kinst2.img
 
 Place the resulting image files in their respective folders ```games/kinst/``` or ```games/kinst2/```.
 
-On first launch the HDD image must be selected, this is not necessary for later launches.
+[ki-rom](https://github.com/nekuz0r/ki-rom) custom boot ROM release should be zipped as ki-rom.zip and placed in ```games/hbmame/```
 
 ## Credits
 Core by Keith Conger
@@ -51,3 +47,5 @@ R4300i CPU adapted from the [N64](https://github.com/MiSTer-devel/N64_MiSTer) Mi
 `adsp2105.sv` and `dcs_mem.sv` are adapted from the [Wolf Unit](https://github.com/blahm1d/wolf-unit) MiSTer core
 
 [MAME](https://github.com/mamedev/mame) kinst driver as a reference
+
+[MisterAddons](https://github.com/misteraddons) original hardware measurements

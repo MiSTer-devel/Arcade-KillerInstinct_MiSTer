@@ -69,7 +69,7 @@ module ki_debug_screen (
   // Gameplay slowdowns are occasional, so the live row usually shows a good
   // frame.
   input  wire [223:0] perf_worst,
-  input  wire [271:0] perf_prof,
+  input  wire [335:0] perf_prof,
   // Which coarse bucket F0..F7 cover. Latched with perf_prof in the CPU, so
   // the header digit always describes the frame the numbers came from.
   input  wire   [2:0] prof_fine_base,
@@ -216,16 +216,22 @@ module ki_debug_screen (
   // frame since the last Clear - so SUM(B)/CY is a real check. It is the
   // slowest frame of ANY scene since Clear, so Clear during the scene you
   // want.
+  //
+  // Rows 12 and 13 split that frame's LM by where the misses went: FM and
+  // DF, misses to the framebuffer pages and the cached stall of accesses to
+  // them; SM and DS, the same for the rest of the low 512 KiB, the board's
+  // SRAM region. FM + SM = LM; DC - DF - DS is main RAM's stall, and any
+  // CACHE command's.
   function automatic [7:0] prof_char(
     input logic  [3:0] row,
     input logic  [4:0] column,
-    input logic [271:0] p,
+    input logic [335:0] p,
     input logic   [2:0] fb
   );
-    logic [15:0] f [0:16];
+    logic [15:0] f [0:20];
     integer i;
     begin
-      for (i = 0; i < 17; i = i + 1)
+      for (i = 0; i < 21; i = i + 1)
         f[i] = p[i*16 +: 16];
       prof_char = " ";
       case (row)
@@ -259,6 +265,11 @@ module ki_debug_screen (
                                        : perf_field(column, 5'd8, "F", "5", f[14]);
         10: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "6", f[15])
                                         : perf_field(column, 5'd8, "F", "7", f[16]);
+        // The low-memory split, after a blank row.
+        12: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "F", "M", f[17])
+                                        : perf_field(column, 5'd8, "D", "F", f[18]);
+        13: prof_char = (column < 5'd8) ? perf_field(column, 5'd0, "S", "M", f[19])
+                                        : perf_field(column, 5'd8, "D", "S", f[20]);
         default: prof_char = " ";
       endcase
     end

@@ -41,6 +41,42 @@ package ki_board_pkg;
     end
     return merged;
   endfunction
+
+  // Where each region of the CPU's physical map lives, as byte offsets into
+  // SDRAM - low RAM at 0, main RAM from 1 MiB, the boot ROM's copy from 9 MiB
+  // - and the DCS ROM's offset in DDR3.
+  localparam logic [27:0] KI_STORE_LOW  = 28'h000_0000;
+  localparam logic [27:0] KI_STORE_MAIN = 28'h010_0000;
+  localparam logic [27:0] KI_STORE_BOOT = 28'h090_0000;
+  localparam logic [27:0] KI_STORE_DCS  = 28'h0a0_0000;
+
+  // The two framebuffer pages inside low RAM, each an exact 320x240x16
+  // buffer. They live in on-chip memory; the 10 KiB after each is low SDRAM.
+  localparam logic [31:0] KI_FB0_LOW  = 32'h0003_0000;
+  localparam logic [31:0] KI_FB0_HIGH = 32'h0005_5800;
+  localparam logic [31:0] KI_FB1_LOW  = 32'h0005_8000;
+  localparam logic [31:0] KI_FB1_HIGH = 32'h0007_d800;
+
+  // A CPU physical address's SDRAM storage address. Anything that is not low
+  // RAM or main RAM is taken as the boot ROM.
+  function automatic logic [27:0] ki_storage_address(
+    input logic [31:0] address
+  );
+    if (address <= KI_LOW_RAM_LAST)
+      return KI_STORE_LOW + address[27:0];
+    if ((address >= KI_MAIN_RAM_BASE) &&
+        (address <= KI_MAIN_RAM_LAST))
+      return KI_STORE_MAIN +
+          (address[27:0] - KI_MAIN_RAM_BASE[27:0]);
+    // Main RAM is physically 8 MiB.  The ROM proves that A23 selects no DRAM
+    // pin for the following 1 MiB, which aliases the array's first 1 MiB.
+    if ((address >= KI_MAIN_RAM_ALIAS_BASE) &&
+        (address <= KI_MAIN_RAM_ALIAS_LAST))
+      return KI_STORE_MAIN +
+          (address[27:0] - KI_MAIN_RAM_ALIAS_BASE[27:0]);
+    return KI_STORE_BOOT +
+        (address[27:0] - KI_BOOT_BASE[27:0]);
+  endfunction
 endpackage
 
 `default_nettype wire

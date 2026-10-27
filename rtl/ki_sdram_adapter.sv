@@ -59,6 +59,16 @@ module ki_sdram_adapter (
 
   output logic        sdram_ready,
 
+  // The CPU's direct fill path; see ki_fast_fill. The request comes from the
+  // CPU's clock; the line goes back on clk.
+  input  wire         fast_req_tog,
+  input  wire  [31:0] fast_req_line,
+  output wire         fast_window,
+  output wire         fast_beat,
+  output wire         fast_first,
+  output wire  [63:0] fast_qword,
+  output wire         fast_done_tog,
+
   output wire  [24:0] controller_address,
   output wire [255:0] controller_write_data,
   output wire  [31:0] controller_byte_enable,
@@ -69,7 +79,10 @@ module ki_sdram_adapter (
   // A controller without per-beat validity may tie this low; single-word read
   // data is then taken at the completion handshake.
   input  wire         controller_dout_valid,
-  input  wire         controller_ready
+  input  wire         controller_ready,
+  output wire         controller_fast_tog,
+  output wire  [24:0] controller_fast_addr,
+  input  wire         controller_fast_valid
 );
   // What the arbitration below launches. ki_sdram_x2 carries these to the
   // controller unchanged and packs the words that come back.
@@ -97,6 +110,18 @@ module ki_sdram_adapter (
     .ctl_rd(controller_read), .ctl_we(controller_write),
     .ctl_dout(controller_read_data), .ctl_dout_valid(controller_dout_valid),
     .ctl_ready(controller_ready)
+  );
+
+  // The direct fill path bypasses the arbitration below: ki_sdram_burst takes
+  // its requests on a port of their own, and only when nothing else is
+  // pending. ki_fast_fill maps the line and assembles what comes back.
+  ki_fast_fill fast (
+    .clk(clk), .clk_ctl(clk2x),
+    .req_tog(fast_req_tog), .req_line(fast_req_line),
+    .ctl_tog(controller_fast_tog), .ctl_addr(controller_fast_addr),
+    .word(controller_read_data), .word_valid(controller_fast_valid),
+    .window(fast_window), .beat(fast_beat), .first(fast_first),
+    .qword(fast_qword), .done_tog(fast_done_tog)
   );
 
   // Returned beats pass straight through to the port that owns the
