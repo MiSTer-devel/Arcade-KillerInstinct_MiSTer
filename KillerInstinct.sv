@@ -122,10 +122,10 @@ module emu
 
 localparam CONF_STR = {
 	"KillerInstinct;;",
-	"SC0,IMG,Mount HDD Image;",
+	"S0,IMG,Mount HDD Image;",
 	"-;",
 	"P1,Video Settings;",
-	"P1O1,Aspect Ratio,Original,Full Screen;",
+	"P1O1,Aspect Ratio,Original,Wide Screen;",
 	"P1O2,Video Timing,Native,60Hz CRT;",
 	"-;",
 	"O8,OSD Pause,Off,On;",
@@ -143,7 +143,7 @@ localparam CONF_STR = {
 `endif
 	"R0,Reset;",
 	"J1,High Quick,High Medium,High Fierce,Low Quick,Low Medium,Low Fierce,Start,Coin,Service,Test,Pause;",
-	"V,1.59"
+	"V,1.60"
 };
 
 wire [1:0] buttons;

@@ -19,10 +19,6 @@ implements:
 - Original/Full Screen aspect ratios
 - Core Pause
 
-### Known issue
-
-Occasional slowdown
-
 ## Media
 
 ROM and disk data are not included. MRAs are supplied for the dumped KI and
@@ -41,7 +37,7 @@ chdman extracthd -i kinst2.chd -o kinst2.img
 
 Place the resulting image files in their respective folders ```games/kinst/``` or ```games/kinst2/```.
 
-On first launch the HDD image must be selected, this is not necessary for later launches.
+[ki-rom](https://github.com/nekuz0r/ki-rom) custom boot ROM release should be zipped as ki-rom.zip and placed in ```games/hbmame/```
 
 ## Credits
 Core by Keith Conger
