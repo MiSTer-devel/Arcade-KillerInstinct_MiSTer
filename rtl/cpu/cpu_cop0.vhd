@@ -526,7 +526,7 @@ begin
          when 16 =>
             readValue(1 downto 0)   <= COP0_16_CONFIG_cacheAlgoKSEG0;
             readValue(3 downto 2)   <= COP0_16_CONFIG_cu;   
-            readValue(14 downto 4)  <= "11001000110";
+            readValue(14 downto 4)  <= "11001001011";
             readValue(15)           <= COP0_16_CONFIG_bigEndian;
             readValue(23 downto 16) <= "00000110"; 
             readValue(27 downto 24) <= COP0_16_CONFIG_sysadWBPattern; 
@@ -1664,7 +1664,7 @@ begin
    
    cop0_export(16)(1 downto 0)   <= COP0_16_CONFIG_cacheAlgoKSEG0;
    cop0_export(16)(3 downto 2)   <= COP0_16_CONFIG_cu;   
-   cop0_export(16)(14 downto 4)  <= "11001000110";
+   cop0_export(16)(14 downto 4)  <= "11001001011";
    cop0_export(16)(15)           <= COP0_16_CONFIG_bigEndian;
    cop0_export(16)(23 downto 16) <= "00000110"; 
    cop0_export(16)(27 downto 24) <= COP0_16_CONFIG_sysadWBPattern; 

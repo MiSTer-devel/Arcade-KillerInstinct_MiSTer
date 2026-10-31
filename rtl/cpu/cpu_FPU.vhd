@@ -471,7 +471,7 @@ begin
          when x"2" => -- cfc1
             transfer_data <= (others => '0');
             if (transfer_RD = 0) then
-               transfer_data(11 downto 8) <= x"A";  -- revision
+               transfer_data(15 downto 0) <= x"2020";
             end if;
             if (transfer_RD = 31) then
                transfer_data(24 downto 0) <= csr; 
