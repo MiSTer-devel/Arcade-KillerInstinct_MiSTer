@@ -528,7 +528,7 @@ begin
             readValue(3 downto 2)   <= COP0_16_CONFIG_cu;   
             readValue(14 downto 4)  <= "11001001011";
             readValue(15)           <= COP0_16_CONFIG_bigEndian;
-            readValue(23 downto 16) <= "00000110"; 
+            readValue(23 downto 16) <= "00000010"; 
             readValue(27 downto 24) <= COP0_16_CONFIG_sysadWBPattern; 
             readValue(30 downto 28) <= COP0_16_CONFIG_systemClockRatio;
             
@@ -678,7 +678,7 @@ begin
                COP0_16_CONFIG_bigEndian     <= '1';
             end if;
             COP0_16_CONFIG_sysadWBPattern   <= (others => '0'); 
-            COP0_16_CONFIG_systemClockRatio <= (others => '1'); 
+            COP0_16_CONFIG_systemClockRatio <= (others => '0'); 
             COP0_17_LOADLINKEDADDRESS       <= (others => '0'); 
             COP0_18_WATCHLO                 <= (others => '0');   
             COP0_19_WATCHHI                 <= (others => '0');   
@@ -862,9 +862,9 @@ begin
                         
                         when 16 =>
                            COP0_16_CONFIG_cacheAlgoKSEG0 <= writeValue(1 downto 0);
-                           COP0_16_CONFIG_cu             <= writeValue(3 downto 2);   
-                           COP0_16_CONFIG_bigEndian      <= writeValue(15);
-                           COP0_16_CONFIG_sysadWBPattern <= writeValue(27 downto 24); 
+                           COP0_16_CONFIG_cu             <= '0' & writeValue(2);      -- bit 3 reads 0; bit 2 is K0's top bit   
+                           --COP0_16_CONFIG_bigEndian      <= writeValue(15);         -- read only
+                           --COP0_16_CONFIG_sysadWBPattern <= writeValue(27 downto 24); -- read only
                            --COP0_16_CONFIG_systemClockRatio <= writeValue(30 downto 28); -- read only
                      
                         when 17 => COP0_17_LOADLINKEDADDRESS(31 downto 0) <= writeValue(31 downto 0);
@@ -1666,7 +1666,7 @@ begin
    cop0_export(16)(3 downto 2)   <= COP0_16_CONFIG_cu;   
    cop0_export(16)(14 downto 4)  <= "11001001011";
    cop0_export(16)(15)           <= COP0_16_CONFIG_bigEndian;
-   cop0_export(16)(23 downto 16) <= "00000110"; 
+   cop0_export(16)(23 downto 16) <= "00000010"; 
    cop0_export(16)(27 downto 24) <= COP0_16_CONFIG_sysadWBPattern; 
    cop0_export(16)(30 downto 28) <= COP0_16_CONFIG_systemClockRatio;
    
