@@ -20,7 +20,7 @@ implements:
 - Game DIP switches.
 - Native/60 Hz CRT timing modes.
 - Original/Wide Screen aspect ratios
-- Optional vertical crop
+- Optional horizontal crop
 - Core Pause
 
 ## Media
