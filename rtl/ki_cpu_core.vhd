@@ -317,6 +317,8 @@ begin
          NO_TRAP_INSTR        => true,
          -- KI instruction fetches use KSEG0/KSEG1.
          INSTR_KSEG_ONLY      => true,
+         -- KI never converts a long outside +-2^55 to floating point.
+         FPU_CVT_L_NARROW     => true,
          DEBUG_TRACE          => (DEBUG_TRACE /= 0)
       )
       port map

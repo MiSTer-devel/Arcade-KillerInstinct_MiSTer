@@ -4,6 +4,14 @@ use IEEE.numeric_std.all;
 use STD.textio.all;
 
 entity cpu_FPU is
+   generic
+   (
+      -- cvt.s.l and cvt.d.l convert through the shared 57-bit path only, and
+      -- a value outside +-2^55 takes an Unimplemented Operation trap. Without
+      -- it, a 64-bit value is first shifted right into that path with its
+      -- lost bits kept as sticky, and every value converts, as on the R4600.
+      CVT_L_NARROW   : boolean := false
+   );
    port 
    (
       clk93             : in  std_logic;
@@ -165,6 +173,12 @@ architecture arch of cpu_FPU is
    
    signal clz_value                       : unsigned(56 downto 0) := (others => '0');
    signal clz_result                      : integer range 0 to 56 := 0;
+   -- Without CVT_L_NARROW: the 64-bit magnitude of a long to convert, and
+   -- its leading zero count.
+   signal cvtl_wide                       : std_logic := '0';
+   signal cvtl_mag                        : unsigned(63 downto 0) := (others => '0');
+   signal cvtl_clz                        : integer range 0 to 64 := 0;
+   signal cvtl_pre                        : unsigned(56 downto 0);
    signal exception_checkInputConvert2F   : std_logic := '0';
    signal exception_inputInvalid          : std_logic := '0';
    
@@ -762,7 +776,7 @@ begin
                
                if (OPgroup = 20 or OPgroup = 21) then
                
-                  if (signed(command_op1) >= INT64_MAX or signed(command_op1) < INT64_MIN) then
+                  if (CVT_L_NARROW and (signed(command_op1) >= INT64_MAX or signed(command_op1) < INT64_MIN)) then
                      exception_checkInputConvert2F <= bit64;
                   end if;
                
@@ -1019,9 +1033,38 @@ begin
          end if;
       end loop;
 
+      cvtl_clz <= 64;
+      if (not CVT_L_NARROW) then
+         for i in 0 to 63 loop
+            if (cvtl_mag(i) = '1') then
+               cvtl_clz <= 63 - i;
+            end if;
+         end loop;
+      end if;
+
       end if;
    end process;
    
+   -- A long's magnitude, shifted right until its top bit is at most bit 55,
+   -- with every bit shifted out ORed into bit 0. Bit 0 is only ever a sticky
+   -- bit for a value this wide, so the shared path rounds it exactly.
+   process (all)
+      variable shift : integer range 0 to 8;
+   begin
+      shift := 0;
+      for i in 56 to 63 loop
+         if (cvtl_mag(i) = '1') then
+            shift := i - 55;
+         end if;
+      end loop;
+      cvtl_pre <= resize(shift_right(cvtl_mag, shift), 57);
+      for i in 0 to 7 loop
+         if (i < shift and cvtl_mag(i) = '1') then
+            cvtl_pre(0) <= '1';
+         end if;
+      end loop;
+   end process;
+
    -- shifter
    process (clk93)
    begin
@@ -1617,30 +1660,62 @@ begin
             else
                clz_value <= 24x"0" & unsigned(abs(resize(signed(command_op1(31 downto 0)), 33)));
             end if;
+            if (not CVT_L_NARROW) then
+               -- abs(-2^63) is -2^63 again, whose bits are 2^63 unsigned.
+               cvtl_wide <= bit64;
+               cvtl_mag  <= unsigned(abs(signed(command_op1)));
+            end if;
          end if;
-         
+
          -- stage 1
          if (CIS_start = '1' or CID_start = '1') then
             signOut       <= signA_1;
             shifter_input <= clz_value;
+            if (not CVT_L_NARROW and cvtl_wide = '1') then
+               shifter_input <= cvtl_pre;
+            end if;
          end if;
-         
+
          -- stage 2
          if (CIS_stage1 = '1') then
-            if (clz_result = 56) then 
+            if (clz_result = 56) then
                CID_exp <= 0;
             else
                CID_exp   <= 127 + (55 - clz_result);
                CID_shift <= 26 - (55 - clz_result);
             end if;
+            -- The top bit of the long is bit 63 - cvtl_clz; cvtl_pre has it at
+            -- that bit or at bit 55, whichever is lower.
+            if (not CVT_L_NARROW and cvtl_wide = '1') then
+               if (cvtl_clz = 64) then
+                  CID_exp <= 0;
+               elsif (cvtl_clz < 8) then
+                  CID_exp   <= 127 + (63 - cvtl_clz);
+                  CID_shift <= 26 - 55;
+               else
+                  CID_exp   <= 127 + (63 - cvtl_clz);
+                  CID_shift <= 26 - (63 - cvtl_clz);
+               end if;
+            end if;
          end if;
-         
+
          if (CID_stage1 = '1') then
-            if (clz_result = 56) then 
+            if (clz_result = 56) then
                CID_exp <= 0;
             else
                CID_exp   <= 1023 + (55 - clz_result);
                CID_shift <= 55 - (55 - clz_result);
+            end if;
+            if (not CVT_L_NARROW and cvtl_wide = '1') then
+               if (cvtl_clz = 64) then
+                  CID_exp <= 0;
+               elsif (cvtl_clz < 8) then
+                  CID_exp   <= 1023 + (63 - cvtl_clz);
+                  CID_shift <= 0;
+               else
+                  CID_exp   <= 1023 + (63 - cvtl_clz);
+                  CID_shift <= 55 - (63 - cvtl_clz);
+               end if;
             end if;
          end if;
          

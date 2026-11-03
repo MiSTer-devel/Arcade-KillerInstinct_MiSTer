@@ -88,6 +88,9 @@ entity cpu is
       -- KI instruction fetches use the unmapped KSEG0/KSEG1 path. The data TLB
       -- remains enabled for mapped data accesses.
       INSTR_KSEG_ONLY       : boolean := false;
+      -- cvt.s.l and cvt.d.l of a value outside +-2^55 take an Unimplemented
+      -- Operation trap instead of converting; see cpu_FPU's CVT_L_NARROW.
+      FPU_CVT_L_NARROW      : boolean := false;
       -- Build the pre-event execution trace.
       --
       -- The trace is a diagnostic, and it is not free. debug_trace_bus is 896
@@ -1263,6 +1266,7 @@ architecture arch of cpu is
    signal exceptionPC                  : unsigned(63 downto 0) := (others => '0');
    signal COP0ReadValue                : unsigned(63 downto 0) := (others => '0');
    
+   signal COP0_enable                  : std_logic;
    signal COP1_enable                  : std_logic;
    signal COP2_enable                  : std_logic;
    signal fpuRegMode                   : std_logic;
@@ -3885,7 +3889,11 @@ begin
                         
                      when 16#10# => -- COP0
                         blockIRQ <= '1';
-                        if (decSource1(4) = '1') then
+                        if (COP0_enable = '0') then
+                           decodeExcType           <= EXCTYPE_DECODE;
+                           decodeExcCode           <= x"B";
+                           decodeExcCOP            <= "00";
+                        elsif (decSource1(4) = '1') then
                            case (to_integer(decImmData(5 downto 0))) is
                               when 1 => decodeTLBR  <= '1';                         
                               when 2 => decodeTLBWI <= '1'; 
@@ -6126,6 +6134,7 @@ begin
       exception               => exception,   
       exceptionStage1         => exceptionStage1,   
             
+      COP0_enable             => COP0_enable,
       COP1_enable             => COP1_enable,
       COP2_enable             => COP2_enable,
       fpuRegMode              => fpuRegMode,
@@ -6207,6 +6216,10 @@ begin
    );
    
    icpu_FPU : entity work.cpu_FPU
+   generic map
+   (
+      CVT_L_NARROW      => FPU_CVT_L_NARROW
+   )
    port map
    (
       clk93             => clk93,         

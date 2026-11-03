@@ -22,10 +22,10 @@ entity cpu_cop0 is
       -- 31 downto 0; dmfc0 needs the 64-bit operations those same Status bits
       -- gate. The upper halves are therefore unreadable by the game.
       --
-      -- XContext exists only to serve the XTLB refill vector at 0x80000080,
-      -- which is unreachable without 64-bit addressing, and its Region and
-      -- BadVPN fields are written from nothing but excAddr - so with this set
-      -- they are constant zero and synthesis removes them outright.
+      -- XContext serves the XTLB refill vector at 0x80000080, which User code
+      -- with UX set reaches under a 32-bit kernel. With this set it is
+      -- written from the same sign-extended 32-bit address as BadVAddr, so it
+      -- adds no width to the capture.
       ADDR32_ONLY           : boolean := false
    );
    port 
@@ -108,6 +108,7 @@ entity cpu_cop0 is
       exception               : out std_logic := '0';
       exceptionStage1         : out std_logic := '0';
             
+      COP0_enable             : out std_logic;
       COP1_enable             : out std_logic;
       COP2_enable             : out std_logic;
       fpuRegMode              : out std_logic;
@@ -241,8 +242,18 @@ architecture arch of cpu_cop0 is
    signal bit64mode                       : std_logic := '0';
    signal tlbMiss1                        : std_logic := '0';
    signal tlbMiss3                        : std_logic := '0';
-   
-   signal nextEPC_1                       : unsigned(63 downto 0) := (others => '0');
+   -- EXL as it was before the exception being taken set it. An exception
+   -- taken with EXL already set leaves EPC and Cause.BD alone, and a TLB
+   -- miss taken then goes to the general vector, not a refill vector.
+   signal exlAtException                  : std_logic := '0';
+   -- KX, SX or UX for the mode the exception was taken in: it picks the XTLB
+   -- refill vector over the TLB one. Taken here rather than from bit64mode,
+   -- which follows the mode the exception switches to.
+   signal xtlbAtException                 : std_logic := '0';
+   signal xtlbNow                         : std_logic;
+   signal xtlbAfterEret                   : std_logic;
+
+   signal nextEPC_1                      : unsigned(63 downto 0) := (others => '0');
    signal isDelaySlot_1                   : std_logic := '0';
    -- Written only by the exception process below.
    signal suppressed_1                    : std_logic := '0';
@@ -271,10 +282,12 @@ architecture arch of cpu_cop0 is
    
    signal TLB_init                        : std_logic := '0';
    signal TLB_resetMode                   : std_logic := '0';
-   signal TLB_resetAddr                   : unsigned(4 downto 0) := (others => '0');
+   -- The R4600's TLB has 48 entries, 0 to 47.
+   constant TLB_LAST                      : integer := 47;
+   signal TLB_resetAddr                   : unsigned(5 downto 0) := (others => '0');
    
-   signal TLB_readAddr                    : unsigned(4 downto 0) := (others => '0');
-   signal TLB_compareEnd                  : unsigned(4 downto 0) := (others => '0');
+   signal TLB_readAddr                    : unsigned(5 downto 0) := (others => '0');
+   signal TLB_compareEnd                  : unsigned(5 downto 0) := (others => '0');
    
    signal TLBInvalidate                   : std_logic := '0'; 
    
@@ -338,8 +351,8 @@ architecture arch of cpu_cop0 is
    
    signal TLBMEM_writeEnable              : std_logic;
    signal TLBMEM_writeData                : std_logic_vector(100 downto 0);
-   signal TLBMEM_writeAddr                : std_logic_vector(4 downto 0);
-   signal TLBMEM_readAddr                 : std_logic_vector(4 downto 0);
+   signal TLBMEM_writeAddr                : std_logic_vector(5 downto 0);
+   signal TLBMEM_readAddr                 : std_logic_vector(5 downto 0);
    signal TLBMEM_readData                 : std_logic_vector(100 downto 0);
    
    signal TLB_ExcInstrRead                : std_logic;
@@ -370,7 +383,7 @@ architecture arch of cpu_cop0 is
    signal eret_ie_reg                     : std_logic := '0';
    
    signal TLB_InstrClearEna               : std_logic;
-   signal TLB_InstrClearIndex             : unsigned(4 downto 0);
+   signal TLB_InstrClearIndex             : unsigned(5 downto 0);
    
    signal TLB_Instr_fetchReq              : std_logic;
    signal TLB_Data_fetchReq               : std_logic;
@@ -385,7 +398,7 @@ architecture arch of cpu_cop0 is
    signal TLB_fetchCached                 : std_logic := '0';
    signal TLB_fetchDirty                  : std_logic := '0';
    signal TLB_fetchRandom                 : std_logic := '0';
-   signal TLB_fetchSource                 : unsigned(4 downto 0) := (others => '0');
+   signal TLB_fetchSource                 : unsigned(5 downto 0) := (others => '0');
    signal TLB_fetchAddrOut                : unsigned(31 downto 0) := (others => '0');
    signal TLB_fetchAddrOutMasked          : unsigned(31 downto 0) := (others => '0');
    
@@ -406,7 +419,7 @@ architecture arch of cpu_cop0 is
       region                 : unsigned(1 downto 0);
       random                 : std_logic;
    end record; 
-   type tTLBENTRYS  is array(0 to 31) of tTLBENTRY;
+   type tTLBENTRYS  is array(0 to 63) of tTLBENTRY;
    signal TLBENTRYS : tTLBENTRYS;
 -- synthesis translate_on
    
@@ -416,6 +429,22 @@ architecture arch of cpu_cop0 is
 
 begin 
 
+   -- CP0 instructions are always usable in Kernel mode (KSU = 0, or EXL or
+   -- ERL set), and in User or Supervisor mode only with Status.CU0 set.
+   -- The instruction ERET returns to is decoded while ERET clears ERL (or EXL
+   -- when ERL is clear), so it is checked in the mode ERET leaves behind.
+   COP0_enable   <= '1' when (COP0_12_SR_enable_cop0 = '1' or COP0_12_SR_privilegeMode = "00") else
+                    '1' when (eret = '0' and (COP0_12_SR_exceptionLevel = '1' or COP0_12_SR_errorLevel = '1')) else
+                    '1' when (eret = '1' and COP0_12_SR_exceptionLevel = '1' and COP0_12_SR_errorLevel = '1') else
+                    '0';
+   xtlbNow       <= COP0_12_SR_kernelExtendedAddr when (COP0_12_SR_exceptionLevel = '1' or COP0_12_SR_errorLevel = '1' or COP0_12_SR_privilegeMode = "00") else
+                    COP0_12_SR_supervisorAddr     when (COP0_12_SR_privilegeMode = "01") else
+                    COP0_12_SR_userExtendedAddr;
+   -- The same for the mode an ERET in progress returns to: it clears ERL, or
+   -- EXL when ERL is clear.
+   xtlbAfterEret <= COP0_12_SR_kernelExtendedAddr when ((COP0_12_SR_exceptionLevel = '1' and COP0_12_SR_errorLevel = '1') or COP0_12_SR_privilegeMode = "00") else
+                    COP0_12_SR_supervisorAddr     when (COP0_12_SR_privilegeMode = "01") else
+                    COP0_12_SR_userExtendedAddr;
    COP1_enable   <= COP0_12_SR_enable_cop1;
    COP2_enable   <= COP0_12_SR_enable_cop2;
    fpuRegMode    <= COP0_12_SR_floatingPointMode;
@@ -582,8 +611,8 @@ begin
          
          if (COP0_12_SR_vectorLocation = '1') then
          
-            if (COP0_12_SR_errorLevel = '0' and ((exception = '1' and tlbMiss3 = '1') or (exception = '0' and exceptionStage1 = '1' and tlbMiss1 = '1'))) then
-               if (bit64mode = '1') then
+            if (COP0_12_SR_errorLevel = '0' and exlAtException = '0' and ((exception = '1' and tlbMiss3 = '1') or (exception = '0' and exceptionStage1 = '1' and tlbMiss1 = '1'))) then
+               if (xtlbAtException = '1') then
                   exceptionPC(31 downto 0) <= x"BFC00280";
                else
                   exceptionPC(31 downto 0) <= x"BFC00200";
@@ -594,8 +623,8 @@ begin
             
          else
             
-            if (COP0_12_SR_errorLevel = '0' and ((exception = '1' and tlbMiss3 = '1') or (exception = '0' and exceptionStage1 = '1' and tlbMiss1 = '1'))) then
-               if (bit64mode = '1') then
+            if (COP0_12_SR_errorLevel = '0' and exlAtException = '0' and ((exception = '1' and tlbMiss3 = '1') or (exception = '0' and exceptionStage1 = '1' and tlbMiss1 = '1'))) then
+               if (xtlbAtException = '1') then
                   exceptionPC(31 downto 0) <= x"80000080";
                else
                   exceptionPC(31 downto 0) <= x"80000000";
@@ -622,8 +651,8 @@ begin
          
             COP0_0_INDEX_tlbEntry           <= (others => '0');
             COP0_0_INDEX_probefailure       <= '0';
-            COP0_1_RANDOM                   <= (others => '0');
-            COP0_2_ENTRYLO0_phyAdr          <= (others => '0');
+            COP0_1_RANDOM                   <= to_unsigned(TLB_LAST, 6);
+            COP0_2_ENTRYLO0_phyAdr         <= (others => '0');
             COP0_2_ENTRYLO0_cache           <= (others => '0');
             COP0_2_ENTRYLO0_dirty           <= '0';       
             COP0_2_ENTRYLO0_valid           <= '0';       
@@ -704,7 +733,9 @@ begin
             TLB_Data_fetchReq_saved         <= '0';
             tlbMiss1                        <= '0';
             tlbMiss3                        <= '0';
-            
+            exlAtException                  <= '0';
+            xtlbAtException                 <= '0';
+
          elsif (ce = '1') then
          
             -- interrupt
@@ -725,20 +756,20 @@ begin
                cop0Written9 <= cop0Written9 - 1;
             end if;
             
-            -- random
+            -- random: counts down from the last TLB entry to Wired, then wraps.
+            -- A Wired above the last entry leaves Random at the last entry.
             if (stall = 0) then
-               if (COP0_6_WIRED(5) = '0' and COP0_1_RANDOM(4 downto 0) = COP0_6_WIRED(4 downto 0)) then
-                  COP0_1_RANDOM <= 6x"1F";
-                  --COP0_1_RANDOM <= 6x"03"; -- DO NOT COMMIT AS ACTIVE!
+               if (COP0_1_RANDOM <= COP0_6_WIRED) then
+                  COP0_1_RANDOM <= to_unsigned(TLB_LAST, 6);
                else
                   COP0_1_RANDOM <= COP0_1_RANDOM - 1;
                end if;
             end if;
-            
+
             if (cop0Written6 > 0) then
                cop0Written6 <= cop0Written6 - 1;
                if (cop0Written6 = 1) then
-                  COP0_1_RANDOM   <= to_unsigned(31, 6);
+                  COP0_1_RANDOM   <= to_unsigned(TLB_LAST, 6);
                end if;
             end if;
             
@@ -761,7 +792,10 @@ begin
             -- CPU access
             if (exception = '1') then
          
-               COP0_14_EPC               <= nextEPC_1;
+               if (exlAtException = '0') then
+                  COP0_14_EPC               <= nextEPC_1;
+                  COP0_13_CAUSE_branchDelay <= isDelaySlot_1;
+               end if;
                -- nextEPC_1 is pcOld1 unmodified when the suppression applied,
                -- so the recorded EPC IS the address the predicate refused to
                -- back up from.
@@ -774,7 +808,6 @@ begin
                      ds_first_reg <= nextEPC_1(31 downto 0);
                   end if;
                end if;
-               COP0_13_CAUSE_branchDelay <= isDelaySlot_1;
                
                case (COP0_13_CAUSE_exceptionCode(3 downto 0)) is
                   when x"4" | x"5" | x"9" | x"A" | x"C"  => error_exception <= '1';
@@ -932,18 +965,30 @@ begin
                if (exception = '0' and exceptionStage1 = '1') then
                   COP0_13_CAUSE_coprocessorError <= "00";
                   COP0_13_CAUSE_exceptionCode    <= '0' & x"2";
-                  COP0_14_EPC                  <= TLB_Instr_fetchAddrIn;
-                  COP0_13_CAUSE_branchDelay    <= '0';
-                  if (nextDelaySlot = '1') then
-                     COP0_14_EPC               <= TLB_Instr_fetchAddrIn - 4;
-                     COP0_13_CAUSE_branchDelay <= '1';
+                  if (exlAtException = '0') then
+                     COP0_14_EPC                  <= TLB_Instr_fetchAddrIn;
+                     COP0_13_CAUSE_branchDelay    <= '0';
+                     if (nextDelaySlot = '1') then
+                        COP0_14_EPC               <= TLB_Instr_fetchAddrIn - 4;
+                        COP0_13_CAUSE_branchDelay <= '1';
+                     end if;
                   end if;
                end if;
             end if;
-            
+
             if (TLB_ExcInstrRead = '1') then
                exceptionStage1            <= '1';
                tlbMiss1                   <= TLB_ExcInstrMiss;
+               exlAtException             <= COP0_12_SR_exceptionLevel;
+               xtlbAtException            <= xtlbNow;
+               -- A miss on the fetch at an ERET's target can be reported
+               -- while that ERET is still waiting to clear EXL, and it then
+               -- cancels the clear. To the program ERET has finished, so the
+               -- miss is taken in the mode ERET returns to.
+               if (eret = '1') then
+                  exlAtException          <= COP0_12_SR_exceptionLevel and COP0_12_SR_errorLevel;
+                  xtlbAtException         <= xtlbAfterEret;
+               end if;
                COP0_12_SR_exceptionLevel  <= '1';
             end if;
             
@@ -955,6 +1000,8 @@ begin
                   if (decode_irq = '1' or exceptionFPU = '1' or exception3 = '1' or TLB_ExcDataRead = '1' or TLB_ExcDataWrite = '1' or TLB_ExcDataDirty = '1') then
                   
                      exception <= '1';
+                     exlAtException              <= COP0_12_SR_exceptionLevel;
+                     xtlbAtException             <= xtlbNow;
                      COP0_12_SR_exceptionLevel   <= '1';
                      COP0_13_CAUSE_coprocessorError <= "00";
                      if (decode_irq = '1') then
@@ -1011,13 +1058,19 @@ begin
                   -- is driven from that one bit instead of from the adder.
                   -- EntryHi's VPN2 is bits 31 downto 13 in 32-bit mode; the
                   -- bits above it are the 64-bit extension and read zero.
-                  -- XContext is not written at all.
+                  -- XContext takes the same sign-extended address as
+                  -- BadVAddr: Region and BadVPN2's upper bits are copies of
+                  -- bit 31.
                   COP0_8_BADVIRTUALADDRESS(63 downto 32) <= (others => excAddr(31));
                   COP0_8_BADVIRTUALADDRESS(31 downto 0)  <= excAddr(31 downto 0);
 
                   COP0_10_ENTRYHI_virtualAddress(26 downto 19) <= (others => '0');
                   COP0_10_ENTRYHI_virtualAddress(18 downto 0)  <= excAddr(31 downto 13);
                   COP0_10_ENTRYHI_region                       <= (others => '0');
+
+                  COP0_20_XCONTEXT_Region                <= (others => excAddr(31));
+                  COP0_20_XCONTEXT_BadVPN(26 downto 19)  <= (others => excAddr(31));
+                  COP0_20_XCONTEXT_BadVPN(18 downto 0)   <= excAddr(31 downto 13);
                else
                   COP0_8_BADVIRTUALADDRESS       <= excAddr;
 
@@ -1026,6 +1079,16 @@ begin
 
                   COP0_20_XCONTEXT_Region        <= excAddr(63 downto 62);
                   COP0_20_XCONTEXT_BadVPN        <= excAddr(39 downto 13);
+               end if;
+
+               -- An R4600 taking an exception in User or Supervisor mode with
+               -- 32-bit addressing, on an address with bit 31 set, reports
+               -- BadVAddr bits 63:32 as 0x3FFFFF00, not as a sign extension.
+               -- Measured on a KI board for a User load from KSEG0; Kernel
+               -- mode, and addresses below 0x80000000, sign-extend.
+               if (xtlbNow = '0' and excAddr(31) = '1' and COP0_12_SR_exceptionLevel = '0' and
+                   COP0_12_SR_errorLevel = '0' and COP0_12_SR_privilegeMode /= "00") then
+                  COP0_8_BADVIRTUALADDRESS(63 downto 32) <= x"3FFFFF00";
                end if;
             end if;
             
@@ -1073,6 +1136,9 @@ begin
                      TLB_Instr_fetchReq_saved <= '0';
                      TLB_readAddr             <= TLB_fetchSource;
                      TLB_compareEnd           <= TLB_fetchSource - 1;
+                     if (TLB_fetchSource = 0) then
+                        TLB_compareEnd        <= to_unsigned(TLB_LAST, 6);
+                     end if;
                      TLBState                 <= TLBINSTR;
                      TLB_fetchAddrIn          <= TLB_Instr_fetchAddrIn;
                      TLB_fetchExcNotFound     <= '1';
@@ -1082,6 +1148,9 @@ begin
                      TLB_Data_fetchReq_saved  <= '0';
                      TLB_readAddr             <= TLB_fetchSource;
                      TLB_compareEnd           <= TLB_fetchSource - 1;
+                     if (TLB_fetchSource = 0) then
+                        TLB_compareEnd        <= to_unsigned(TLB_LAST, 6);
+                     end if;
                      TLBState                 <= TLBDATA;
                      TLB_fetchAddrIn          <= TLB_Data_fetchAddrIn;
                      TLB_fetchExcNotFound     <= '1';
@@ -1092,7 +1161,7 @@ begin
                   
                when TLBPROBE =>
                   TLB_readAddr <= TLB_readAddr + 1;
-                  if (TLB_readAddr = 31) then
+                  if (TLB_readAddr = TLB_LAST) then
                      TLBState                  <= TLBIDLE;
                      COP0_0_INDEX_probefailure <= '1';
                      COP0_0_INDEX_tlbEntry     <= (others => '0');
@@ -1103,14 +1172,19 @@ begin
                         if (TLBREAD_global = '1' or (COP0_10_ENTRYHI_addressSpaceID = TLBREAD_ASID)) then
                            TLBState                  <= TLBIDLE;
                            COP0_0_INDEX_probefailure <= '0';
-                           COP0_0_INDEX_tlbEntry     <= '0' & TLB_readAddr;
+                           COP0_0_INDEX_tlbEntry     <= TLB_readAddr;
                            TLBDone                   <= '1';
                         end if;
                      end if;
                   end if;
                   
                when TLBDATA | TLBINSTR =>
+                  -- The walk starts at the last entry that hit and wraps
+                  -- from the last entry to 0.
                   TLB_readAddr <= TLB_readAddr + 1;
+                  if (TLB_readAddr = TLB_LAST) then
+                     TLB_readAddr <= (others => '0');
+                  end if;
                   if (TLB_readAddr = TLB_compareEnd) then
                      TLBState           <= TLBIDLE;
                      if (TLBState = TLBINSTR) then
@@ -1189,7 +1263,7 @@ begin
          if (TLB_resetMode = '1') then
             TLB_resetAddr <= TLB_resetAddr + 1;
             TLB_init      <= '1';
-            if (TLB_resetAddr = 30) then
+            if (TLB_resetAddr = TLB_LAST - 1) then
                TLB_resetMode <= '0';
             end if;
          end if;
@@ -1214,8 +1288,8 @@ begin
             end if;
          end if;
          
-         if (SS_wren_CPU = '1' and SS_Adr >= 256 and SS_Adr < 320) then
-            TLB_resetAddr <= SS_Adr(5 downto 1);
+         if (SS_wren_CPU = '1' and SS_Adr >= 256 and SS_Adr < 256 + 2 * (TLB_LAST + 1)) then
+            TLB_resetAddr <= SS_Adr(6 downto 1);
             TLB_init      <= SS_Adr(0);
          end if;
          
@@ -1275,14 +1349,14 @@ begin
                          '0';
    
    TLBMEM_writeAddr <= std_logic_vector(TLB_resetAddr) when (TLB_init = '1') else
-                       std_logic_vector(COP0_0_INDEX_tlbEntry(4 downto 0)) when (TLBWI = '1') else
-                       std_logic_vector(COP0_1_RANDOM(4 downto 0));
-   
+                       std_logic_vector(COP0_0_INDEX_tlbEntry) when (TLBWI = '1') else
+                       std_logic_vector(COP0_1_RANDOM);
+
    iTLBMEM : entity mem.RamMLAB
-	GENERIC MAP 
+	GENERIC MAP
    (
       width      => 101,
-      widthad    => 5
+      widthad    => 6
 	)
 	PORT MAP (
       inclock    => clk93,
@@ -1293,7 +1367,7 @@ begin
       q          => TLBMEM_readData
 	);
    
-   TLBMEM_readAddr <= std_logic_vector(COP0_0_INDEX_tlbEntry(4 downto 0)) when (TLBState = TLBIDLE) else
+   TLBMEM_readAddr <= std_logic_vector(COP0_0_INDEX_tlbEntry) when (TLBState = TLBIDLE) else
                       std_logic_vector(TLB_readAddr);
    
    TLBREAD_global   <= TLBMEM_readData(0);           
