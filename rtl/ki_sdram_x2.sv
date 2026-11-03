@@ -48,8 +48,8 @@ module ki_sdram_x2 (
   // Two words per beat, LOW word first, which is address order.
   output logic [31:0] req_dout = 32'd0,
   // Which halves of req_dout carry a word. Always 2'b11 except on the final
-  // beat of an ODD burst, which the core only issues at burst 1 (the BIST's
-  // single-word probe); every cache, video and ROM path uses 2, 4 or 16.
+  // beat of an ODD burst, which the core never issues: every cache, video and
+  // ROM path uses 2, 4 or 16.
   //
   // Like req_dout, this HOLDS between beats rather than clearing. A
   // single-word requester is allowed to take its data at the completion
@@ -124,17 +124,16 @@ module ki_sdram_x2 (
   // on the edge that captures the last word, and this stage is a register
   // behind that, so passing ready straight through would report the
   // transaction complete one or two cycles BEFORE its final beat came out.
-  // ki_sdram_adapter turns ready into request_done, and both the boot-ROM
-  // path and the self test take their data at done - they would lose the last
-  // two words of every read. The condition is "nothing is still OWED": no
-  // words left to arrive and none half-packed. It deliberately does NOT also
-  // wait for req_dout_valid to fall. ready and the final beat's valid then go
-  // high in the SAME cycle, which is safe because ki_sdram_adapter spends a
-  // cycle turning ready into request_done - by which point a requester
-  // watching valid has taken the beat, and one watching done finds req_dout
-  // still holding it. That cycle is not free to give away: request_done
-  // becomes the data cache's ram_done, so it lands straight on F3 of every
-  // miss.
+  // ki_sdram_adapter turns ready into request_done, and the boot-ROM path
+  // takes its data at done - it would lose the last two words of every read.
+  // The condition is "nothing is still OWED": no words left to arrive and none
+  // half-packed. It deliberately does NOT also wait for req_dout_valid to
+  // fall. ready and the final beat's valid then go high in the SAME cycle,
+  // which is safe because ki_sdram_adapter spends a cycle turning ready into
+  // request_done - by which point a requester watching valid has taken the
+  // beat, and one watching done finds req_dout still holding it. That cycle is
+  // not free to give away: request_done becomes the data cache's ram_done, so
+  // it lands straight on F3 of every miss.
   assign req_ready = ctl_ready && (words_left == 5'd0) && !half;
 
   always_ff @(posedge clk2x) begin

@@ -15,6 +15,11 @@ entity cpu is
       -- "READING AHEAD". The request travels as a line fetch (bit 117) with
       -- bit 107 set, and clk1x captures its four qwords into line_fill_1x.
       DCACHE_READ_AHEAD     : boolean := false;
+      -- And across a 4 KB page, for an unmapped load of low or main RAM; see
+      -- cpu_datacache.vhd, "READING AHEAD". A line that is not SDRAM RAM - a
+      -- framebuffer line - goes through the scheduler as any read-ahead of
+      -- one does (fast_ra_line_ok).
+      DCACHE_RA_CROSS_PAGE  : boolean := false;
       -- A 64-bit store that misses the data cache takes its line without
       -- reading it from SDRAM; the cache tracks which qwords it holds and
       -- fills the rest only if they are wanted. The heavy frames' store-miss
@@ -60,6 +65,15 @@ entity cpu is
       -- is seen, the qword straight into mem_finished_dataRot: it is always
       -- qword-aligned, so the rotation's two stages have nothing to do.
       UNC_FAST_DONE         : boolean := false;
+      -- In the cycle an uncached load in stage 4 completes, an uncached
+      -- 64-bit load of SDRAM RAM waiting in stage 3 goes to the direct port
+      -- on that edge, and is presented in stage 4 on the next. See
+      -- fast_s3_go.
+      UNC_LAUNCH_S3         : boolean := false;
+      -- An uncached 64-bit load through the bridge completes on the edge its
+      -- response is taken, the qword straight into mem_finished_dataRot: it
+      -- is qword-aligned, so the rotation's two stages have nothing to do.
+      UNC_BRIDGE_FAST_DONE  : boolean := false;
       -- The crossing to the bridge as a SYNCHRONOUS 2:1 handshake: clk1x reads
       -- the mailbox's request, and clk93 its acknowledge, the write-back line
       -- release and the response FIFO's write pointer, straight from the
@@ -73,6 +87,19 @@ entity cpu is
       -- takes no load-delay bubble, as on the R4600, and merges into that
       -- load's result in stage 4. Needs LOAD_INTERLOCK. See merge_bypass.
       LOAD_MERGE_BYPASS     : boolean := false;
+      -- The instruction behind a load takes the load-delay bubble for its rt
+      -- field only when it reads rt as a general register: the R4600
+      -- interlocks only on a use of the loaded register. One that writes rt,
+      -- or uses the field as a function or an FPU register, follows a load
+      -- into that register back to back. Needs LOAD_INTERLOCK. See
+      -- dec_reads_rt.
+      LOAD_RT_EXACT         : boolean := false;
+      -- An FPU ADD or SUB with no cancellation rounds a cycle sooner; see
+      -- cpu_FPU's ADD_FAST_NORM.
+      FPU_ADD_FAST          : boolean := false;
+      -- An instruction waiting on an FPU result takes it in the FPU's done
+      -- cycle and issues the next, as on the R4600; see FPU_fwd_valid.
+      FPU_FORWARD           : boolean := false;
       -- A clean data-cache demand miss, the cache's read-ahead line fetch and
       -- an uncached 64-bit load of SDRAM RAM ask ki_sdram_burst's second port
       -- straight from clk93 when nothing of the CPU's is in the bridge's
@@ -80,6 +107,22 @@ entity cpu is
       -- Needs SYNC_CROSSING: the test reads clk1x's state across its timed
       -- 2:1 crossing.
       DIRECT_FILL           : boolean := false;
+      -- With DIRECT_FILL, the read-ahead's line fetch may take the direct
+      -- port on the edge after the data cache asks for it, from the ask
+      -- itself, not a cycle later from datacache_ra_pending; see fast_ra_go.
+      RA_LAUNCH_EARLY       : boolean := false;
+      -- With DIRECT_FILL, a direct read-ahead's line comes back a qword at a
+      -- time on fast_ra_valid, on the controller's clock, as an uncached
+      -- qword does on fast_unc_valid: its request carries bit 1 of the line
+      -- address set (ki_fast_fill), each qword goes into datacache_ra_data as
+      -- it comes, and the fourth completes it. See fast_ra_ret.
+      RA_CTL_RETURN         : boolean := false;
+      -- With DIRECT_FILL, the read-ahead of the line after the one the data
+      -- cache waits for in FILLRA_WAIT leaves on the direct port as that one
+      -- completes, not from the cache's ask as the copy starts: 1, on the
+      -- edge after its completion registers; 2, on that edge. See
+      -- fast_chain_term.
+      RA_CHAIN              : integer := 0;
       -- Narrow the COP0 exception-address capture to the 32-bit KI contract.
       ADDR32_ONLY           : boolean := false;
       -- Drop trap instructions from the exception logic while retaining the
@@ -90,39 +133,7 @@ entity cpu is
       INSTR_KSEG_ONLY       : boolean := false;
       -- cvt.s.l and cvt.d.l of a value outside +-2^55 take an Unimplemented
       -- Operation trap instead of converting; see cpu_FPU's CVT_L_NARROW.
-      FPU_CVT_L_NARROW      : boolean := false;
-      -- Build the pre-event execution trace.
-      --
-      -- The trace is a diagnostic, and it is not free. debug_trace_bus is 896
-      -- bits leaving cpu:core for the top level, where a 736-bit shadow latches
-      -- it; the SDC false-paths all of it, so it never shows up in a timing
-      -- report, but it is still ~900 real wires anchoring stage-2 and stage-4
-      -- registers toward the debug screen. The CPU domain's critical paths are
-      -- mostly interconnect, so what the fitter can and cannot pack tightly is
-      -- exactly what bounds Fmax here.
-      --
-      -- Only the EXPORT is gated. The capture registers are written in the same
-      -- process as debug_ret_count's and debug_h1_op's counters, which feed
-      -- screen fields worth keeping, so they cannot be generate-guarded without
-      -- splitting that process. Left with no reader they are dead logic and
-      -- synthesis removes them, which reaches the same place with far less
-      -- disturbance to code that works.
-      --
-      -- Turning this off blanks the trace rows on the debug screen. Every other
-      -- field on that screen keeps working.
-      DEBUG_TRACE           : boolean := true;
-      -- How long the CPU must go without executing any boot ROM before the
-      -- restart detectors arm, in decodes. It has to be long enough that no
-      -- excursion into RAM during boot can satisfy it, and short enough to arm
-      -- before the first restart: the game reaches FMV about 4 to 5 s after
-      -- reset and can restart within a second of playback starting.
-      --
-      -- 2^24 is about 0.4 s at about 42 MIPS - two orders of magnitude
-      -- longer than a boot trampoline, and comfortably inside that window. G
-      -- on the trace page reports whether it actually armed, so a wrong choice
-      -- is visible rather than silent. Simulation overrides it so a dozen
-      -- instructions can still exercise the triggers.
-      BOOT_QUIET_BITS       : integer := 24
+      FPU_CVT_L_NARROW      : boolean := false
    );
    port 
    (
@@ -156,56 +167,23 @@ entity cpu is
       error_TLB             : out std_logic := '0';
       debug_fetch_pc        : out std_logic_vector(31 downto 0) := (others => '0');
       debug_retired         : out std_logic_vector(31 downto 0) := (others => '0');
-      -- The PC of the instruction retiring THIS cycle, and its strobe. Where
-      -- the retired count says how much ran, these say WHAT ran - and the two
-      -- have to be driven off the same condition or a profile built from them
-      -- will not sum to RT. Bucketing them is the caller's business: which
-      -- address ranges matter is a property of the game, not of the CPU.
-      debug_prof_pc         : out std_logic_vector(31 downto 0) := (others => '0');
-      debug_prof_valid      : out std_logic := '0';
-      -- Bitstream reader source pointer used by the frozen fault trace.
-      debug_gpr_s1          : out std_logic_vector(31 downto 0) := (others => '0');
-      debug_irq_count       : out std_logic_vector(31 downto 0) := (others => '0');
-      debug_t2_reload_count : out std_logic_vector(31 downto 0) := (others => '0');
-      -- Departure opcode, exception state, and restart counters retained by
-      -- the current fault-capture contract.
-      debug_h1_op           : out std_logic_vector(31 downto 0) := (others => '0');
-      debug_exc_cause       : out std_logic_vector(31 downto 0) := (others => '0');
-      debug_ret_count       : out std_logic_vector(31 downto 0) := (others => '0');
-      -- The stage-4 data address at the moment the stall watchdog trips.
-      -- debug_stall_pc says where the pipeline was; this says what it was
-      -- reaching for, which is what identifies an unanswered access.
-      -- Everything the stage-4 stall RELEASE depends on, captured at the same
-      -- instant. ST says stall4 is set with nothing outstanding; this says
-      -- which release condition is not being met.
+      -- The PC and opcode of the instruction retiring this cycle, in
+      -- simulation only; in hardware they stay zero.
       debug_retire_pc       : out std_logic_vector(31 downto 0) := (others => '0');
       debug_retire_opcode   : out std_logic_vector(31 downto 0) := (others => '0');
-      debug_trace_bus         : out std_logic_vector(895 downto 0) := (others => '0');
-      -- Live COP0 Cause and EPC, not the frozen copies in the trace bus.
-      -- Simulation needs to read EPC the cycle after an interrupt is taken,
-      -- which is long before any trace trigger fires.
+      -- Live COP0 Status/Cause, packed as cpu_cop0 packs it, and EPC: readable
+      -- the cycle after an exception is taken.
       debug_cop0_cause_live   : out std_logic_vector(31 downto 0) := (others => '0');
       debug_cop0_epc_live     : out std_logic_vector(31 downto 0) := (others => '0');
-      -- State at the LAST ERET BEFORE THE FREEZE. cpu_cop0 captures each eret;
-      -- this holds the copy from the moment the trace freezes, so the values
-      -- describe the eret that preceded the fault rather than whichever one
-      -- happened most recently before the screen was photographed.
-      debug_eret_epc          : out std_logic_vector(31 downto 0) := (others => '0');
-      debug_eret_target       : out std_logic_vector(31 downto 0) := (others => '0');
-      debug_eret_flags        : out std_logic_vector(31 downto 0) := (others => '0');
-      -- Suppression census; see cpu_cop0.vhd. Live, not frozen: a freeze or a
-      -- reset may fire no trace trigger at all, and these must still be
-      -- readable off the screen at any moment.
-      debug_ds_count          : out std_logic_vector(31 downto 0) := (others => '0');
-      -- Raw per-cycle causes for the performance counters in ki_cpu_core.
-      -- Nothing reads this bus but those counters, so a build without them
-      -- prunes all of it, the perf-only registers included.
+      -- Raw per-cycle causes of lost cycles, for measuring the CPU. Nothing in
+      -- the design reads this bus, so synthesis prunes all of it, the
+      -- perf-only registers included.
       --
       -- THE LOST-CYCLE CENSUS. An instruction retires in a cycle where
       -- stall4Masked = 0 and writebackNew = 1. Every other cycle is lost, and
       -- bits 0, 2 and 6-9 give each lost cycle exactly one cause, so
-      -- CY - RT = S4 + MD + S3 + S1 + LB + FL, less paused cycles. FL is off
-      -- the page for DI (below), so the check holds to within FL:
+      -- CY - RT = S4 + MD + S3 + S1 + LB + FL, less paused cycles. FL has no
+      -- bit here (see perf_lost_fl), so a sum of the bits holds to within FL:
       --
       --   0 a D-cache miss (a COUNT, not a cycle)                MC
       --   1 stall4, uncached STORE (part of S4)                 UW
@@ -248,23 +226,13 @@ entity cpu is
       -- With LOAD_INTERLOCK, only a load that TOOK its bubble counts, so DI
       -- reads what the dependency test failed to give back.
       --
-      -- The D-cache fields (MC SK WB F1 SH RA) are still computed for
-      -- simulation; synthesis drops them with nothing reading them.
+      -- The data cache's perf_* taps are computed for simulation too;
+      -- synthesis drops them with nothing reading them.
       --
       -- The classes partition the cycles: each running cycle retires or is
       -- lost to exactly one class, so together they sum to the total. Keep it
       -- that way.
       debug_perf_events       : out std_logic_vector(11 downto 0);
-      -- Where the low-memory misses and cached stall went, for the PROF
-      -- page's slowest frame: 0 misses to a framebuffer page (FM), 1 cached
-      -- stall4 cycles of a load or store to one (DF), 2 misses to the rest of
-      -- the low 512 KiB - the board's SRAM region (SM), 3 cached stall4
-      -- cycles of a load or store there (DS). FM + SM is LM; what DC leaves
-      -- is main RAM's, and any CACHE command's.
-      debug_perf_mem          : out std_logic_vector(3 downto 0);
-      debug_ds_first          : out std_logic_vector(31 downto 0) := (others => '0');
-      debug_trace_frozen      : out std_logic := '0';
-      debug_trace_trigger     : in  std_logic := '0';
 
       mem_request           : out std_logic := '0';
       mem_rnw               : out std_logic := '0'; 
@@ -302,15 +270,26 @@ entity cpu is
       -- fast_ok is the bridge's: nothing of the CPU's that touches SDRAM in
       -- flight or held there. A request is a toggle with the line's physical
       -- address beside it; the line comes back as four beats on clk1x and a
-      -- done toggle.
+      -- done toggle. An uncached qword comes back either as one beat and a
+      -- done toggle, or on fast_unc_valid (ki_fast_fill's UNC_CTL_RETURN):
+      -- fast_unc_qword for one cycle of the controller's clock, which has
+      -- this one's frequency on the same PLL, so this clock takes it once.
+      -- With RA_CTL_RETURN a read-ahead's line comes back the same way, its
+      -- four qwords on fast_unc_qword while fast_ra_valid is high.
       fast_ok               : in  std_logic := '0';
       fast_req_tog          : out std_logic := '0';
       fast_req_line         : out std_logic_vector(31 downto 0) := (others => '0');
+      -- The line read is the data cache's read-ahead of a stream (its
+      -- ra_reqStream); ki_sdram_burst's RA_ROW_HOLD. Changes with the toggle.
+      fast_req_stream       : out std_logic := '0';
       fast_window           : in  std_logic := '0';
       fast_beat             : in  std_logic := '0';
       fast_first            : in  std_logic := '0';
       fast_qword            : in  std_logic_vector(63 downto 0) := (others => '0');
       fast_done_tog         : in  std_logic := '0';
+      fast_unc_valid        : in  std_logic := '0';
+      fast_unc_qword        : in  std_logic_vector(63 downto 0) := (others => '0');
+      fast_ra_valid         : in  std_logic := '0';
       
       ram_done              : in  std_logic;
       ram_rnw               : in  std_logic;
@@ -507,80 +486,15 @@ architecture arch of cpu is
    signal PC                           : unsigned(63 downto 0) := (others => '0');
    signal debug_fetch_pc_register      : std_logic_vector(31 downto 0) := (others => '0');
    signal debug_retired_count          : unsigned(31 downto 0) := (others => '0');
-   signal debug_gpr_s1_register        : std_logic_vector(31 downto 0) := (others => '0');
-   signal debug_gpr_s2_register        : std_logic_vector(31 downto 0) := (others => '0');
    signal debug_retire_pc_register     : std_logic_vector(31 downto 0) := (others => '0');
    signal debug_retire_opcode_register : std_logic_vector(31 downto 0) := (others => '0');
-   signal debug_irq_count_register     : unsigned(31 downto 0) := (others => '0');
-   signal debug_t2_reload_register     : unsigned(31 downto 0) := (others => '0');
-   signal debug_ret_count_register     : unsigned(31 downto 0) := (others => '0');
-   signal debug_entry_count_register   : unsigned(15 downto 0) := (others => '0');
-   signal ram_reentry                  : std_logic;
-   signal boot_quiet_count             : unsigned(BOOT_QUIET_BITS - 1 downto 0) := (others => '0');
-   signal game_running                 : std_logic := '0';
-   signal trace_trigger_id             : std_logic_vector(2 downto 0) := (others => '0');
-
-   -- Two-stage synchronizer for the board-side freeze request.
-   signal trace_trigger_meta           : std_logic := '0';
-   signal trace_trigger_sync           : std_logic := '0';
-   signal dep_pc_now                   : std_logic_vector(31 downto 0) := (others => '0');
-   -- How many decodes have happened since reset, saturating at 2. One is not
-   -- enough: the pc reported by the FIRST post-reset decode comes from a
-   -- register the reset does not own, so the comparison must not run until two
-   -- genuine decodes are in hand. Stage 1 and stage 2 clear those registers
-   -- as well; this is the independent guard, so the failure it prevents does
-   -- not depend on one assignment.
-   signal dep_valid                    : unsigned(1 downto 0) := (others => '0');
-   signal hist_op1                     : std_logic_vector(31 downto 0) := (others => '0');
-   signal debug_h1_op_r                : std_logic_vector(31 downto 0) := (others => '0');
-   signal debug_prev_op_live           : std_logic_vector(31 downto 0) := (others => '0');
-   signal debug_exc_cause_register     : std_logic_vector(31 downto 0) := (others => '0');
    signal cop0_debug_cause             : unsigned(31 downto 0);
    signal cop0_debug_epc               : unsigned(31 downto 0);
-   signal cop0_debug_badvaddr          : unsigned(31 downto 0);
-   signal cop0_debug_tlb_census        : unsigned(31 downto 0);
-   signal cop0_debug_tlb_exc_stb       : std_logic;
-   signal cop0_debug_eret_epc          : unsigned(31 downto 0);
-   signal cop0_debug_eret_target       : unsigned(31 downto 0);
-   signal cop0_debug_eret_flags        : unsigned(31 downto 0);
-   signal cop0_debug_ds_count          : unsigned(31 downto 0);
-   signal cop0_debug_ds_first          : unsigned(31 downto 0);
-   -- Owned solely by eret_freeze_proc.
-   signal eret_held                    : std_logic := '0';
-   signal eret_epc_held                : std_logic_vector(31 downto 0) := (others => '0');
-   signal eret_target_held             : std_logic_vector(31 downto 0) := (others => '0');
-   signal eret_flags_held              : std_logic_vector(31 downto 0) := (others => '0');
-   -- The fault strobe delayed two cycles. BadVAddr, Cause and EPC are all
-   -- written by cop0's exception process on the strobe cycle itself, so
-   -- freezing there would capture the PREVIOUS exception's values.
-   signal tlb_exc_stb_d1               : std_logic := '0';
-   signal tlb_exc_stb_d2               : std_logic := '0';
-   -- Owned solely by tlb_fault_proc. Sticky, because the trace freeze can only
-   -- act on a decode boundary and the fault does not land on one.
-   signal tlb_fault_req                : std_logic := '0';
-   signal fault_badvaddr               : std_logic_vector(31 downto 0) := (others => '0');
-   signal fault_s1                     : std_logic_vector(31 downto 0) := (others => '0');
-   signal fault_s2                     : std_logic_vector(31 downto 0) := (others => '0');
-   signal fault_census                 : std_logic_vector(31 downto 0) := (others => '0');
-   signal fault_cause                  : std_logic_vector(31 downto 0) := (others => '0');
-   signal fault_epc                    : std_logic_vector(31 downto 0) := (others => '0');
 
-   -- ---------------------------------------------------------------------
-   -- Pre-event execution trace (see the debug_trace_bus port comment).
-   --
-   -- decodeNewPulse is what makes this trustworthy. decodeNew is only WRITTEN
-   -- when stall = 0, so it stays asserted for the whole of a stall and a
-   -- capture gated on it re-samples one decode many times. The trace needs one
-   -- entry per instruction, so stage 2 raises this for exactly the cycle in
-   -- which pcOld1/opcode1 hold a newly decoded pair.
-   --
-   -- The trace is a shift register rather than a ring: no write-pointer decode,
-   -- and the export order is fixed, so a photograph cannot be misread by
-   -- getting the wrap point wrong. Index 0 is the newest decode.
-   -- ---------------------------------------------------------------------
-   constant TRACE_DEPTH : integer := 8;
-   type t_trace_word is array (0 to TRACE_DEPTH - 1) of std_logic_vector(31 downto 0);
-   type t_trace_src  is array (0 to TRACE_DEPTH - 1) of std_logic_vector(3 downto 0);
+   -- decodeNewPulse is high for exactly the cycle in which pcOld1/opcode1
+   -- hold a newly decoded pair. decodeNew is only WRITTEN when stall = 0, so
+   -- it stays asserted for the whole of a stall, and logic gated on it would
+   -- see one decode many times.
    signal decodeNewPulse               : std_logic := '0';
    -- A genuine delay slot SEQUENTIALLY FOLLOWS its branch. A branch target
    -- does not. That one test separates them, and it needs no opcode decoding.
@@ -616,25 +530,6 @@ architecture arch of cpu is
       return '0';
    end function;
    signal chainedDelaySlot             : std_logic := '0';
-   signal fetch_src                    : std_logic_vector(3 downto 0);
-   signal src0                         : std_logic_vector(3 downto 0) := (others => '0');
-   signal src1                         : std_logic_vector(3 downto 0) := (others => '0');
-   signal trace_pc                     : t_trace_word := (others => (others => '0'));
-   signal trace_op                     : t_trace_word := (others => (others => '0'));
-   signal trace_src                    : t_trace_src := (others => (others => '0'));
-   signal trace_frozen                 : std_logic := '0';
-   signal trace_cause                  : std_logic_vector(31 downto 0) := (others => '0');
-   signal trace_epc                    : std_logic_vector(31 downto 0) := (others => '0');
-   signal trace_badvaddr               : std_logic_vector(31 downto 0) := (others => '0');
-   signal trace_s1                     : std_logic_vector(31 downto 0) := (others => '0');
-   signal trace_s2                     : std_logic_vector(31 downto 0) := (others => '0');
-   signal trace_tlb_census             : std_logic_vector(31 downto 0) := (others => '0');
-   signal store_addr_0                 : std_logic_vector(31 downto 0) := (others => '0');
-   signal store_data_0                 : std_logic_vector(31 downto 0) := (others => '0');
-   signal store_pc_0                   : std_logic_vector(31 downto 0) := (others => '0');
-   signal store_addr_1                 : std_logic_vector(31 downto 0) := (others => '0');
-   signal store_hold                   : unsigned(4 downto 0) := (others => '0');
-   signal store_frozen                 : std_logic := '0';
    signal hi                           : unsigned(63 downto 0) := (others => '0');
    signal lo                           : unsigned(63 downto 0) := (others => '0');
           
@@ -877,13 +772,6 @@ architecture arch of cpu is
   
    signal PCold0                       : unsigned(63 downto 0) := (others => '0');
    signal PCold1                       : unsigned(63 downto 0) := (others => '0');
-   -- The profile's own copy of the PC pipeline's last two stages. PCold2 and
-   -- PCold3 below sit inside "synthesis translate_off", so they exist only in
-   -- simulation - which a vcom check cannot tell you, because ModelSim
-   -- compiles that region too and only Quartus refuses it. These mirror them
-   -- under exactly the same enables, and cost 64 flops.
-   signal prof_pc2                     : std_logic_vector(31 downto 0) := (others => '0');
-   signal prof_pc3                     : std_logic_vector(31 downto 0) := (others => '0');
    
 -- synthesis translate_off
    signal PCold2                       : unsigned(63 downto 0) := (others => '0');
@@ -1327,6 +1215,10 @@ architecture arch of cpu is
    signal FPU_CF                       : std_logic;
    signal FPU_command_ena              : std_logic := '0';
    signal FPU_command_done             : std_logic := '0';
+   signal FPU_fwd_data                 : unsigned(63 downto 0);
+   signal FPU_fwd_valid                : std_logic;
+   signal FPU_fwd_match1               : std_logic := '0';
+   signal FPU_fwd_match2               : std_logic := '0';
    signal FPU_TransferEna              : std_logic := '0';
    signal FPU_TransferData             : unsigned(63 downto 0);
 
@@ -1338,6 +1230,7 @@ architecture arch of cpu is
    signal writebackNew                 : std_logic := '0';
    signal writebackStallFromMEM        : std_logic := '0';
    signal load_use                     : std_logic;
+   signal dec_reads_rt                 : std_logic;
    -- LOAD_MERGE_BYPASS: the instruction in stage 2 is a merge load of the rt
    -- the load in stage 3 writes, and takes no bubble (merge_bypass); it
    -- carries that into stage 3 (decodeMergeFwd) and stage 4
@@ -1358,7 +1251,7 @@ architecture arch of cpu is
    signal writeback_fifoStall          : std_logic := '0'; 
    signal read_fifoStall               : std_logic := '0';
    -- Perf-only: what the access holding stage 4 is, for the uncached split in
-   -- debug_perf_events. Pruned along with the counters.
+   -- debug_perf_events.
    signal perf_st4_read                : std_logic := '0';
    -- Perf-only: an empty pipeline slot a load left, carried from stage 3 into
    -- stage 4 with the slot (see debug_perf_events).
@@ -1369,17 +1262,9 @@ architecture arch of cpu is
    signal perf_lost_s1                 : std_logic;
    signal perf_lost_lb                 : std_logic;
    signal perf_lost_fl                 : std_logic;
-   -- Not on the debug page, but simulation taps this signal
-   -- directly for the DI directed test, so it stays. Synthesis strips it.
    signal perf_ld_indep                : std_logic;
    signal perf_st4_region              : std_logic_vector(1 downto 0) := "00";
    signal perf_exec_region             : std_logic_vector(1 downto 0);
-   -- The stage 3 access is in the low 512 KiB but not a framebuffer page:
-   -- the board's SRAM region outside them. Latched into stage 4 beside
-   -- perf_st4_region.
-   signal perf_exec_sram               : std_logic;
-   signal perf_st4_sram                : std_logic := '0';
-   signal perf_dc                      : std_logic;
    signal perf_uc                      : std_logic;
    signal perf_uc_load                 : std_logic;
    signal perf_uc_write                : std_logic;
@@ -1446,6 +1331,8 @@ architecture arch of cpu is
    signal fast_ra_line                 : unsigned(31 downto 0);
    signal fast_tog_r                   : std_logic := '0';
    signal fast_is_ra_r                 : std_logic := '0';
+   -- The read-ahead outstanding is a stream's (datacache_ra_stream).
+   signal fast_stream_r                : std_logic := '0';
    signal fast_window_dc               : std_logic;
    -- An uncached 64-bit load takes it (fast_unc_go), fast_is_unc_r marks the
    -- one outstanding as such, and fast_unc_q_1x is its qword, taken at its
@@ -1456,6 +1343,26 @@ architecture arch of cpu is
    signal fast_unc_q_1x                : std_logic_vector(63 downto 0) := (others => '0');
    signal fast_line_r                  : unsigned(31 downto 0) := (others => '0');
    signal fast_done_seen               : std_logic := '0';
+   -- fast_unc_ret: the outstanding uncached qword is back on fast_unc_valid.
+   -- fast_ret: a direct read is back, either way.
+   signal fast_unc_ret                 : std_logic;
+   signal fast_ret                     : std_logic;
+   -- RA_CTL_RETURN: a qword of the direct read-ahead outstanding is on
+   -- fast_ra_valid (fast_ra_take), fast_ra_q of its four have come, and this
+   -- is the fourth (fast_ra_ret).
+   signal fast_ra_take                 : std_logic;
+   signal fast_ra_q                    : unsigned(1 downto 0) := (others => '0');
+   signal fast_ra_ret                  : std_logic;
+   -- RA_CHAIN: the direct read-ahead outstanding completes on this edge
+   -- (fast_ra_land); the line after the one the data cache waits for may
+   -- leave (fast_chain_term), and does (fast_chain_go).
+   signal fast_ra_land                 : std_logic;
+   signal fast_chain_term              : std_logic;
+   signal fast_chain_go                : std_logic;
+   -- fast_s3_go: UNC_LAUNCH_S3's request, from stage 3; fast_s3_launched:
+   -- it was asked for on the last edge, and stage 4 presents it now.
+   signal fast_s3_go                   : std_logic;
+   signal fast_s3_launched             : std_logic := '0';
    signal fast_out                     : integer range 0 to 2 := 0;
    signal fast_first_seen              : std_logic := '0';
    signal fast_path_quiet              : std_logic;
@@ -1481,7 +1388,6 @@ architecture arch of cpu is
    signal datacache_CmdStall           : std_logic;
    signal datacache_perf_miss          : std_logic;
    signal datacache_perf_miss_low      : std_logic;
-   signal datacache_perf_miss_fb       : std_logic;
    signal datacache_perf_fill_wait     : std_logic;
    signal datacache_perf_stride_hit    : std_logic;
    signal datacache_perf_wb_line       : std_logic;
@@ -1493,10 +1399,20 @@ architecture arch of cpu is
    -- transaction in flight is one.
    signal datacache_ra_request         : std_logic;
    signal datacache_ra_addr            : unsigned(31 downto 0);
+   signal datacache_ra_stream          : std_logic;
    signal datacache_ra_pending         : std_logic := '0';
    signal datacache_ra_done            : std_logic := '0';
    signal datacache_ra_data            : std_logic_vector(255 downto 0) := (others => '0');
    signal datacache_ra_store           : std_logic;
+   -- datacache_ra_data changed on the last edge, a qword of a line on
+   -- fast_ra_valid (RA_CTL_RETURN).
+   signal datacache_ra_wr              : std_logic := '0';
+   -- RA_CHAIN: the cache's arm and the line after, whether that line is SDRAM
+   -- RAM, and its launch on the last edge.
+   signal datacache_ra_chain_ok        : std_logic;
+   signal datacache_ra_chain_addr      : unsigned(31 downto 0);
+   signal datacache_ra_chain_sdram     : std_logic;
+   signal datacache_ra_chain_taken     : std_logic := '0';
    signal datacache_CmdDone            : std_logic;
    
    signal datacache_wb_ena             : std_logic;
@@ -1559,191 +1475,8 @@ begin
 
    debug_fetch_pc <= debug_fetch_pc_register;
    debug_retired  <= std_logic_vector(debug_retired_count);
-   -- Exactly the condition that increments debug_retired_count below, so the
-   -- profile's buckets sum to RT by construction.
-   debug_prof_valid <= '1' when (stall4Masked = 0 and writebackNew = '1') else '0';
-   debug_prof_pc    <= prof_pc3;
-   debug_gpr_s1       <= debug_gpr_s1_register;
    debug_retire_pc <= debug_retire_pc_register;
    debug_retire_opcode <= debug_retire_opcode_register;
-   debug_irq_count <= std_logic_vector(debug_irq_count_register);
-   debug_t2_reload_count <= std_logic_vector(debug_t2_reload_register);
-   -- RC carries BOTH restart shapes: entries to the game's own entry point in
-   -- the high half, RAM -> boot ROM transitions in the low half. They are
-   -- mutually exclusive explanations of the same visible symptom and reading
-   -- them side by side is what separates them.
-   debug_ret_count <= std_logic_vector(debug_entry_count_register) &
-                      std_logic_vector(debug_ret_count_register(15 downto 0));
-   debug_h1_op <= debug_h1_op_r;
-   -- The opcode AT the departure pc, captured in the same statement as it.
-   debug_exc_cause <= debug_exc_cause_register;
-
-   process (clk93)
-   begin
-      if rising_edge(clk93) then
-         if (reset_93 = '1') then
-            dep_pc_now  <= (others => '0');
-            dep_valid   <= (others => '0');
-            debug_entry_count_register <= (others => '0');
-            trace_pc     <= (others => (others => '0'));
-            trace_op     <= (others => (others => '0'));
-            trace_src    <= (others => (others => '0'));
-            trace_frozen <= '0';
-            trace_cause  <= (others => '0');
-            trace_epc    <= (others => '0');
-            trace_trigger_id <= (others => '0');
-            trace_badvaddr   <= (others => '0');
-            trace_s1         <= (others => '0');
-            trace_s2         <= (others => '0');
-            trace_tlb_census <= (others => '0');
-            debug_ret_count_register <= (others => '0');
-            boot_quiet_count <= (others => '0');
-            game_running     <= '0';
-            trace_trigger_meta <= '0';
-            trace_trigger_sync <= '0';
-         else
-            trace_trigger_meta <= debug_trace_trigger;
-            trace_trigger_sync <= trace_trigger_meta;
-         end if;
-
-         if (reset_93 = '1') then
-            null;
-         elsif (ce_93 = '1' and decodeNewPulse = '1') then
-            dep_pc_now  <= std_logic_vector(PCold1(31 downto 0));
-            if (dep_valid < 2) then
-               dep_valid <= dep_valid + 1;
-            end if;
-
-            -- Every execution of the entry point, counted on the same pulse as
-            -- everything else so it cannot double-count under a stall, and
-            -- saturating so the displayed value is always true. Boot is 1.
-            if (PCold1(31 downto 0) = x"88000000" and
-                debug_entry_count_register < x"FFFF") then
-               debug_entry_count_register <= debug_entry_count_register + 1;
-            end if;
-
-            -- Shift the decode in. Index 0 is the newest, so the landing
-            -- instruction ends up at index 0 and the departure at index 1.
-            -- Stopping on trace_frozen keeps the CAUSAL window: the boot ROM
-            -- runs thousands of instructions after the restart and would
-            -- otherwise overwrite the evidence before anyone can read it.
-            if (trace_frozen = '0') then
-               trace_pc(0)  <= std_logic_vector(PCold1(31 downto 0));
-               trace_op(0)  <= std_logic_vector(opcode1);
-               trace_src(0) <= src1;
-               for i in 1 to TRACE_DEPTH - 1 loop
-                  trace_pc(i)  <= trace_pc(i - 1);
-                  trace_op(i)  <= trace_op(i - 1);
-                  trace_src(i) <= trace_src(i - 1);
-               end loop;
-            end if;
-
-            if (dep_valid = 2 and debug_entry_count_register >= 1 and
-                (PCold1(31 downto 20) = x"9FC" or
-                 PCold1(31 downto 20) = x"BFC") and
-                dep_pc_now(31 downto 20) /= x"9FC" and
-                dep_pc_now(31 downto 20) /= x"BFC") then
-               if (debug_ret_count_register < x"FFFFFFFF") then
-                  debug_ret_count_register <= debug_ret_count_register + 1;
-               end if;
-            end if;
-
-            if (PCold1(31 downto 20) = x"9FC" or
-                PCold1(31 downto 20) = x"BFC") then
-               boot_quiet_count <= (others => '0');
-            elsif (game_running = '0') then
-               if (boot_quiet_count = 2 ** BOOT_QUIET_BITS - 1) then
-                  game_running <= '1';
-               else
-                  boot_quiet_count <= boot_quiet_count + 1;
-               end if;
-            end if;
-
-            if (trace_frozen = '0') then
-               if (tlb_fault_req = '1' and game_running = '1') then
-                  trace_frozen     <= '1';
-                  trace_trigger_id <= "100";
-                  trace_cause      <= fault_cause;
-                  trace_epc        <= fault_epc;
-                  trace_badvaddr   <= fault_badvaddr;
-                  trace_s1         <= fault_s1;
-                  trace_s2         <= fault_s2;
-                  trace_tlb_census <= fault_census;
-               -- Same widened test as the counter above. This fires BEFORE
-               -- the handoff to 0x88000000, so rows 1-7 hold the game code
-               -- that jumped into the ROM - the departure.
-               elsif (dep_valid = 2 and debug_entry_count_register >= 1 and
-                   (PCold1(31 downto 20) = x"9FC" or
-                    PCold1(31 downto 20) = x"BFC") and
-                   dep_pc_now(31 downto 20) /= x"9FC" and
-                   dep_pc_now(31 downto 20) /= x"BFC") then
-                  trace_frozen     <= '1';
-                  trace_trigger_id <= "001";
-                  trace_cause      <= std_logic_vector(cop0_debug_cause);
-                  trace_epc        <= std_logic_vector(cop0_debug_epc);
-                  trace_badvaddr   <= std_logic_vector(cop0_debug_badvaddr);
-                  trace_s1         <= debug_gpr_s1_register;
-                  trace_s2         <= debug_gpr_s2_register;
-                  trace_tlb_census <= std_logic_vector(cop0_debug_tlb_census);
-               elsif (ram_reentry = '1') then
-                  trace_frozen     <= '1';
-                  trace_trigger_id <= "010";
-                  trace_cause      <= std_logic_vector(cop0_debug_cause);
-                  trace_epc        <= std_logic_vector(cop0_debug_epc);
-                  trace_badvaddr   <= std_logic_vector(cop0_debug_badvaddr);
-                  trace_s1         <= debug_gpr_s1_register;
-                  trace_s2         <= debug_gpr_s2_register;
-                  trace_tlb_census <= std_logic_vector(cop0_debug_tlb_census);
-               -- Also counted rather than gated - see ram_reentry. The board
-               -- side fires on the THIRD disk init: exactly two per startup
-               -- in both games, so the third is the restart's first.
-               elsif (trace_trigger_sync = '1') then
-                  trace_frozen     <= '1';
-                  trace_trigger_id <= "011";
-                  trace_cause      <= std_logic_vector(cop0_debug_cause);
-                  trace_epc        <= std_logic_vector(cop0_debug_epc);
-                  trace_badvaddr   <= std_logic_vector(cop0_debug_badvaddr);
-                  trace_s1         <= debug_gpr_s1_register;
-                  trace_s2         <= debug_gpr_s2_register;
-                  trace_tlb_census <= std_logic_vector(cop0_debug_tlb_census);
-               end if;
-            end if;
-         end if;
-      end if;
-   end process;
-
-   debug_ds_count      <= std_logic_vector(cop0_debug_ds_count);
-   debug_ds_first      <= std_logic_vector(cop0_debug_ds_first);
-   debug_eret_epc      <= eret_epc_held;
-   debug_eret_target   <= eret_target_held;
-   debug_eret_flags    <= eret_flags_held;
-
-   -- Track cop0's per-eret capture until the trace freezes, then hold.
-   --
-   -- The fault is three instructions after the eret being asked about, so
-   -- "the last eret before the freeze" IS that eret. Holding matters because
-   -- the boot ROM the restart lands in takes interrupts of its own, and
-   -- without this the page would show one of those by the time it is read.
-   --
-   -- Every signal here is written by this process and no other.
-   eret_freeze_proc : process (clk93)
-   begin
-      if rising_edge(clk93) then
-         if (reset_93 = '1') then
-            eret_held         <= '0';
-            eret_epc_held     <= (others => '0');
-            eret_target_held  <= (others => '0');
-            eret_flags_held   <= (others => '0');
-         elsif (ce_93 = '1' and eret_held = '0') then
-            eret_epc_held      <= std_logic_vector(cop0_debug_eret_epc);
-            eret_target_held   <= std_logic_vector(cop0_debug_eret_target);
-            eret_flags_held    <= std_logic_vector(cop0_debug_eret_flags);
-            if (trace_frozen = '1') then
-               eret_held <= '1';
-            end if;
-         end if;
-      end if;
-   end process;
 
    ds_chain_proc : process (clk93)
    begin
@@ -1764,171 +1497,18 @@ begin
    -- On a re-decode the previous decode is the slot itself, which is not a
    -- branch, so the EPC back-up remains enabled. In the chained case the
    -- previous decode is the second branch and suppression applies.
-   --
-   -- DS on the status page counts every firing. In normal gameplay it should
-   -- stay at or near zero; only the FMV decompressor's
-   -- branch-in-branch-delay-slot idiom should move it.
    chainedDelaySlot <= ds_prev_isbranch when (PCold1(31 downto 0) /= (ds_prev_pc + 4)) else '0';
-
-   -- The fault latch.
-   --
-   -- Runs every clk93 cycle, unlike the trace process above which is gated on
-   -- decodeNewPulse. cpu_cop0 writes BadVAddr, Cause and EPC in the same cycle
-   -- as the strobe, so the capture is two cycles behind it; nothing else writes
-   -- them in between, and the faulting load never reaches writeback, so $s1 and
-   -- $s2 still hold their pre-fault values.
-   --
-   -- Every signal here is written by this process and no other.
-   tlb_fault_proc : process (clk93)
-   begin
-      if rising_edge(clk93) then
-         if (reset_93 = '1') then
-            tlb_exc_stb_d1 <= '0';
-            tlb_exc_stb_d2 <= '0';
-            tlb_fault_req  <= '0';
-            fault_badvaddr <= (others => '0');
-            fault_s1       <= (others => '0');
-            fault_s2       <= (others => '0');
-            fault_census   <= (others => '0');
-            fault_cause    <= (others => '0');
-            fault_epc      <= (others => '0');
-         elsif (ce_93 = '1') then
-            tlb_exc_stb_d1 <= cop0_debug_tlb_exc_stb;
-            tlb_exc_stb_d2 <= tlb_exc_stb_d1;
-
-            -- First fault only. A restart takes the boot ROM through code that
-            -- may fault again, and the first one is the one being asked about.
-            if (tlb_exc_stb_d2 = '1' and tlb_fault_req = '0') then
-               tlb_fault_req  <= '1';
-               fault_badvaddr <= std_logic_vector(cop0_debug_badvaddr);
-               fault_s1       <= debug_gpr_s1_register;
-               fault_s2       <= debug_gpr_s2_register;
-               fault_census   <= std_logic_vector(cop0_debug_tlb_census);
-               fault_cause    <= std_logic_vector(cop0_debug_cause);
-               fault_epc      <= std_logic_vector(cop0_debug_epc);
-            end if;
-         end if;
-      end if;
-   end process;
-
-   process (clk93)
-   begin
-      if rising_edge(clk93) then
-         if (reset_93 = '1') then
-            store_addr_0 <= (others => '0');
-            store_data_0 <= (others => '0');
-            store_pc_0   <= (others => '0');
-            store_addr_1 <= (others => '0');
-            store_hold   <= (others => '0');
-            store_frozen <= '0';
-         elsif (ce_93 = '1') then
-            if (trace_frozen = '1' and store_frozen = '0') then
-               if (store_hold = 16) then
-                  store_frozen <= '1';
-               else
-                  store_hold <= store_hold + 1;
-               end if;
-            end if;
-
-            if (store_frozen = '0' and stall4Masked = 0 and executeNew = '1'
-                and executeMemWriteEnable = '1') then
-               store_addr_1 <= store_addr_0;
-               store_addr_0 <= std_logic_vector(executeMemAddress(31 downto 0));
-               store_data_0 <= std_logic_vector(executeMemWriteData(31 downto 0));
-               store_pc_0   <= debug_fetch_pc_register;
-            end if;
-         end if;
-      end if;
-   end process;
-
-   ram_reentry <= '1' when (dep_valid = 2 and
-                            PCold1(31 downto 0) = x"88000000" and
-                            debug_entry_count_register >= 1)
-                      else '0';
 
    debug_cop0_cause_live <= std_logic_vector(cop0_debug_cause);
    debug_cop0_epc_live   <= std_logic_vector(cop0_debug_epc);
-
-   gtrace_export : if DEBUG_TRACE generate
-      debug_trace_frozen <= trace_frozen;
-
-      -- Export oldest first, so the debug page renders top to bottom in program
-      -- order and entry 7 is always the landing decode.
-      trace_export : for i in 0 to TRACE_DEPTH - 1 generate
-         debug_trace_bus(i * 64 + 63 downto i * 64 + 32) <=
-            trace_pc(TRACE_DEPTH - 1 - i);
-         debug_trace_bus(i * 64 + 31 downto i * 64) <=
-            trace_op(TRACE_DEPTH - 1 - i);
-         debug_trace_bus(512 + i * 4 + 3 downto 512 + i * 4) <=
-            trace_src(TRACE_DEPTH - 1 - i);
-      end generate;
-
-      debug_trace_bus(575 downto 544) <= trace_cause;
-      debug_trace_bus(607 downto 576) <= trace_epc;
-      debug_trace_bus(639 downto 608) <= store_addr_0;
-      debug_trace_bus(671 downto 640) <= store_data_0;
-      debug_trace_bus(703 downto 672) <= store_pc_0;
-      debug_trace_bus(735 downto 704) <= store_addr_1;
-      -- The capture's own provenance, in its own word rather than stolen bits.
-      --   [2:0]  which trigger froze the trace
-      --   [3]    end-of-boot gate, so an unarmed detector is visible as such
-      debug_trace_bus(738 downto 736) <= trace_trigger_id;
-      debug_trace_bus(739)            <= game_running;
-      debug_trace_bus(799 downto 768) <= trace_badvaddr;
-      debug_trace_bus(831 downto 800) <= trace_s1;
-      debug_trace_bus(863 downto 832) <= trace_s2;
-      debug_trace_bus(895 downto 864) <= trace_tlb_census;
-      -- Fill starts at 740, not 739: bit 739 is game_running, and a fill over
-      -- it would give it two drivers. ModelSim resolves that silently; only the
-      -- Quartus analysis pass rejects it, which is why BRINGUP makes that pass
-      -- mandatory after any change that moves bits between fields.
-      debug_trace_bus(767 downto 740) <= (others => '0');
-   end generate;
-
-   gtrace_off : if not DEBUG_TRACE generate
-      debug_trace_frozen <= '0';
-      debug_trace_bus    <= (others => '0');
-   end generate;
 
    process (clk93)
    begin
       if (rising_edge(clk93)) then
          if (reset_93 = '1') then
             debug_fetch_pc_register <= (others => '0');
-            debug_t2_reload_register <= (others => '0');
-            -- debug_ret_count_register is NOT cleared here. It is written by
-            -- the decodeNewPulse process, and a register driven from two
-            -- processes is illegal for synthesis - Quartus rejects it outright
-            -- while ModelSim resolves it silently.
          elsif (ce_93 = '1' and stall = 0 and decodeNew = '1') then
             debug_fetch_pc_register <= std_logic_vector(PCold1(31 downto 0));
-            debug_prev_op_live      <= std_logic_vector(opcode1);
-            -- One deeper, so two consecutive fetches can be compared.
-            hist_op1 <= debug_prev_op_live;
-            -- EVERY transition out of the decompressed program back into
-            -- the boot ROM, with the address it landed on, the address it left
-            -- from, and a running count.
-            --
-            -- Read the landing address: BFC00000 is the reset vector,
-            -- BFC00380 the general exception vector for Status.BEV = 1, and
-            -- anything else is an ordinary call into ROM code.
-            if (debug_fetch_pc_register(31 downto 24) = x"88" and
-                (PCold1(31 downto 20) = x"9FC" or
-                 PCold1(31 downto 20) = x"BFC")) then
-               debug_h1_op_r <= hist_op1;
-               debug_exc_cause_register <= std_logic_vector(cop0_debug_cause);
-            end if;
-
-            -- The store is in the branch DELAY SLOT, so "the loop ran 256
-            -- times" and "the CPU issued 256 stores" are not the same claim.
-            -- Counted at decode, gated by stall = 0 and decodeNew, so each
-            -- pass counts once whether or not it goes on to drive the bus.
-
-
-            if PCold1(31 downto 0) = x"9FC00728" then
-               debug_t2_reload_register <= debug_t2_reload_register + 1;
-            end if;
-
          end if;
       end if;
    end process;
@@ -1949,8 +1529,6 @@ begin
       "10" when (executeMemAddress(28 downto 24) = "10000") else   -- 0x10xxxxxx, I/O
       "11" when (executeMemAddress(28 downto 22) = "1111111") else -- 0x1FCxxxxx, boot ROM
       "00";                                                        -- RAM, anything else
-
-   perf_exec_sram <= '1' when (executeMemAddress(31 downto 19) = 0 and executeMemFB = '0') else '0';
 
    perf_uc       <= stall4 and (not writeback_UseCache);
    perf_uc_write <= perf_uc and writebackMemWrite;
@@ -1991,19 +1569,8 @@ begin
                               not (decodeSource1 > 0 and resultTarget = decodeSource1) and
                               not (decodeSource2 > 0 and resultTarget = decodeSource2)) else '0';
 
-   -- LM (bit 10) is the SRAM-region share of MC. It is APPENDED rather than
-   -- put in S3's slot. Row 14 of the Perf page shows S3 directly for both
-   -- frames, and it is a term of the CY - RT = S4 + MD + S3 + S1 + LB
-   -- identity. Repurposing it would corrupt both.
-   -- A cached stall charged by the region of the load or store in stage 4.
-   -- A CACHE command's index address is not a data address, so its stall
-   -- is left out: it stays in what DC - DF - DS leaves, with main RAM's.
-   perf_dc <= stall4 and writeback_UseCache and (perf_st4_read or writebackMemWrite);
-   debug_perf_mem <= (perf_dc and perf_st4_sram) &                    -- 3 DS
-                     (datacache_perf_miss_low and not datacache_perf_miss_fb) & -- 2 SM
-                     (perf_dc and perf_st4_region(0) and not perf_st4_region(1)) & -- 1 DF
-                     datacache_perf_miss_fb;                          -- 0 FM
-
+   -- LM (bit 10) is the SRAM-region share of MC; see cpu_datacache's
+   -- perf_miss_low.
    debug_perf_events <= perf_ld_indep &                   -- 11 DI
                         datacache_perf_miss_low &         -- 10 LM
                         perf_lost_lb &                    -- 9 LB
@@ -2048,12 +1615,31 @@ begin
          datacache_fill_done      <= datacache_fill_due;
          datacache_fill_due       <= '0';
          datacache_ra_done        <= '0';
+         datacache_ra_wr          <= '0';
+         datacache_ra_chain_taken <= '0';
          -- Followed in reset too, so a direct fill that ends during one
-         -- leaves nothing outstanding after it.
+         -- leaves nothing outstanding after it; and so is a read-ahead line's
+         -- qword count (RA_CTL_RETURN).
          fast_done_seen           <= fast_done_tog;
-         
+         fast_s3_launched         <= fast_s3_go;
+         if (fast_ra_take = '1') then
+            fast_ra_q <= fast_ra_q + 1;
+         end if;
+
          if (reset_93 = '1') then
-         
+
+            -- Neither ki_fast_fill nor the SDRAM controller takes the CPU's
+            -- reset, so a direct read in flight when it comes still
+            -- finishes. Its completion goes nowhere, but it is counted: a
+            -- read left counted keeps fast_busy up, and every later miss
+            -- off the direct port. No request leaves during a reset, and
+            -- every source of one outlasts a direct read, so the count is
+            -- zero by its end (asserted).
+            if (fast_ret = '1') then
+               fast_out <= fast_out - 1;
+            end if;
+            -- The data cache forgets its read-ahead in the reset too.
+            datacache_ra_pending      <= '0';
             mem1_request_latched      <= '0';
             datacache_request_latched <= '0';
             writefifo_cnt             <= 0;
@@ -2357,7 +1943,8 @@ begin
                 writefifo_Din(115 downto 108) <= std_logic_vector(read_sequence_93);
                 writefifo_Din(116)           <= '0';
                writefifo_Din(117)           <= '0';
-             elsif (mem4_request = '1' and writefifo_mem4_ready = '1' and fast_unc_go = '0') then
+             elsif (mem4_request = '1' and writefifo_mem4_ready = '1' and fast_unc_go = '0' and
+                    fast_s3_launched = '0') then
                 writefifo_issue_pending      <= '1';
                 writefifo_issue_wb           <= '0';
                 writefifo_Din( 95 downto 64) <= std_logic_vector(mem4_address);
@@ -2420,7 +2007,11 @@ begin
             if (fast_ra_go = '1') then
                datacache_ra_pending <= '0';
             end if;
-            if (DCRA_ON and datacache_ra_request = '1') then
+            -- A read-ahead that took the direct port from its ask
+            -- (RA_LAUNCH_EARLY) has left: it waits for nothing, and pending
+            -- would send it through the scheduler as well.
+            if (DCRA_ON and datacache_ra_request = '1' and
+                not (RA_LAUNCH_EARLY and fast_ra_go = '1')) then
                datacache_ra_pending <= '1';
             end if;
             
@@ -2429,28 +2020,38 @@ begin
             -- bridge fill's takes below; a read-ahead's as ra_done with
             -- line_fill_1x, as a bridge read-ahead's comes; an uncached
             -- load's into the rotation below, as a bridge one's goes. An
-            -- uncached load asks for its qword, bit 0 set to say so.
+            -- uncached load asks for its qword, bit 0 set to say so, from stage
+            -- 4 (fast_unc_go) or stage 3 (fast_s3_go).
             -- Direct reads outstanding, and the newest one's first beat.
-            if ((fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1') and
-                fast_done_tog = fast_done_seen) then
+            if ((fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1' or
+                 fast_s3_go = '1') and fast_ret = '0') then
                fast_out <= fast_out + 1;
-            elsif (not (fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1') and
-                   fast_done_tog /= fast_done_seen) then
+            elsif (not (fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1' or
+                        fast_s3_go = '1') and fast_ret = '1') then
                fast_out <= fast_out - 1;
             end if;
-            if (fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1') then
+            if (fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1' or
+                fast_s3_go = '1') then
                fast_first_seen <= '0';
             elsif (fast_window = '1' and fast_first = '1') then
                fast_first_seen <= '1';
             end if;
-            if (fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1') then
+            if (fast_go = '1' or fast_ra_go = '1' or fast_unc_go = '1' or fast_go_q = '1' or
+                fast_s3_go = '1') then
                fast_tog_r    <= not fast_tog_r;
                fast_is_ra_r  <= fast_ra_go;
-               fast_is_unc_r <= fast_unc_go;
-               if (fast_unc_go = '1') then
+               fast_stream_r <= fast_ra_go and (datacache_ra_stream or fast_chain_term);
+               fast_is_unc_r <= fast_unc_go or fast_s3_go;
+               if (fast_s3_go = '1') then
+                  fast_line_r <= executeMemAddress(31 downto 3) & "001";
+               elsif (fast_unc_go = '1') then
                   fast_line_r <= mem4_address(31 downto 3) & "001";
                elsif (fast_ra_go = '1') then
                   fast_line_r <= fast_ra_line;
+                  -- Bit 1: its qwords back on fast_ra_valid.
+                  if (RA_CTL_RETURN) then
+                     fast_line_r(1) <= '1';
+                  end if;
                else
                   fast_line_r <= fast_line;
                end if;
@@ -2466,6 +2067,26 @@ begin
                else
                   datacache_fill_done <= '1';
                end if;
+            end if;
+            -- RA_CTL_RETURN: a direct read-ahead's qwords into the staging
+            -- register as they come, its completion with the fourth. The
+            -- copy that reads it is over before the next line's first comes
+            -- (asserted in the data cache).
+            if (fast_ra_take = '1') then
+               case (fast_ra_q) is
+                  when "00"   => datacache_ra_data( 63 downto   0) <= fast_unc_qword;
+                  when "01"   => datacache_ra_data(127 downto  64) <= fast_unc_qword;
+                  when "10"   => datacache_ra_data(191 downto 128) <= fast_unc_qword;
+                  when others => datacache_ra_data(255 downto 192) <= fast_unc_qword;
+               end case;
+               datacache_ra_wr <= '1';
+               if (fast_ra_q = 3) then
+                  datacache_ra_done <= '1';
+               end if;
+            end if;
+            -- RA_CHAIN: the data cache stages the chained line at its exit.
+            if (fast_chain_go = '1') then
+               datacache_ra_chain_taken <= '1';
             end if;
 
             -- The FIFO holds its head until resp_take pops it, so the payload
@@ -2523,6 +2144,11 @@ begin
                      else
                         datacache_fill_done <= '1';
                      end if;
+                  elsif (UNC_BRIDGE_FAST_DONE and read4_useLoadType = LOADTYPE_QWORD) then
+                     -- An uncached 64-bit load: qword-aligned, so its
+                     -- rotation is none, and it completes on this edge.
+                     mem_finished_dataRot    <= resp_fifo_dout(63 downto 0);
+                     mem_finished_read       <= '1';
                   else
                      -- An uncached stage-4 read, the one completion whose
                      -- data this side still has to rotate. Two more cycles.
@@ -2535,15 +2161,21 @@ begin
             -- the rotation (asserted). With UNC_FAST_DONE it skips it: a
             -- qword-aligned load's rotation is none (read4_uncachedRot "00"
             -- for every load type at a qword address), so it completes on
-            -- this edge.
+            -- this edge. Its qword goes only where its completion reads it:
+            -- an uncached opcode taken beside it is in mem_finished_dataRead.
             if (fast_done_tog /= fast_done_seen and fast_is_unc_r = '1') then
-               mem_finished_dataRead   <= fast_unc_q_1x;
                if (UNC_FAST_DONE) then
                   mem_finished_dataRot <= fast_unc_q_1x;
                   mem_finished_read    <= '1';
                else
+                  mem_finished_dataRead   <= fast_unc_q_1x;
                   response_cdc_pending_93 <= '1';
                end if;
+            end if;
+            -- And on fast_unc_valid, as UNC_FAST_DONE has it.
+            if (fast_unc_ret = '1') then
+               mem_finished_dataRot <= fast_unc_qword;
+               mem_finished_read    <= '1';
             end if;
 
          end if;
@@ -3311,9 +2943,6 @@ begin
             
                PCold0             <= FetchAddr;
                PC                 <= FetchAddr;
-               -- Tag the address with the mux arm that produced it, in the
-               -- same statement that latches it, so the pair cannot drift.
-               src0               <= fetch_src;
                useCached_data     <= fetchCache;
                fetchReady         <= '1';
                
@@ -3399,7 +3028,6 @@ begin
             stall2           <= '0';
             decodeNew        <= '0';
             decodeNewPulse   <= '0';
-            src1             <= (others => '0');
             -- Cleared for the same reason as pcOld0 in stage 1: a stale pc or
             -- opcode surviving a reset is indistinguishable from a real decode
             -- to anything watching this stage.
@@ -3429,7 +3057,6 @@ begin
 
                   pcOld1           <= pcOld0;
                   opcode1          <= opcodeCacheMuxed;
-                  src1             <= src0;
 
                   decodeImmData    <= decImmData;   
                   decodeJumpTarget <= decJumpTarget;
@@ -4149,7 +3776,7 @@ begin
                         decodeExcType           <= EXCTYPE_ADDRD;
                         decodeExcCode           <= x"4";
 
-                     when 16#35# => -- LDC1 
+                     when 16#35# => -- LDC1
                         decodeMem64Bit          <= '1';
                         decodeLoadType          <= LOADTYPE_QWORD;
                         if (COP1_enable = '0') then
@@ -4194,8 +3821,8 @@ begin
                            decodeMemWriteEnable    <= '1';
                            decodeExcType           <= EXCTYPE_ADDRW;
                            decodeExcCode           <= x"5";
-                        end if;  
-                        
+                        end if;
+
                      when 16#3A# => -- SWC2 -> NOP
                         null;
    
@@ -4257,8 +3884,22 @@ begin
                if (unsigned(FPUregs_address_a) = decodeFPUSource1 and FPUregs_wren_a(0) = '1') then decodeFPUValue1(31 downto  0) <= unsigned(FPUregs_data_a(31 downto  0)); end if;
                if (unsigned(FPUregs_address_a) = decodeFPUSource2 and FPUregs_wren_a(1) = '1') then decodeFPUValue2(63 downto 32) <= unsigned(FPUregs_data_a(63 downto 32)); end if;
                if (unsigned(FPUregs_address_a) = decodeFPUSource2 and FPUregs_wren_a(0) = '1') then decodeFPUValue2(31 downto  0) <= unsigned(FPUregs_data_a(31 downto  0)); end if;
-      
+
             end if; -- stall
+
+            -- An FPU result in its done cycle, for the instruction held in
+            -- stage 3 on it: what the write port above carries next cycle,
+            -- or, if the op traps, a value the exception discards with that
+            -- instruction. The op's stall3 holds that instruction from the
+            -- op's issue to its done, so this needs no stall term; and the
+            -- earliest done is three cycles after issue, so the register
+            -- match, taken a cycle earlier, has settled by then.
+            FPU_fwd_match1 <= '0';
+            FPU_fwd_match2 <= '0';
+            if (FPUWriteTarget = decodeFPUSource1) then FPU_fwd_match1 <= '1'; end if;
+            if (FPUWriteTarget = decodeFPUSource2) then FPU_fwd_match2 <= '1'; end if;
+            if (FPU_fwd_valid = '1' and FPU_fwd_match1 = '1') then decodeFPUValue1 <= FPU_fwd_data; end if;
+            if (FPU_fwd_valid = '1' and FPU_fwd_match2 = '1') then decodeFPUValue2 <= FPU_fwd_data; end if;
 
          end if; -- ce
       end if; -- clk
@@ -4394,32 +4035,6 @@ begin
       end if;
    end process;
 -- synthesis translate_on
-
-   -- WHICH ARM OF THE MUX ABOVE PRODUCED THIS FETCH ADDRESS.
-   --
-   -- Only three of these arms can produce 0xBFC00004 at all:
-   --
-   --   5 REG    a jr/jalr whose register held BFC00004
-   --   7 ERET   an eret with EPC = BFC00004
-   --   0 SEQ    PC was already BFC00000 and simply advanced
-   --
-   -- while 1 EXC would mean COP0 produced a vector it has no code to produce,
-   -- and 4 BRA or 6 JMP cannot reach BFC00004 from a 0x88xxxxxx pc - a taken
-   -- branch is limited to a signed 16-bit word offset and a jump immediate
-   -- inherits the top nibble of the delay slot's pc. So whichever tag appears
-   -- beside the landing entry either names the mechanism or convicts the mux.
-   --
-   -- Deliberately written in the SAME priority order as FetchAddrSelect and
-   -- FetchAddr1 above, and placed next to them, so the two cannot drift apart
-   -- unnoticed.
-   fetch_src <= x"4" when (FetchAddrSelect = '1')                                else -- taken branch
-                x"1" when (exception = '1' or exceptionStage1 = '1')             else -- exception vector
-                x"2" when (executeIgnoreNext = '1')                              else -- annulled slot -> PCnext
-                x"3" when (decodeNew = '0')                                      else -- no decode -> PCnext
-                x"5" when (decodeBranchType = BRANCH_ALWAYS_REG)                 else -- jr / jalr
-                x"6" when (decodeBranchType = BRANCH_JUMPIMM)                    else -- j / jal
-                x"7" when (decodeBranchType = BRANCH_ERET)                       else -- eret
-                x"0";                                                                 -- sequential PCnext
 
    EXECOPBranchDelaySlot <= '0' when (executeIgnoreNext = '1') else
                             '1' when (decodeBranchType /= BRANCH_OFF) else 
@@ -4870,7 +4485,7 @@ begin
             execute_unstallFPUForward <= '0';
             
             if (FPU_command_done = '1') then
-               if (decodeFPUForwardUse = '1') then
+               if (decodeFPUForwardUse = '1' and FPU_fwd_valid = '0') then
                   execute_unstallFPUForward <= '1';
                else
                   stall3     <= '0';
@@ -4974,7 +4589,6 @@ begin
                      pcOld2                        <= pcOld1;
                      opcode2                       <= opcode1;
 -- synthesis translate_on
-                     prof_pc2                      <= std_logic_vector(pcOld1(31 downto 0));
                             
                      -- from calculation
                      if (decodeTarget = 0 or exceptionNew3 = '1') then
@@ -5229,6 +4843,8 @@ begin
       CWF_FB        => DCACHE_CWF_FB,
       FILL_FIRST    => DCACHE_FILL_FIRST,
       FILL_AT_MISS  => DCACHE_FILL_AT_MISS,
+      RA_CROSS_PAGE => DCACHE_RA_CROSS_PAGE,
+      RA_CHAIN      => (RA_CHAIN /= 0),
       READ_AHEAD    => DCACHE_READ_AHEAD
    )
    port map
@@ -5294,7 +4910,6 @@ begin
       debug_state       => datacache_debug_state,
       perf_miss         => datacache_perf_miss,
       perf_miss_low     => datacache_perf_miss_low,
-      perf_miss_fb      => datacache_perf_miss_fb,
       perf_fill_wait    => datacache_perf_fill_wait,
       perf_fill_data    => open,
       perf_fill_hold    => open,
@@ -5308,10 +4923,16 @@ begin
       perf_delta_hit    => open,
       ra_request        => datacache_ra_request,
       ra_reqAddr        => datacache_ra_addr,
+      ra_reqStream      => datacache_ra_stream,
       ra_done           => datacache_ra_done,
       ra_data           => datacache_ra_data,
       ra_store          => datacache_ra_store,
       ra_store_addr     => unsigned(writefifo_Din(95 downto 64)),
+      ra_wr             => datacache_ra_wr,
+      ra_chain_ok       => datacache_ra_chain_ok,
+      ra_chain_addr     => datacache_ra_chain_addr,
+      ra_chain_sdram    => datacache_ra_chain_sdram,
+      ra_chain_taken    => datacache_ra_chain_taken,
       perf_ra_issue     => open,
       perf_ra_used      => open,
       tail_q_ok         => fast_tail_q_ok,
@@ -5359,10 +4980,25 @@ begin
    -- window once the first's has closed, so the two come back in order and
    -- the first's completion is the first done toggle. Otherwise the data
    -- cache holds the request until the line has landed.
+   --
+   -- With RA_CHAIN the read-ahead of the line after the one the data cache
+   -- waits for in FILLRA_WAIT leaves as that one completes, without an ask
+   -- (fast_chain_term): the cache arms it while it waits (ra_chain_ok, with
+   -- the line in ra_chain_addr), learns of its launch on the next edge
+   -- (ra_chain_taken), and stages it as in flight when it leaves FILLRA_WAIT,
+   -- asking for nothing. One that cannot leave then is not sent at all: the
+   -- cache asks for it as the copy starts, as without RA_CHAIN.
    fast_line       <= datacache_reqAddr(31 downto 5) & "00000";
    fast_line_ok    <= is_sdram_line(fast_line);
-   fast_ra_line    <= datacache_ra_addr(31 downto 5) & "00000";
-   fast_ra_line_ok <= is_sdram_line(fast_ra_line);
+   fast_ra_line    <= (datacache_ra_chain_addr(31 downto 5) & "00000") when (fast_chain_term = '1') else
+                      (datacache_ra_addr(31 downto 5) & "00000");
+   -- The ask's line. The armed line after was tested as it was armed
+   -- (datacache_ra_chain_sdram), so a chained launch is not tested again
+   -- (asserted), and its select stays off this compare.
+   fast_ra_line_ok <= is_sdram_line(datacache_ra_addr(31 downto 5) & "00000");
+   -- The line after the one the data cache is filling, for its arm: the
+   -- direct port reads only SDRAM RAM.
+   datacache_ra_chain_sdram <= is_sdram_line((datacache_reqAddr(31 downto 5) + 1) & "00000");
    fast_busy       <= '1' when (fast_out /= 0) else '0';
    fast_path_quiet <= '1' when (writefifo_Empty = '1' and writefifo_issue_pending = '0' and
                                 write_cdc_busy_93 = '0' and
@@ -5381,14 +5017,71 @@ begin
    fast_go_q       <= '1' when (datacache_request_raw = '1' and fast_tail_q_ok = '1') else '0';
    fast_go         <= '1' when (FAST_ON and datacache_request_raw = '1' and
                                 fast_line_ok = '1' and fast_path_clear = '1') else '0';
-   fast_ra_go      <= '1' when (FAST_ON and DCRA_ON and datacache_ra_pending = '1' and
-                                datacache_request_raw = '0' and fast_unc_go = '0' and
-                                fast_ra_line_ok = '1' and fast_path_clear = '1') else '0';
+   -- RA_LAUNCH_EARLY: also from the cache's ask, in the cycle after the edge
+   -- that registered it and datacache_ra_addr together, unless a load leaves
+   -- from stage 3 on this edge; then it waits in pending as before. One ask is
+   -- never pending beside another: the cache has one read-ahead in flight.
+   -- RA_CHAIN: also the cache's armed line after, without an ask
+   -- (fast_chain_term).
+   fast_ra_go      <= '1' when (FAST_ON and DCRA_ON and
+                                (((datacache_ra_pending = '1' or
+                                   (RA_LAUNCH_EARLY and datacache_ra_request = '1' and
+                                    fast_s3_go = '0')) and fast_path_clear = '1' and
+                                  fast_ra_line_ok = '1') or
+                                 fast_chain_term = '1') and
+                                datacache_request_raw = '0' and fast_unc_go = '0') else '0';
+   -- RA_CHAIN: the armed line after leaves as the read-ahead the cache waits
+   -- for completes. 1: in the cycle its datacache_ra_done is high, under the
+   -- usual rule - that completion took fast_out down on the edge that
+   -- registered it. 2: in the cycle the direct read-ahead outstanding comes
+   -- back (fast_ra_land), on the edge that registers its completion, which
+   -- takes fast_out down as this launch takes it up; nothing else of the
+   -- CPU's may be in the bridge's path, as for any direct read. Never in a
+   -- reset, never beside a load leaving from stage 3, nor beside an ask,
+   -- which the cache makes only with no read-ahead in flight (asserted).
+   fast_ra_land    <= '1' when (fast_ra_ret = '1' or
+                                (fast_done_tog /= fast_done_seen and fast_is_ra_r = '1')) else '0';
+   fast_chain_term <= '1' when (FAST_ON and DCRA_ON and RA_CHAIN /= 0 and reset_93 = '0' and
+                                datacache_ra_chain_ok = '1' and fast_s3_go = '0' and
+                                ((RA_CHAIN = 1 and datacache_ra_done = '1' and fast_path_clear = '1') or
+                                 (RA_CHAIN = 2 and fast_ra_land = '1' and fast_out = 1 and
+                                  fast_ok = '1' and fast_path_quiet = '1'))) else '0';
+   fast_chain_go   <= fast_ra_go and fast_chain_term;
    fast_unc_ok     <= '1' when (mem4_req64 = '1' and mem4_address(2 downto 0) = "000" and
                                 is_sdram_line(mem4_address(31 downto 5) & "00000") = '1') else '0';
    fast_unc_go     <= '1' when (FAST_ON and mem4_request = '1' and mem4_rnw = '1' and
                                 writefifo_mem4_ready = '1' and fast_unc_ok = '1' and
                                 datacache_request_raw = '0' and fast_path_clear = '1') else '0';
+   fast_unc_ret    <= '1' when (FAST_ON and fast_unc_valid = '1' and fast_is_unc_r = '1') else '0';
+   -- RA_CTL_RETURN: a direct read-ahead's qwords on fast_ra_valid, the
+   -- fourth its completion.
+   fast_ra_take    <= '1' when (FAST_ON and DCRA_ON and RA_CTL_RETURN and fast_ra_valid = '1' and
+                                fast_is_ra_r = '1') else '0';
+   fast_ra_ret     <= '1' when (fast_ra_take = '1' and fast_ra_q = 3) else '0';
+   fast_ret        <= '1' when (fast_done_tog /= fast_done_seen or fast_unc_ret = '1' or
+                                fast_ra_ret = '1') else '0';
+
+   -- UNC_LAUNCH_S3. An uncached load in stage 4 completes in a cycle with
+   -- mem_finished_read. If the instruction waiting in stage 3 is an uncached
+   -- 64-bit load of SDRAM RAM, qword-aligned, it goes to the direct port on
+   -- that edge, under fast_unc_go's rule: nothing of the CPU's in the
+   -- bridge's path, so every store ahead of it has been written. The edge
+   -- releases stage 4 and nothing else stalls, so stage 4 presents the load
+   -- on the next (asserted); in that cycle the bridge's load branch stands
+   -- aside (fast_s3_launched), and fast_unc_go cannot fire, the read being
+   -- outstanding. Its completion releases stage 4 as fast_unc_go's does.
+   fast_s3_go      <= '1' when (FAST_ON and UNC_LAUNCH_S3 and
+                                mem_finished_read = '1' and stall4 = '1' and
+                                writeback_UseCache = '0' and
+                                executeNew = '1' and executeMemReadEnable = '1' and
+                                executeMemUseCache = '0' and executeMem64Bit = '1' and
+                                executeLoadType = LOADTYPE_QWORD and
+                                executeMemAddress(2 downto 0) = "000" and
+                                is_sdram_line(executeMemAddress(31 downto 5) & "00000") = '1' and
+                                stall1 = '0' and stall2 = '0' and stall3 = '0' and
+                                fast_out = 0 and fast_ok = '1' and fast_path_quiet = '1' and
+                                datacache_request_raw = '0' and datacache_ra_pending = '0' and
+                                read_fifoStall = '0' and writeback_fifoStall = '0') else '0';
 
    -- A direct uncached load's qword, at its one beat.
    process (clk1x)
@@ -5402,20 +5095,87 @@ begin
 
 -- synthesis translate_off
    process (clk93)
+      variable reset_d : std_logic := '1';
+      variable n_go    : integer;
    begin
       if rising_edge(clk93) then
+         -- One direct request at most leaves on an edge.
+         n_go := 0;
+         if (fast_go = '1')     then n_go := n_go + 1; end if;
+         if (fast_go_q = '1')   then n_go := n_go + 1; end if;
+         if (fast_ra_go = '1')  then n_go := n_go + 1; end if;
+         if (fast_unc_go = '1') then n_go := n_go + 1; end if;
+         if (fast_s3_go = '1')  then n_go := n_go + 1; end if;
+         assert n_go <= 1
+            report "two direct requests on one edge"
+            severity failure;
+         -- RA_LAUNCH_EARLY: no read-ahead is asked for while another waits
+         -- to be issued, so a launch beside an ask is the ask's own, and
+         -- leaving pending clear for it drops nothing.
+         assert not (RA_LAUNCH_EARLY and reset_93 = '0' and
+                     datacache_ra_request = '1' and datacache_ra_pending = '1')
+            report "a read-ahead asked for while another waited to be issued"
+            severity failure;
+         -- RA_CHAIN: a chained launch is never beside an ask or one waiting
+         -- to be issued, so the line it takes is the only one asked for.
+         assert not (reset_93 = '0' and fast_chain_term = '1' and
+                     (datacache_ra_request = '1' or datacache_ra_pending = '1'))
+            report "a chained read-ahead beside an ask"
+            severity failure;
+         -- RA_CHAIN: the armed line after is SDRAM RAM, as it was tested on
+         -- arming; fast_ra_go does not test it again.
+         assert not (fast_chain_term = '1' and
+                     is_sdram_line(datacache_ra_chain_addr(31 downto 5) & "00000") = '0')
+            report "a chained read-ahead of a line the direct port cannot read"
+            severity failure;
+         -- RA_CTL_RETURN: a qword on fast_ra_valid is the direct read-ahead
+         -- outstanding's, never a bridge read-ahead's beside it; its fourth
+         -- is the only completion on its edge.
+         assert not (fast_ra_valid = '1' and
+                     (not (FAST_ON and DCRA_ON and RA_CTL_RETURN) or
+                      fast_is_ra_r = '0' or fast_out = 0))
+            report "a read-ahead qword came back with no direct read-ahead outstanding"
+            severity failure;
+         assert not (fast_ra_take = '1' and resp_take = '1' and resp_fifo_dout(105) = '1')
+            report "a direct read-ahead qword came back beside a bridge read-ahead's completion"
+            severity failure;
+         assert not (fast_ra_ret = '1' and
+                     (fast_done_tog /= fast_done_seen or fast_unc_ret = '1'))
+            report "a direct read-ahead line came back beside another completion"
+            severity failure;
          -- A bridge read-ahead's completion beside it touches neither.
          assert not (fast_done_tog /= fast_done_seen and fast_is_unc_r = '1' and
-                     (response_cdc_pending_93 = '1' or response_cdc_deliver_93 = '1' or
+                     (fast_ra_ret = '1' or
+                      response_cdc_pending_93 = '1' or response_cdc_deliver_93 = '1' or
                       (resp_fifo_empty = '0' and resp_fifo_dout(105) = '0')))
             report "a direct uncached load completed beside another completion"
             severity failure;
+         assert not (fast_unc_ret = '1' and
+                     (fast_done_tog /= fast_done_seen or fast_ra_ret = '1' or fast_out /= 1 or
+                      response_cdc_pending_93 = '1' or response_cdc_deliver_93 = '1' or
+                      (resp_fifo_empty = '0' and resp_fifo_dout(105) = '0')))
+            report "a direct uncached qword came back beside another completion"
+            severity failure;
+         -- A load launched from stage 3 is the one stage 4 presents next.
+         assert not (fast_s3_launched = '1' and reset_93 = '0' and
+                     not (stall4Masked = 0 and executeNew = '1' and
+                          mem4_request = '1' and mem4_rnw = '1' and
+                          mem4_address(31 downto 3) = fast_line_r(31 downto 3)))
+            report "a load launched from stage 3 was not presented on the next edge"
+            severity failure;
+         -- Every direct read in flight when a reset came has finished, and
+         -- been counted, by its end.
+         assert not (reset_d = '1' and reset_93 = '0' and fast_out /= 0)
+            report "a direct read was still outstanding when the reset ended"
+            severity failure;
+         reset_d := reset_93;
       end if;
    end process;
 -- synthesis translate_on
    datacache_request <= datacache_request_raw and not fast_go and not fast_go_q;
-   fast_req_tog  <= fast_tog_r;
-   fast_req_line <= std_logic_vector(fast_line_r);
+   fast_req_tog    <= fast_tog_r;
+   fast_req_line   <= std_logic_vector(fast_line_r);
+   fast_req_stream <= fast_stream_r;
 
    -- The data cache takes a direct demand fill through its usual fill port,
    -- the window open from the request until the fourth beat. A direct
@@ -5457,7 +5217,39 @@ begin
    load_use <= '1' when (not LOAD_INTERLOCK or decodeCOP1ReadEnable = '1' or
                          (decSource1 > 0 and decSource1 = decodeTarget) or
                          (decSource2 > 0 and decSource2 = decodeTarget and
-                          merge_bypass = '0')) else '0';
+                          dec_reads_rt = '1' and merge_bypass = '0')) else '0';
+
+   -- LOAD_RT_EXACT: whether the instruction in stage 2 reads its rt field as
+   -- a general register. These do not: REGIMM and J/JAL, where the field is
+   -- a function or part of the target; the immediate ALU ops through LUI,
+   -- DADDI and DADDIU, and the plain and linked loads, which write rt;
+   -- CACHE, where it is the operation; and the FPU loads and stores, where
+   -- it names an FPU register (an FPU load ahead keeps its bubble anyway,
+   -- through decodeCOP1ReadEnable). Everything else keeps the compare: the
+   -- stores, the branches, the SPECIAL ops, the coprocessor moves and the
+   -- merging loads (whose own bypass is merge_bypass).
+   dec_reads_rt <= '0' when (LOAD_RT_EXACT and
+                             (opcodeCacheMuxed(31 downto 26) = "000001" or   -- REGIMM
+                              opcodeCacheMuxed(31 downto 26) = "000010" or   -- J
+                              opcodeCacheMuxed(31 downto 26) = "000011" or   -- JAL
+                              opcodeCacheMuxed(31 downto 29) = "001"    or   -- ADDI .. LUI
+                              opcodeCacheMuxed(31 downto 26) = "011000" or   -- DADDI
+                              opcodeCacheMuxed(31 downto 26) = "011001" or   -- DADDIU
+                              opcodeCacheMuxed(31 downto 26) = "100000" or   -- LB
+                              opcodeCacheMuxed(31 downto 26) = "100001" or   -- LH
+                              opcodeCacheMuxed(31 downto 26) = "100011" or   -- LW
+                              opcodeCacheMuxed(31 downto 26) = "100100" or   -- LBU
+                              opcodeCacheMuxed(31 downto 26) = "100101" or   -- LHU
+                              opcodeCacheMuxed(31 downto 26) = "100111" or   -- LWU
+                              opcodeCacheMuxed(31 downto 26) = "101111" or   -- CACHE
+                              opcodeCacheMuxed(31 downto 26) = "110000" or   -- LL
+                              opcodeCacheMuxed(31 downto 26) = "110001" or   -- LWC1
+                              opcodeCacheMuxed(31 downto 26) = "110100" or   -- LLD
+                              opcodeCacheMuxed(31 downto 26) = "110101" or   -- LDC1
+                              opcodeCacheMuxed(31 downto 26) = "110111" or   -- LD
+                              opcodeCacheMuxed(31 downto 26) = "111001" or   -- SWC1
+                              opcodeCacheMuxed(31 downto 26) = "111101"))    -- SDC1
+                   else '1';
 
    -- LOAD_MERGE_BYPASS. The R4600 manual, describing each of LWL, LWR, LDL and
    -- LDR: "The contents of general register rt are internally bypassed within
@@ -5702,7 +5494,6 @@ begin
                   hi_1                         <= hi;
                   lo_1                         <= lo;
 -- synthesis translate_on
-                  prof_pc3                     <= prof_pc2;
                
                   writebackTarget              <= resultTarget;
                   writebackData                <= resultData;
@@ -5720,7 +5511,6 @@ begin
                   -- Perf-only, for the uncached split in debug_perf_events.
                   perf_st4_read                <= executeMemReadEnable;
                   perf_st4_region              <= perf_exec_region;
-                  perf_st4_sram                <= perf_exec_sram;
 
                   writeback_COP1_ReadEnable    <= executeCOP1ReadEnable;
                   cop1_stage4_target           <= executeCOP1Target;
@@ -5752,7 +5542,7 @@ begin
                   if (executeMemReadEnable = '1' and
                       executeMemUseCache = '0' and
                       mem4_request = '1' and
-                      writefifo_mem4_ready = '0') then
+                      writefifo_mem4_ready = '0' and fast_s3_launched = '0') then
                      read_fifoStall         <= '1';
                      read_fifoStall_address <= mem4_address;
                      read_fifoStall_req64   <= mem4_req64;
@@ -5973,11 +5763,8 @@ begin
 
          if (reset_93 = '1') then
             debug_retired_count <= (others => '0');
-            debug_gpr_s1_register <= (others => '0');
-            debug_gpr_s2_register <= (others => '0');
             debug_retire_pc_register <= (others => '0');
             debug_retire_opcode_register <= (others => '0');
-            debug_irq_count_register <= (others => '0');
             
             --debugCnt             <= (others => '0');
             --debugSum             <= (others => '0');
@@ -5985,10 +5772,6 @@ begin
          
          elsif (ce_93 = '1') then
 
-            if (decode_irq = '1') then
-               debug_irq_count_register <= debug_irq_count_register + 1;
-            end if;
-            
             if (stall4Masked = 0 and writebackNew = '1') then
                debug_retired_count <= debug_retired_count + 1;
             
@@ -6004,14 +5787,6 @@ begin
                -- export
                if (writebackWriteEnable = '1') then 
                   if (writebackTarget > 0) then
-                      -- Track the decompressor stream state used by the
-                      -- frozen fault trace.
-                      if (writebackTarget = 17) then
-                         debug_gpr_s1_register <= std_logic_vector(writebackData(31 downto 0));
-                      end if;
-                      if (writebackTarget = 18) then
-                         debug_gpr_s2_register <= std_logic_vector(writebackData(31 downto 0));
-                      end if;
 -- synthesis translate_off
                      regs(to_integer(writebackTarget)) <= writebackData;
 -- synthesis translate_on
@@ -6123,14 +5898,6 @@ begin
       exceptionPC             => exceptionPC,
       debug_cause             => cop0_debug_cause,
       debug_epc               => cop0_debug_epc,
-      debug_badvaddr          => cop0_debug_badvaddr,
-      debug_eret_epc          => cop0_debug_eret_epc,
-      debug_eret_target       => cop0_debug_eret_target,
-      debug_eret_flags        => cop0_debug_eret_flags,
-      debug_ds_count          => cop0_debug_ds_count,
-      debug_ds_first          => cop0_debug_ds_first,
-      debug_tlb_census        => cop0_debug_tlb_census,
-      debug_tlb_exc_stb       => cop0_debug_tlb_exc_stb,
       exception               => exception,   
       exceptionStage1         => exceptionStage1,   
             
@@ -6218,6 +5985,8 @@ begin
    icpu_FPU : entity work.cpu_FPU
    generic map
    (
+      ADD_FAST_NORM     => FPU_ADD_FAST,
+      RESULT_FORWARD    => FPU_FORWARD,
       CVT_L_NARROW      => FPU_CVT_L_NARROW
    )
    port map
@@ -6253,7 +6022,10 @@ begin
       FPUWriteData      => FPUWriteData,  
       FPUWriteEnable    => FPUWriteEnable,
       FPUWriteMask      => FPUWriteMask,
-      
+
+      result_fwd        => FPU_fwd_data,
+      result_fwd_valid  => FPU_fwd_valid,
+
       SS_FPU_CF         => ss_in(24)(32),
       SS_CSR            => unsigned(ss_in(24)(24 downto 0))
    );

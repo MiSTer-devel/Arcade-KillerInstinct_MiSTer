@@ -44,6 +44,15 @@ entity cpu_datacache is
       -- FILLRA_COPY's last cycle, from the staging register. See "READING
       -- AHEAD".
       RA_ANSWER      : boolean := false;
+      -- The line after a load's may be read ahead across its 4 KB page, for
+      -- an unmapped (KSEG0) load of low or main RAM, inside its 512 KB. See
+      -- "READING AHEAD".
+      RA_CROSS_PAGE  : boolean := false;
+      -- The read-ahead of the line after a load's that waits in FILLRA_WAIT
+      -- may leave as that load's own read-ahead lands, launched by cpu.vhd
+      -- from the cache's arm, rather than from the ask as the copy starts.
+      -- See "READING AHEAD".
+      RA_CHAIN       : boolean := false;
       -- A framebuffer line is filled from the qword its access wants: the
       -- request carries that qword in ram_reqAddr bits 4..3, and the bridge
       -- returns the line in sub-block order, beat k being that qword XOR k,
@@ -163,10 +172,8 @@ entity cpu_datacache is
       --   perf_writeback  evicting a dirty line (write-back traffic)
       --
       -- perf_miss makes DC divisible - DC cycles over miss count is cycles
-      -- per miss. The census exports DC in units of 256 cycles and MC as a
-      -- plain count, so scale DC back up before dividing. ~20-30 says the
-      -- misses are normal and there are simply too many of them; ~200+ says
-      -- the memory path itself is the problem.
+      -- per miss. ~20-30 says the misses are normal and there are simply too
+      -- many of them; ~200+ says the memory path itself is the problem.
       perf_miss         : out std_logic := '0';
       -- The same miss, when it lands in the board's SRAM rather than its DRAM.
       --
@@ -182,9 +189,6 @@ entity cpu_datacache is
       -- and main RAM at 0x08000000, and the bridge compares the address it
       -- receives against those - so the test is just the top bits being zero.
       perf_miss_low     : out std_logic := '0';
-      -- Of those, the misses to a framebuffer page (RW_fb): the rest of
-      -- perf_miss_low is the SRAM region outside them.
-      perf_miss_fb      : out std_logic := '0';
       -- The fill interval, split exhaustively rather than sampled by proxy:
       -- a partition of the FILL state itself, with a sum check.
       --
@@ -254,7 +258,9 @@ entity cpu_datacache is
       perf_fill_absent  : out std_logic := '0';
       -- Read ahead (READ_AHEAD). ra_request asks the scheduler, at its lowest
       -- priority, for the four qwords of the line at ra_reqAddr; they arrive
-      -- in ra_data, stable from ra_done until the next read-ahead completes.
+      -- in ra_data, stable from ra_done until the next read-ahead's data
+      -- comes: its completion, or its first qword with cpu.vhd's
+      -- RA_CTL_RETURN (ra_wr).
       -- ra_store is every store entering the write FIFO - write-backs and
       -- uncached stores alike - with its address: one landing in the line
       -- being read ahead makes the copy stale.
@@ -262,10 +268,27 @@ entity cpu_datacache is
       --   perf_ra_used   one pulse per miss that filled from the staged line
       ra_request        : out std_logic := '0';
       ra_reqAddr        : out unsigned(31 downto 0) := (others => '0');
+      -- The read-ahead is a stream's: the copy that asked for it had waited
+      -- for its own line (FILLRA_WAIT longer than its one cycle). Changes
+      -- with ra_reqAddr.
+      ra_reqStream      : out std_logic := '0';
       ra_done           : in  std_logic := '0';
       ra_data           : in  std_logic_vector(255 downto 0) := (others => '0');
       ra_store          : in  std_logic := '0';
       ra_store_addr     : in  unsigned(31 downto 0) := (others => '0');
+      -- ra_data took a qword on the last edge: a line that comes back a
+      -- qword at a time (cpu.vhd's RA_CTL_RETURN), its fourth beside
+      -- ra_done.
+      ra_wr             : in  std_logic := '0';
+      -- RA_CHAIN. ra_chain_ok: the arm - the cache waits in FILLRA_WAIT for
+      -- its own line's read-ahead, and the copy would ask for the line after,
+      -- ra_chain_addr, which ra_chain_sdram (cpu.vhd) says the direct port
+      -- can read. ra_chain_taken: cpu.vhd launched that line on the last
+      -- edge.
+      ra_chain_ok       : out std_logic := '0';
+      ra_chain_addr     : out unsigned(31 downto 0) := (others => '0');
+      ra_chain_sdram    : in  std_logic := '0';
+      ra_chain_taken    : in  std_logic := '0';
       -- EARLY_RESTART: a fill request raised while the line before it is
       -- still landing may leave now (cpu.vhd, fast_go_q).
       tail_q_ok         : in  std_logic := '0';
@@ -428,8 +451,33 @@ architecture arch of cpu_datacache is
    --   * any store to the staged line reaching the write FIFO after the
    --     read-ahead was asked for - a write-back or an uncached store - makes
    --     the copy stale, and a miss on it then fills the ordinary way;
-   --   * the line after is only asked for inside the same 4 KB page, so a
-   --     read-ahead can never step out of the memory the load was in.
+   --   * the line after is asked for across the load's 4 KB page
+   --     (RA_CROSS_PAGE) only when the load was unmapped (KSEG0, so the
+   --     virtual address in tag_addr_1 is the physical one), of low or main
+   --     RAM, and the line after is in the same 512 KB (ra_xpage, written
+   --     with ram_reqAddr in every IDLE cycle; a fill's and a copy's asks
+   --     read it before the cache is next in IDLE, and the tail's ask, made
+   --     after TAIL_ANS has returned to IDLE, reads tail_ra_ok, taken from
+   --     it at tail_go). Every RAM range of the board
+   --     begins and ends on a 512 KB boundary, so that line is in the load's
+   --     own RAM, never in I/O, an undecoded gap, the boot ROM or main RAM's
+   --     alias: a read-ahead never steps out of the memory the load was in.
+   --     Any other load's read-ahead stays inside its 4 KB page - for a load
+   --     through the TLB, the physical page after its own belongs to another
+   --     virtual page, or to none;
+   --   * a read-ahead asked for by a copy that had to wait for its line - the
+   --     CPU reading faster than lines come - is marked as a stream's
+   --     (ra_reqStream), for the memory to keep its row open for the next;
+   --   * with RA_CHAIN that read-ahead need not wait for the copy's ask. While
+   --     a load waits in FILLRA_WAIT for its own line's read-ahead, the copy's
+   --     ask conditions holding, the cache arms (ra_chain_ok) with the line
+   --     after in a register of its own (chain_line), and cpu.vhd may launch
+   --     that line as the awaited one lands (ra_chain_taken). The cache then
+   --     stages it as in flight when it leaves FILLRA_WAIT - to the copy, or
+   --     to a fill if the awaited line was dropped - and asks for nothing. A
+   --     store to it from the edge it may leave on until it is staged poisons
+   --     it there (chain_poison); from then on ra_poison_now does. A launch
+   --     not taken leaves the copy to ask as before.
    --
    -- A read-ahead of a line already in the cache is harmless: a hit never
    -- looks at the copy, and by the time that line can miss it has been
@@ -783,6 +831,24 @@ architecture arch of cpu_datacache is
    -- testbench counts it with ra_poison_now, the drop it pre-empts.
    signal ra_vdrop       : std_logic := '0';
    signal ra_poison_now  : std_logic;
+   -- This FILLRA_WAIT has lasted more than its one cycle.
+   signal fillra_waited  : std_logic := '0';
+   -- RA_CHAIN: the arm's conditions now (chain_arm) and its register; the
+   -- line after (chain_line); the launch seen and not yet staged
+   -- (chain_fired), either (chain_live); and a store to that line on an edge
+   -- it may have left on or since (chain_poison, this cycle's
+   -- chain_poison_now).
+   signal chain_arm        : std_logic;
+   signal chain_ok_r       : std_logic := '0';
+   signal chain_ok_d       : std_logic := '0';
+   signal chain_line       : unsigned(26 downto 0) := (others => '0');
+   signal chain_fired      : std_logic := '0';
+   signal chain_live       : std_logic;
+   signal chain_poison     : std_logic := '0';
+   signal chain_poison_now : std_logic;
+   -- RA_CROSS_PAGE: the line after this miss's may be asked for across its
+   -- 4 KB page. Latched in IDLE with ram_reqAddr; see READING AHEAD.
+   signal ra_xpage       : std_logic := '0';
    -- The staged line, as address(31..5).
    signal ra_line        : unsigned(26 downto 0) := (others => '0');
    -- This access's line is the staged one.
@@ -820,7 +886,6 @@ begin
    -- state = IDLE with read_ena/write_ena, so RW_addr holds this access's
    -- address in the same cycle.
    perf_miss_low <= perf_miss_i when (RW_addr(31 downto 19) = 0) else '0';
-   perf_miss_fb  <= perf_miss_i and RW_fb;
    perf_miss_i <= '1' when (state = IDLE and
                           (read_ena = '1' or write_ena = '1') and
                           read_hit = '0' and
@@ -883,6 +948,23 @@ begin
    perf_ra_used <= '1' when (state = FILLRA_WAIT and ra_state = RA_VALID and
                              ra_poison_now = '0' and
                              ra_line = ram_reqAddr(31 downto 5)) else '0';
+
+   -- RA_CHAIN: armed while the load waits for its own line's read-ahead, in
+   -- flight and unpoisoned, under the conditions the copy asks on; until that
+   -- line's completion, and not once the line after has left.
+   chain_live <= ra_chain_taken or chain_fired;
+   chain_arm  <= '1' when (READ_AHEAD and RA_CHAIN and state = FILLRA_WAIT and
+                           ra_state = RA_FLIGHT and ra_done = '0' and
+                           ra_poison = '0' and ra_poison_now = '0' and
+                           ra_line = ram_reqAddr(31 downto 5) and
+                           writeMode = '0' and write_through_in = '0' and ra_arm = '1' and
+                           (ram_reqAddr(11 downto 5) /= "1111111" or
+                            (RA_CROSS_PAGE and ra_xpage = '1')) and
+                           ra_chain_sdram = '1' and chain_live = '0') else '0';
+   chain_poison_now <= '1' when (READ_AHEAD and RA_CHAIN and ra_store = '1' and
+                                 ra_store_addr(28 downto 5) = chain_line(23 downto 0)) else '0';
+   ra_chain_ok   <= chain_ok_r;
+   ra_chain_addr <= chain_line & "00000";
 
    ce_fetch <= '1' when (stall = 0 and ce_93 = '1') else '0';
 
@@ -1469,9 +1551,23 @@ begin
          end if;
          -- A load asks for the next read-ahead as its copy begins, so the
          -- staged copy (ra_data) must not change under the four COPY cycles
-         -- that read it: no read-ahead lands during FILLRA_COPY.
-         if (SS_reset = '0' and READ_AHEAD and state = FILLRA_COPY and ra_done = '1') then
+         -- that read it: no read-ahead lands during FILLRA_COPY, nor any qword
+         -- of one that comes a qword at a time (ra_wr).
+         if (SS_reset = '0' and READ_AHEAD and state = FILLRA_COPY and
+             (ra_done = '1' or ra_wr = '1')) then
             report "cpu_datacache: a read-ahead landed while the previous one was being copied in"
+               severity failure;
+         end if;
+         -- RA_CHAIN: the line after leaves only from the arm, while the load
+         -- still waits in FILLRA_WAIT, and is staged as it leaves the state.
+         chain_ok_d <= chain_ok_r;
+         if (SS_reset = '0' and ra_chain_taken = '1' and
+             (not RA_CHAIN or chain_ok_d = '0' or chain_fired = '1' or state /= FILLRA_WAIT)) then
+            report "cpu_datacache: a chained read-ahead launched without the arm, or outside FILLRA_WAIT"
+               severity failure;
+         end if;
+         if (SS_reset = '0' and chain_fired = '1' and state /= FILLRA_WAIT) then
+            report "cpu_datacache: a chained read-ahead left FILLRA_WAIT unstaged"
                severity failure;
          end if;
          -- STORE_BUFFER: a load never answers in IDLE from RAMs that lack the
@@ -1522,12 +1618,26 @@ begin
          if (state = FILLRA_COPY and fill_mask /= "1111") then
             report "cpu_datacache: a read-ahead copy into a line with present qwords" severity failure;
          end if;
-         -- Only one read-ahead is ever outstanding.
-         if (ra_request = '1' and ra_state /= RA_FLIGHT) then
+         -- A read-ahead of a 4 KB page's first line crossed into it: only with
+         -- RA_CROSS_PAGE, never into a 512 KB block's first line, and only in
+         -- low or main RAM.
+         if (SS_reset = '0' and (ra_request = '1' or perf_ra_issue = '1') and ra_line(6 downto 0) = 0 and
+             (not RA_CROSS_PAGE or ra_line(13 downto 0) = 0 or
+              not (ra_line(26 downto 14) = 0 or ra_line(26 downto 18) = "000010000"))) then
+            report "cpu_datacache: a read-ahead asked for across a 4 KB page without RA_CROSS_PAGE, or outside low or main RAM's 512 KB" severity failure;
+         end if;
+         -- Only one read-ahead is ever outstanding. perf_ra_issue also marks
+         -- a chained line staged without an ask; outside a reset only, for a
+         -- tail's ask on a reset's first edge pulses it with nothing in
+         -- flight after.
+         if ((ra_request = '1' or (SS_reset = '0' and perf_ra_issue = '1')) and
+             ra_state /= RA_FLIGHT) then
             report "cpu_datacache: a read-ahead asked for without being in flight" severity failure;
          end if;
-         -- A read-ahead completion is only ever the one in flight.
-         if (READ_AHEAD and ra_done = '1' and ra_state /= RA_FLIGHT) then
+         -- A read-ahead completion is only ever the one in flight, and so is
+         -- every qword of one that comes a qword at a time (ra_wr): none
+         -- lands in a staged copy.
+         if (READ_AHEAD and (ra_done = '1' or ra_wr = '1') and ra_state /= RA_FLIGHT) then
             report "cpu_datacache: a read-ahead completed that was not in flight" severity failure;
          end if;
          -- synthesis translate_on
@@ -1585,6 +1695,10 @@ begin
             ram_stale <= '1';
          end if;
 
+         if (state /= FILLRA_WAIT) then
+            fillra_waited <= '0';
+         end if;
+
          -- Read-ahead bookkeeping. A store to the staged line makes the copy
          -- stale: in flight it is poisoned and dropped when it lands, landed
          -- it is dropped now.
@@ -1601,6 +1715,22 @@ begin
                else
                   ra_state <= RA_NONE;
                end if;
+            end if;
+         end if;
+
+         -- RA_CHAIN: the arm and the line after, held from the launch until
+         -- the line is staged; a store to it on the edge it may leave on, and
+         -- every one after.
+         if (READ_AHEAD and RA_CHAIN) then
+            chain_ok_r <= chain_arm;
+            if (chain_live = '0') then
+               chain_line   <= ram_reqAddr(31 downto 5) + 1;
+               chain_poison <= chain_poison_now;
+            else
+               chain_poison <= chain_poison or chain_poison_now;
+            end if;
+            if (ra_chain_taken = '1') then
+               chain_fired <= '1';
             end if;
          end if;
 
@@ -1628,11 +1758,13 @@ begin
             tail      <= '0';
             tail_done <= '0';
             if (tail_ra_ok = '1' and tail_next_miss = '0' and ra_state /= RA_FLIGHT and
+                not (RA_CHAIN and chain_live = '1') and
                 not (perf_miss_i = '1' and RW_addr(31 downto 5) = tail_line + 1)) then
                ra_state      <= RA_FLIGHT;
                ra_poison     <= '0';
                ra_line       <= tail_line + 1;
                ra_reqAddr    <= (tail_line + 1) & "00000";
+               ra_reqStream  <= '0';
                ra_request    <= '1';
                perf_ra_issue <= '1';
             end if;
@@ -1672,6 +1804,13 @@ begin
             tail           <= '0';
             tail_done      <= '0';
             tail_held      <= '0';
+            -- A read-ahead in flight when the reset came finishes during it,
+            -- and cpu.vhd passes no completion on then, so none is in flight
+            -- after it.
+            ra_state       <= RA_NONE;
+            ra_request     <= '0';
+            chain_ok_r     <= '0';
+            chain_fired    <= '0';
          else
 
             -- FILL_AT_MISS: the fill's beats and completion while the victim is
@@ -1710,6 +1849,14 @@ begin
                   allocNext      <= '0';
                   fillRA         <= '0';
                   ram_reqAddr    <= RW_addr(31 downto 0);
+                  -- RA_CROSS_PAGE: tag_addr_1 is this access's virtual
+                  -- address, RW_addr its physical one.
+                  ra_xpage       <= '0';
+                  if (RA_CROSS_PAGE and tag_addr_1(31 downto 29) = "100" and
+                      RW_addr(18 downto 12) /= "1111111" and
+                      (RW_addr(31 downto 19) = 0 or RW_addr(31 downto 23) = "000010000")) then
+                     ra_xpage    <= '1';
+                  end if;
                   -- Bits 4..3 name the fill's first qword (CWF_FB).
                   if (CWF_FB and RW_fb = '1') then
                      fill_start  <= RW_addr(4 downto 3);
@@ -1979,11 +2126,13 @@ begin
                      if (READ_AHEAD and writeMode = '0' and fill_mask = "1111" and
                          isWB = '0' and write_through_in = '0' and
                          ra_state /= RA_FLIGHT and ra_arm = '1' and
-                         ram_reqAddr(11 downto 5) /= "1111111") then
+                         (ram_reqAddr(11 downto 5) /= "1111111" or
+                          (RA_CROSS_PAGE and ra_xpage = '1'))) then
                         ra_state      <= RA_FLIGHT;
                         ra_poison     <= '0';
                         ra_line       <= ram_reqAddr(31 downto 5) + 1;
                         ra_reqAddr    <= (ram_reqAddr(31 downto 5) + 1) & "00000";
+                        ra_reqStream  <= '0';
                         ra_request    <= '1';
                         perf_ra_issue <= '1';
                      end if;
@@ -1998,7 +2147,8 @@ begin
                      tail_line      <= ram_reqAddr(31 downto 5);
                      tail_ra_ok     <= '0';
                      if (READ_AHEAD and ra_arm = '1' and
-                         ram_reqAddr(11 downto 5) /= "1111111") then
+                         (ram_reqAddr(11 downto 5) /= "1111111" or
+                          (RA_CROSS_PAGE and ra_xpage = '1'))) then
                         tail_ra_ok <= '1';
                      end if;
                   end if;
@@ -2187,14 +2337,29 @@ begin
                      -- is held to the bridge's one line a round trip, and
                      -- asking at the end would spend these cycles outside
                      -- it. The staged copy the four COPY cycles read changes
-                     -- only when the new read-ahead lands, a round trip away
-                     -- (asserted).
-                     if (writeMode = '0' and write_through_in = '0' and ra_arm = '1' and
-                         ram_reqAddr(11 downto 5) /= "1111111") then
+                     -- only when the new read-ahead's data comes - its
+                     -- completion, or its first qword with RA_CTL_RETURN - a
+                     -- round trip away (asserted).
+                     -- RA_CHAIN: unless it has left already, as this line
+                     -- landed; then it is staged as in flight, and nothing is
+                     -- asked for.
+                     if (RA_CHAIN and chain_live = '1') then
+                        ra_state      <= RA_FLIGHT;
+                        ra_poison     <= chain_poison or chain_poison_now;
+                        ra_line       <= chain_line;
+                        ra_reqAddr    <= chain_line & "00000";
+                        ra_reqStream  <= '1';
+                        ra_request    <= '0';
+                        perf_ra_issue <= '1';
+                        chain_fired   <= '0';
+                     elsif (writeMode = '0' and write_through_in = '0' and ra_arm = '1' and
+                         (ram_reqAddr(11 downto 5) /= "1111111" or
+                          (RA_CROSS_PAGE and ra_xpage = '1'))) then
                         ra_state      <= RA_FLIGHT;
                         ra_poison     <= '0';
                         ra_line       <= ram_reqAddr(31 downto 5) + 1;
                         ra_reqAddr    <= (ram_reqAddr(31 downto 5) + 1) & "00000";
+                        ra_reqStream  <= fillra_waited;
                         ra_request    <= '1';
                         perf_ra_issue <= '1';
                      end if;
@@ -2202,6 +2367,20 @@ begin
                      state          <= FILL;
                      req_r    <= '1';
                      fill_beat_seen <= '0';
+                     -- RA_CHAIN: this line was dropped as it landed, but the
+                     -- line after had left: stage that one as in flight.
+                     if (RA_CHAIN and chain_live = '1') then
+                        ra_state      <= RA_FLIGHT;
+                        ra_poison     <= chain_poison or chain_poison_now;
+                        ra_line       <= chain_line;
+                        ra_reqAddr    <= chain_line & "00000";
+                        ra_reqStream  <= '1';
+                        ra_request    <= '0';
+                        perf_ra_issue <= '1';
+                        chain_fired   <= '0';
+                     end if;
+                  else
+                     fillra_waited  <= '1';
                   end if;
 
                -- A qword a cycle into the victim's way, qword 0 first. The

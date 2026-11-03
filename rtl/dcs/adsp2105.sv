@@ -72,20 +72,6 @@ module adsp2105 (
     output reg  [15:0] dac_sample,
     output reg         dac_ce,
 
-    // Wrapped-sample diagnostics watch stores to the live autobuffer and latch
-    // the PC when adjacent samples differ by more than half of full scale.
-    output reg  [13:0] dbg_wrap_pc,
-    output reg  [7:0]  dbg_wrap_cnt,
-
-    // Upstream diagnostics watch sequential writes outside the autobuffer and
-    // report adjacent full-scale discontinuities with their source PC/address.
-    output reg  [13:0] dbg_src_pc,
-    output reg  [13:0] dbg_src_addr,
-    output reg  [7:0]  dbg_src_cnt,
-    output reg  [7:0]  dbg_src_op,
-    // ROM fetch stability diagnostics; see the dcs_mem instantiation.
-    output wire [7:0]  dbg_rom_unstable_o,
-    output wire [11:0] dbg_rom_bankdelta_o,
     // Mailbox overwrite and boot-progress diagnostics.
     output reg  [7:0]  dbg_cmd_lost,
     // Pulses when the DSP reads a host command from the mailbox. Until the DSP
@@ -285,44 +271,6 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
          .ext_req(rom_ddr_req), .ext_addr(rom_ddr_addr),
          .ext_rdy(rom_ddr_rdy), .ext_q(rom_ddr_q));
 
-    // ROM request stability diagnostics latch the address at request start and
-    // flag any change before completion. Boot is excluded because its streamer
-    // legitimately advances the address between completed transfers.
-    reg [22:0] rom_addr_held;
-    reg        rom_inflight;
-    reg [7:0]  dbg_rom_unstable;
-    reg [11:0] dbg_rom_bankdelta;
-
-    always @(posedge clk) begin
-        if (rst) begin
-            rom_addr_held     <= 23'h0;
-            rom_inflight      <= 1'b0;
-            dbg_rom_unstable  <= 8'h0;
-            dbg_rom_bankdelta <= 12'h0;
-        end else if (boot_active) begin
-            rom_inflight <= 1'b0;
-        end else if (!rom_inflight) begin
-            if (rom_req) begin
-                rom_addr_held <= rom_addr;
-                rom_inflight  <= 1'b1;
-            end
-        end else begin
-            if (rom_addr != rom_addr_held) begin
-                // Record which bank bits moved on the first offender. A
-                // non-zero delta means the BANK changed under the fetch; zero
-                // with a non-zero count means only the offset moved.
-                if (dbg_rom_unstable == 8'h00)
-                    dbg_rom_bankdelta <= {1'b0, rom_addr[22:12] ^ rom_addr_held[22:12]};
-                if (dbg_rom_unstable != 8'hFF)
-                    dbg_rom_unstable <= dbg_rom_unstable + 8'd1;
-            end
-            if (rom_rdy || !rom_req) rom_inflight <= 1'b0;
-        end
-    end
-
-    assign dbg_rom_unstable_o  = dbg_rom_unstable;
-    assign dbg_rom_bankdelta_o = dbg_rom_bankdelta;
-
     // ---- explicit instruction sequencer ------------------------------------
     // One instruction follows S_FETCH -> S_DECODE -> optional drain/divide/ROM/
     // memory stalls -> S_EXEC. S_BOOT holds the CPU during streaming boot DMA.
@@ -400,15 +348,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // Control regs (0x3FEF S1_AUTOBUF, 0x3FFF SYSCONTROL) already live in dm[].
     reg        ab_active;
     reg [2:0]  ab_ireg;                 // I register the buffer pointer lives in
-    reg [15:0] ab_base, ab_size, ab_incs;
-    reg [15:0] dbg_ab_prev;   // last sample stored into the autobuffer
-    reg        dbg_ab_seen;   // suppresses the first store, which has no predecessor
-    reg [15:0] dbg_w_prev_addr, dbg_w_prev_val;  // previous non-autobuffer store
-    reg        dbg_w_seen;
-    // Arm discontinuity diagnostics only after the autobuffer is active and
-    // roughly one second of samples has been emitted.
-    reg [15:0] dbg_arm_ctr;
-    wire       dbg_armed = (dbg_arm_ctr == 16'hFFFF);
+    reg [15:0] ab_size, ab_incs;
     // DAC-rate drain trigger. dac_slot_ctr counts down once per dac_ce_in
     // sample slot; on reaching the last slot of a buffer-half it reloads to
     // `count` (ab_drain_cnt) and sets dac_slot_go = "a drain is due". drain_pend
@@ -796,7 +736,6 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                                   iR[ab_ir]    <= iR[ab_ir] & 16'hFFF0;  // source &= ~0xf (first-sample guard)
                                   // the I write re-bases the DAG
                                   baseR[ab_ir] <= (iR[ab_ir][13:0] & 14'h3FF0) & lmask[ab_ir];
-                                  ab_base      <= iR[ab_ir] & 16'hFFF0;
                                   ab_size      <= lR[ab_lr];
                                   ab_incs      <= mR[ab_mr];
                                   ab_ireg      <= ab_ir[2:0];
@@ -1087,65 +1026,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // 0x3000: ROM bank select.
     // 0x3FFF write with bit9: SYSCONTROL soft reboot.
     task automatic dm_write(input [15:0] addr, input [15:0] val);
-        reg signed [16:0] ab_step;
-        reg signed [16:0] w_step;
-        reg               in_ab, adjacent;
         begin
-            in_ab = (ab_size != 16'h0) && (addr >= ab_base) &&
-                    ({1'b0, addr} < ({1'b0, ab_base} + {1'b0, ab_size}));
-            // Discontinuity diagnostics are filtered to the live autobuffer so ordinary
-            // scratch traffic cannot trip it, and armed only after a first
-            // store has established a predecessor. ab_size is zero until the
-            // autobuffer is armed, which disables this entirely before then.
-            // 17-bit end so base+size cannot wrap the comparison at 0x10000.
-            if (in_ab) begin
-                ab_step = $signed({val[15], val}) -
-                          $signed({dbg_ab_prev[15], dbg_ab_prev});
-                if (ab_step < 0) ab_step = -ab_step;
-                if (dbg_ab_seen && (ab_step > 17'sd32767)) begin
-                    // Keep the FIRST offender: later ones are likely the same
-                    // instruction, and a value that keeps moving is unreadable
-                    // on a debug screen.
-                    // pc is the executing instruction's address here (the
-                    // pc+1 in this same block is nonblocking), but treat the
-                    // reported value as +/-1 when disassembling rather than
-                    // assuming an exact anchor.
-                    if (dbg_wrap_cnt == 8'h00) dbg_wrap_pc <= pc;
-                    if (dbg_wrap_cnt != 8'hFF) dbg_wrap_cnt <= dbg_wrap_cnt + 8'd1;
-                end
-                dbg_ab_prev <= val;
-                dbg_ab_seen <= 1'b1;
-            end else begin
-                // Upstream watcher. Adjacency is what makes this meaningful:
-                // only a run of sequential stores is a buffer being filled, so
-                // an interleaved unrelated write simply breaks the run instead
-                // of producing a bogus comparison. Stride 2 is accepted because
-                // the copy loop reads its source with M2 = 2.
-                adjacent = (addr == (dbg_w_prev_addr + 16'd1)) ||
-                           (addr == (dbg_w_prev_addr + 16'd2));
-                w_step = $signed({val[15], val}) -
-                         $signed({dbg_w_prev_val[15], dbg_w_prev_val});
-                if (w_step < 0) w_step = -w_step;
-                if (dbg_armed && dbg_w_seen && adjacent && (w_step > 17'sd32767)) begin
-                    if (dbg_src_cnt == 8'h00) begin
-                        dbg_src_pc   <= pc;
-                        dbg_src_addr <= addr[13:0];
-                        // The opcode's high byte is latched with the PC so the
-                        // reading checks itself: a store is 0x60-0x7F, 0x80-0x9F
-                        // or 0xA0-0xBF. Anything else - a JUMP, say - means the
-                        // captured PC is not the storing instruction and the
-                        // address beside it should not be trusted.
-                        // op_r, not op: op is declared below this task and
-                        // is assigned from op_r at execute, so they carry the
-                        // same instruction word and only op_r is in scope here.
-                        dbg_src_op   <= op_r[23:16];
-                    end
-                    if (dbg_src_cnt != 8'hFF) dbg_src_cnt <= dbg_src_cnt + 8'd1;
-                end
-                dbg_w_prev_addr <= addr;
-                dbg_w_prev_val  <= val;
-                dbg_w_seen      <= 1'b1;
-            end
             if (addr >= 16'h0800 && addr <= 16'h1fff) begin
                 // PM-alias read-modify-write: the merge {val, old[7:0]} needs
                 // the existing low byte; the S_MEM
@@ -1495,12 +1376,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             dr_done <= 1'b0; dr_idx <= 0; div_done <= 1'b0; div_i <= 5'd0;   // clear stall progress
             pc <= 14'h0000; o_valid <= 1'b0; o_unimpl <= 1'b0; o_ppc <= 14'h0;
             dac_sample <= 16'h0;
-            dbg_wrap_pc <= 14'h0; dbg_wrap_cnt <= 8'h0;
-            dbg_ab_prev <= 16'h0; dbg_ab_seen <= 1'b0;
-            dbg_src_pc <= 14'h0; dbg_src_addr <= 14'h0; dbg_src_cnt <= 8'h0;
-            dbg_src_op <= 8'h0; dbg_arm_ctr <= 16'h0;
             dbg_cmd_lost <= 8'h0; dbg_cmd_read <= 1'b0;
-            dbg_w_prev_addr <= 16'h0; dbg_w_prev_val <= 16'h0; dbg_w_seen <= 1'b0;
             loop_sp <= 0; pc_sp <= 0; cntr_sp <= 0; cntr <= 14'h0;
             astat<=0; mstat<=0; sstat<=0; imask<=0; icntl<=0; px<=0;
             afb[0]<=0; afb[1]<=0; mfb[0]<=0; mfb[1]<=0; sbb[0]<=0; sbb[1]<=0;
@@ -1704,7 +1580,6 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                 // Every captured sample is strobed, not merely the final
                 // sample of a DCS half-buffer: one sample per drain cycle.
                 dac_ce <= 1'b1;
-                if (dbg_arm_ctr != 16'hFFFF) dbg_arm_ctr <= dbg_arm_ctr + 16'd1;
             end
             if (dr_idx < dr_cnt) begin
                 // issue read dr_idx this clock (port address = dr_cur via the muxes)

@@ -22,10 +22,7 @@ module ki_video_timing #(
   output logic       hsync_n,
   output logic       vsync_n,
   output logic       vblank,
-  output logic       frame_start,
-  output logic [31:0] vblank_count,
-  output logic       vblank_seen,
-  output logic  [9:0] max_v_count
+  output logic       frame_start
 );
   localparam int unsigned DIV_WIDTH =
     (CLOCK_DIVIDE <= 1) ? 1 : $clog2(CLOCK_DIVIDE);
@@ -51,24 +48,16 @@ module ki_video_timing #(
       v_count       <= 10'd0;
       ce_pixel      <= 1'b0;
       frame_start   <= 1'b0;
-      vblank_count  <= 32'd0;
-      vblank_seen   <= 1'b0;
-      max_v_count   <= 10'd0;
   end else if (advance) begin
       pixel_divider <= '0;
       ce_pixel      <= 1'b1;
       frame_start   <= 1'b0;
-      if (v_count > max_v_count)
-        max_v_count <= v_count;
-      if (vblank)
-        vblank_seen <= 1'b1;
 
       if (h_count == H_TOTAL - 1) begin
         h_count <= 10'd0;
         if (v_count == V_TOTAL - 1) begin
           v_count <= 10'd0;
           frame_start <= 1'b1;
-          vblank_count <= vblank_count + 32'd1;
         end else begin
           v_count <= v_count + 10'd1;
         end

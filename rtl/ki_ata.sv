@@ -35,14 +35,6 @@ module ki_ata (
 
   output wire   [2:0] debug_state,
   output wire   [7:0] debug_status,
-  output wire   [7:0] debug_error,
-  output wire         debug_image_ready,
-  // The last command byte the host wrote, whether the interrupt line is
-  // up right now, and how many times it has been RAISED. The count is what
-  // separates "never asserted" from "asserted and already consumed": a
-  // status-register read clears irq_pending, which is correct ATA and also
-  // means a live sample of irq alone cannot tell those two apart.
-  output wire  [31:0] debug_info,
   // The START LBA of the last READ SECTORS and the last WRITE SECTORS.
   // The game's verify at 8802DB18 compares a sector against memory; that
   // fails either because the DATA is wrong or because the SECTOR is, and
@@ -111,12 +103,8 @@ module ki_ata (
   logic [7:0]  status;
   logic [7:0]  device_control;
   logic        irq_pending;
-  logic  [7:0] last_command;
-  logic [15:0] irq_raise_count;
-  logic [11:0] data_writes;
   logic [31:0] last_read_lba;
   logic [31:0] last_write_lba;
-  logic        irq_pending_d;
   logic        image_ready;
   logic        image_readonly;
   logic [31:0] image_sectors;
@@ -149,12 +137,8 @@ module ki_ata (
 
   assign debug_state = state;
   assign debug_status = status;
-  assign debug_error = error_reg;
-  assign debug_image_ready = image_ready;
   assign debug_read_lba  = last_read_lba;
   assign debug_write_lba = last_write_lba;
-  assign debug_info = {last_command, irq, irq_pending, device_control[1],
-                       1'b0, data_index, data_writes};
 
   wire cs0_selected = (bus_address >= KI_ATA_CS0_BASE) &&
                       (bus_address <= KI_ATA_CS0_LAST);
@@ -415,12 +399,8 @@ module ki_ata (
       device_head       <= 8'ha0;
       status            <= ATA_READY;
       device_control    <= 8'h00;
-      last_command      <= 8'h00;
-      irq_raise_count   <= 16'd0;
-      data_writes       <= 12'd0;
       last_read_lba     <= 32'h0;
       last_write_lba    <= 32'h0;
-      irq_pending_d     <= 1'b0;
       irq_pending       <= 1'b0;
       image_ready       <= 1'b0;
       image_readonly    <= 1'b1;
@@ -443,21 +423,6 @@ module ki_ata (
       fetch_batch       <= '0;
       fetch_busy        <= 1'b0;
     end else begin
-      // Count the write handshake from both ends: every sector this core asks
-      // the HPS to commit, and every one the HPS acknowledges. If issued
-      // climbs while acked does not, the request never completes and the write
-      // is lost on the HPS side; if both climb together the core did its part
-      // and the image itself is not taking the data.
-      // How far the block ever got, and what the host is actually presenting.
-      //
-      // Count RISING edges of irq_pending. A status-register read clears it -
-      // correct ATA behaviour - so a live sample of the irq line cannot tell
-      // "never asserted" from "asserted and already consumed", and those are
-      // very different faults. The count can only go up.
-      irq_pending_d <= irq_pending;
-      if (irq_pending && !irq_pending_d && irq_raise_count != 16'hffff)
-        irq_raise_count <= irq_raise_count + 1'b1;
-
       // img_mounted is a pulse. The image properties remain valid across a
       // menu reset, so sample them continuously instead of losing the disk
       // after the CPU is reset following a successful mount.
@@ -613,7 +578,6 @@ module ki_ata (
         end else if (cs0_selected) begin
           case (cs0_register)
             3'd0: if (state == ATA_PIO_WRITE && |bus_byte_enable[1:0]) begin
-              if (data_writes != 12'hfff) data_writes <= data_writes + 1'b1;
               if (data_index == 8'hff) begin
                 status      <= ATA_BUSY;
                 irq_pending <= 1'b0;
@@ -631,7 +595,6 @@ module ki_ata (
             3'd6: if (bus_byte_enable[0]) device_head   <= bus_write_data[7:0];
             3'd7: if (bus_byte_enable[0]) begin
               irq_pending <= 1'b0;
-              last_command <= bus_write_data[7:0];
               case (bus_write_data[7:0])
                 8'hec: begin
                   data_index        <= 8'h00;

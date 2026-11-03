@@ -57,35 +57,10 @@ entity cpu_cop0 is
       cop0_export             : out tExportRegs := (others => (others => '0'));
 -- synthesis translate_on
 
-      -- Cause and EPC, OUTSIDE translate_off. cop0_export carries both but is
-      -- simulation-only; these feed the debug screen, so they have to survive
-      -- synthesis.
+      -- Status/Cause and EPC as they stand, packed below. cop0_export carries
+      -- both too, but only in simulation.
       debug_cause             : out unsigned(31 downto 0) := (others => '0');
       debug_epc               : out unsigned(31 downto 0) := (others => '0');
-      debug_badvaddr          : out unsigned(31 downto 0) := (others => '0');
-      -- Census of translation exceptions, so "this was the first" can be
-      -- stated rather than assumed:
-      --
-      --   digits 0-2  data-read TLB exceptions   (bits 31:20)
-      --   digits 3-4  data-write TLB exceptions  (bits 19:12)
-      --   digits 5-6  instruction TLB exceptions (bits 11:4)
-      --   digit  7    bit 0 = the first data exception was a refill MISS
-      --               rather than an invalid-entry hit
-      debug_tlb_census        : out unsigned(31 downto 0) := (others => '0');
-      -- One clk93 pulse per data-side translation exception. cpu.vhd uses it
-      -- to freeze the trace ON the fault instead of on the boot ROM entry the
-      -- handler eventually reaches, which puts the seven instructions BEFORE
-      -- the fault in the capture.
-      debug_tlb_exc_stb       : out std_logic := '0';
-      debug_eret_epc          : out unsigned(31 downto 0) := (others => '0');
-      -- The value eret actually jumped to, selected the same way eretPC is:
-      -- ErrorEPC when Status.ERL is set, EPC otherwise. Captured rather than
-      -- inferred so ERL does not have to be trusted to reconstruct it.
-      debug_eret_target       : out unsigned(31 downto 0) := (others => '0');
-      --   31:16  eret count, saturating
-      --   3      ERL at the eret - if set, the target came from ErrorEPC
-      --   2      EXL   1  BEV   0  IE
-      debug_eret_flags        : out unsigned(31 downto 0) := (others => '0');
 
       eret                    : in  std_logic;
       exception3              : in  std_logic;
@@ -97,9 +72,6 @@ entity cpu_cop0 is
       exception_COP           : in  unsigned(1 downto 0);
       isDelaySlot             : in  std_logic;
       chainedDelaySlot        : in  std_logic := '0';
-
-      debug_ds_count          : out unsigned(31 downto 0) := (others => '0');
-      debug_ds_first          : out unsigned(31 downto 0) := (others => '0');
       nextDelaySlot           : in  std_logic;                   
       pcOld1                  : in  unsigned(63 downto 0);
                   
@@ -255,12 +227,6 @@ architecture arch of cpu_cop0 is
 
    signal nextEPC_1                      : unsigned(63 downto 0) := (others => '0');
    signal isDelaySlot_1                   : std_logic := '0';
-   -- Written only by the exception process below.
-   signal suppressed_1                    : std_logic := '0';
-   signal ds_count_reg                    : unsigned(31 downto 0) := (others => '0');
-   signal ds_first_reg                    : unsigned(31 downto 0) := (others => '0');
-
-   signal ds_seen                         : std_logic := '0';
    
    signal cop0Written6                    : integer range 0 to 2 := 0;
    signal cop0Written9                    : integer range 0 to 3 := 0;
@@ -361,26 +327,6 @@ architecture arch of cpu_cop0 is
    signal TLB_ExcDataWrite                : std_logic;
    signal TLB_ExcDataDirty                : std_logic;
    signal TLB_ExcDataMiss                 : std_logic;
-
-   signal tlbexc_dr_prev                  : std_logic := '0';
-   signal tlbexc_dw_prev                  : std_logic := '0';
-   signal tlbexc_ir_prev                  : std_logic := '0';
-   signal tlbexc_dr_count                 : unsigned(11 downto 0) := (others => '0');
-   signal tlbexc_dw_count                 : unsigned(7 downto 0) := (others => '0');
-   signal tlbexc_ir_count                 : unsigned(7 downto 0) := (others => '0');
-   signal tlbexc_first_miss               : std_logic := '0';
-   signal tlbexc_first_seen               : std_logic := '0';
-   signal tlbexc_data_stb                 : std_logic := '0';
-
-   -- Written by eret_capture_proc and nothing else.
-   signal eret_prev                       : std_logic := '0';
-   signal eret_epc_reg                    : unsigned(31 downto 0) := (others => '0');
-   signal eret_target_reg                 : unsigned(31 downto 0) := (others => '0');
-   signal eret_count_reg                  : unsigned(15 downto 0) := (others => '0');
-   signal eret_erl_reg                    : std_logic := '0';
-   signal eret_exl_reg                    : std_logic := '0';
-   signal eret_bev_reg                    : std_logic := '0';
-   signal eret_ie_reg                     : std_logic := '0';
    
    signal TLB_InstrClearEna               : std_logic;
    signal TLB_InstrClearIndex             : unsigned(5 downto 0);
@@ -791,22 +737,10 @@ begin
             
             -- CPU access
             if (exception = '1') then
-         
+
                if (exlAtException = '0') then
                   COP0_14_EPC               <= nextEPC_1;
                   COP0_13_CAUSE_branchDelay <= isDelaySlot_1;
-               end if;
-               -- nextEPC_1 is pcOld1 unmodified when the suppression applied,
-               -- so the recorded EPC IS the address the predicate refused to
-               -- back up from.
-               if (suppressed_1 = '1') then
-                  if (ds_count_reg /= x"FFFFFFFF") then
-                     ds_count_reg <= ds_count_reg + 1;
-                  end if;
-                  if (ds_seen = '0') then
-                     ds_seen      <= '1';
-                     ds_first_reg <= nextEPC_1(31 downto 0);
-                  end if;
                end if;
                
                case (COP0_13_CAUSE_exceptionCode(3 downto 0)) is
@@ -895,8 +829,8 @@ begin
                         
                         when 16 =>
                            COP0_16_CONFIG_cacheAlgoKSEG0 <= writeValue(1 downto 0);
-                           COP0_16_CONFIG_cu             <= '0' & writeValue(2);      -- bit 3 reads 0; bit 2 is K0's top bit   
-                           --COP0_16_CONFIG_bigEndian      <= writeValue(15);         -- read only
+                           COP0_16_CONFIG_cu             <= '0' & writeValue(2);	-- bit 3 reads 0; bit 2 is K0's top bit
+                           --COP0_16_CONFIG_bigEndian      <= writeValue(15); 		-- read only
                            --COP0_16_CONFIG_sysadWBPattern <= writeValue(27 downto 24); -- read only
                            --COP0_16_CONFIG_systemClockRatio <= writeValue(30 downto 28); -- read only
                      
@@ -961,7 +895,6 @@ begin
                exceptionStage1 <= '0';
                nextEPC_1       <= nextEPC;
                isDelaySlot_1   <= isDelaySlot and (not chainedDelaySlot);
-               suppressed_1    <= isDelaySlot and chainedDelaySlot;
                if (exception = '0' and exceptionStage1 = '1') then
                   COP0_13_CAUSE_coprocessorError <= "00";
                   COP0_13_CAUSE_exceptionCode    <= '0' & x"2";
@@ -1546,131 +1479,6 @@ begin
    debug_cause(27 downto 20) <= COP0_12_SR_interruptMask;
    -- EPC is 64-bit; the low half is the instruction address.
    debug_epc                 <= COP0_14_EPC(31 downto 0);
-
-   -- BadVAddr is written by the exception process above from
-   -- TLB_Data_fetchAddrIn, so the low half is the faulting data address.
-   debug_badvaddr            <= COP0_8_BADVIRTUALADDRESS(31 downto 0);
-
-   debug_tlb_census(31 downto 20) <= tlbexc_dr_count;
-   debug_tlb_census(19 downto 12) <= tlbexc_dw_count;
-   debug_tlb_census(11 downto  4) <= tlbexc_ir_count;
-   debug_tlb_census(3 downto 1)   <= (others => '0');
-   debug_tlb_census(0)            <= tlbexc_first_miss;
-   debug_tlb_exc_stb              <= tlbexc_data_stb;
-
-   debug_ds_count                 <= ds_count_reg;
-   debug_ds_first                 <= ds_first_reg;
-   debug_eret_epc                 <= eret_epc_reg;
-   debug_eret_target              <= eret_target_reg;
-   debug_eret_flags(31 downto 16) <= eret_count_reg;
-   debug_eret_flags(15 downto 4)  <= (others => '0');
-   debug_eret_flags(3)            <= eret_erl_reg;
-   debug_eret_flags(2)            <= eret_exl_reg;
-   debug_eret_flags(1)            <= eret_bev_reg;
-   debug_eret_flags(0)            <= eret_ie_reg;
-
-   -- The eret condition mirrors the one that actually performs the eret at the
-   -- "-- eret" comment below, plus the stall gate, and is edge detected: `eret`
-   -- is a level and holds across a stall, so without the edge one eret would
-   -- be counted many times.
-   --
-   -- The target is recomputed here from ERL rather than read back from the
-   -- eretPC output port. Reading an out port is legal in VHDL-2008 but the
-   -- synthesis flow does not necessarily compile this file as 2008, and a
-   -- diagnostic is not worth that risk.
-   --
-   -- Every signal here is written by this process and no other.
-   eret_capture_proc : process (clk93)
-      variable eret_now : std_logic;
-   begin
-      if rising_edge(clk93) then
-         if (reset = '1') then
-            eret_prev       <= '0';
-            eret_epc_reg    <= (others => '0');
-            eret_target_reg <= (others => '0');
-            eret_count_reg  <= (others => '0');
-            eret_erl_reg    <= '0';
-            eret_exl_reg    <= '0';
-            eret_bev_reg    <= '0';
-            eret_ie_reg     <= '0';
-         else
-            eret_now := '0';
-            if (eret = '1' and exception = '0' and exceptionStage1 = '0' and stall = 0) then
-               eret_now := '1';
-            end if;
-            eret_prev <= eret_now;
-
-            if (eret_now = '1' and eret_prev = '0') then
-               eret_epc_reg    <= COP0_14_EPC(31 downto 0);
-               if (COP0_12_SR_errorLevel = '1') then
-                  eret_target_reg <= COP0_30_EPCERROR(31 downto 0);
-               else
-                  eret_target_reg <= COP0_14_EPC(31 downto 0);
-               end if;
-               eret_erl_reg <= COP0_12_SR_errorLevel;
-               eret_exl_reg <= COP0_12_SR_exceptionLevel;
-               eret_bev_reg <= COP0_12_SR_vectorLocation;
-               eret_ie_reg  <= COP0_12_SR_interruptEnable;
-               if (eret_count_reg /= x"FFFF") then
-                  eret_count_reg <= eret_count_reg + 1;
-               end if;
-            end if;
-         end if;
-      end if;
-   end process;
-
-   -- The exception inputs are levels that hold across a stall, so every one is
-   -- edge-detected. Counts saturate rather than wrap: a wrapped count reads as
-   -- a small number and would be indistinguishable from a healthy one.
-   tlb_census_proc : process (clk93)
-   begin
-      if rising_edge(clk93) then
-         tlbexc_data_stb <= '0';
-
-         if (reset = '1') then
-            tlbexc_dr_prev     <= '0';
-            tlbexc_dw_prev     <= '0';
-            tlbexc_ir_prev     <= '0';
-            tlbexc_dr_count    <= (others => '0');
-            tlbexc_dw_count    <= (others => '0');
-            tlbexc_ir_count    <= (others => '0');
-            tlbexc_first_miss  <= '0';
-            tlbexc_first_seen  <= '0';
-         else
-            tlbexc_dr_prev <= TLB_ExcDataRead;
-            tlbexc_dw_prev <= TLB_ExcDataWrite;
-            tlbexc_ir_prev <= TLB_ExcInstrRead;
-
-            if (TLB_ExcDataRead = '1' and tlbexc_dr_prev = '0') then
-               if (tlbexc_dr_count /= x"FFF") then
-                  tlbexc_dr_count <= tlbexc_dr_count + 1;
-               end if;
-               tlbexc_data_stb <= '1';
-               if (tlbexc_first_seen = '0') then
-                  tlbexc_first_seen <= '1';
-                  tlbexc_first_miss <= TLB_ExcDataMiss;
-               end if;
-            end if;
-
-            if (TLB_ExcDataWrite = '1' and tlbexc_dw_prev = '0') then
-               if (tlbexc_dw_count /= x"FF") then
-                  tlbexc_dw_count <= tlbexc_dw_count + 1;
-               end if;
-               tlbexc_data_stb <= '1';
-               if (tlbexc_first_seen = '0') then
-                  tlbexc_first_seen <= '1';
-                  tlbexc_first_miss <= TLB_ExcDataMiss;
-               end if;
-            end if;
-
-            if (TLB_ExcInstrRead = '1' and tlbexc_ir_prev = '0') then
-               if (tlbexc_ir_count /= x"FF") then
-                  tlbexc_ir_count <= tlbexc_ir_count + 1;
-               end if;
-            end if;
-         end if;
-      end if;
-   end process;
 
    -- synthesis translate_off
    cop0_export(0)(5 downto 0)    <= COP0_0_INDEX_tlbEntry;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 `default_nettype none
 
-// Rendered-frame-rate measurement and a compact top-right video overlay.
+// Rendered-frame-rate measurement and a two-digit top-right video overlay.
 //
 // The raster itself is generated locally and therefore stays at 58.98/59.94
 // Hz even when the emulated game falls behind.  A change of framebuffer_base,
@@ -70,67 +70,52 @@ module ki_fps_overlay (
     end
   end
 
-  function automatic [7:0] decimal_ascii(
-    input logic [6:0] value,
-    input logic       ones
-  );
-    logic [6:0] clipped;
-    logic [3:0] tens;
-    logic [3:0] units;
+  function automatic [34:0] glyph_bits(input logic [3:0] digit);
     begin
-      clipped = (value > 7'd99) ? 7'd99 : value;
-      tens = clipped / 10;
-      units = clipped % 10;
-      decimal_ascii = 8'h30 + (ones ? units : tens);
-    end
-  endfunction
-
-  function automatic [34:0] glyph_bits(input logic [7:0] character);
-    begin
-      case (character)
-        "0": glyph_bits={5'b01110,5'b10001,5'b10011,5'b10101,5'b11001,5'b10001,5'b01110};
-        "1": glyph_bits={5'b00100,5'b01100,5'b00100,5'b00100,5'b00100,5'b00100,5'b01110};
-        "2": glyph_bits={5'b01110,5'b10001,5'b00001,5'b00010,5'b00100,5'b01000,5'b11111};
-        "3": glyph_bits={5'b11110,5'b00001,5'b00001,5'b01110,5'b00001,5'b00001,5'b11110};
-        "4": glyph_bits={5'b00010,5'b00110,5'b01010,5'b10010,5'b11111,5'b00010,5'b00010};
-        "5": glyph_bits={5'b11111,5'b10000,5'b10000,5'b11110,5'b00001,5'b00001,5'b11110};
-        "6": glyph_bits={5'b01110,5'b10000,5'b10000,5'b11110,5'b10001,5'b10001,5'b01110};
-        "7": glyph_bits={5'b11111,5'b00001,5'b00010,5'b00100,5'b01000,5'b01000,5'b01000};
-        "8": glyph_bits={5'b01110,5'b10001,5'b10001,5'b01110,5'b10001,5'b10001,5'b01110};
-        "9": glyph_bits={5'b01110,5'b10001,5'b10001,5'b01111,5'b00001,5'b00001,5'b01110};
-        "F": glyph_bits={5'b11111,5'b10000,5'b10000,5'b11110,5'b10000,5'b10000,5'b10000};
-        "P": glyph_bits={5'b11110,5'b10001,5'b10001,5'b11110,5'b10000,5'b10000,5'b10000};
-        "S": glyph_bits={5'b01111,5'b10000,5'b10000,5'b01110,5'b00001,5'b00001,5'b11110};
-        ":": glyph_bits={5'b00000,5'b00100,5'b00100,5'b00000,5'b00100,5'b00100,5'b00000};
+      case (digit)
+        4'd0: glyph_bits={5'b01110,5'b10001,5'b10011,5'b10101,5'b11001,5'b10001,5'b01110};
+        4'd1: glyph_bits={5'b00100,5'b01100,5'b00100,5'b00100,5'b00100,5'b00100,5'b01110};
+        4'd2: glyph_bits={5'b01110,5'b10001,5'b00001,5'b00010,5'b00100,5'b01000,5'b11111};
+        4'd3: glyph_bits={5'b11110,5'b00001,5'b00001,5'b01110,5'b00001,5'b00001,5'b11110};
+        4'd4: glyph_bits={5'b00010,5'b00110,5'b01010,5'b10010,5'b11111,5'b00010,5'b00010};
+        4'd5: glyph_bits={5'b11111,5'b10000,5'b10000,5'b11110,5'b00001,5'b00001,5'b11110};
+        4'd6: glyph_bits={5'b01110,5'b10000,5'b10000,5'b11110,5'b10001,5'b10001,5'b01110};
+        4'd7: glyph_bits={5'b11111,5'b00001,5'b00010,5'b00100,5'b01000,5'b01000,5'b01000};
+        4'd8: glyph_bits={5'b01110,5'b10001,5'b10001,5'b01110,5'b10001,5'b10001,5'b01110};
+        4'd9: glyph_bits={5'b01110,5'b10001,5'b10001,5'b01111,5'b00001,5'b00001,5'b01110};
         default: glyph_bits=35'd0;
       endcase
     end
   endfunction
 
-  logic  [7:0] character;
+  // Two 16x16 cells, the tens digit at 280..295 and the ones digit at
+  // 296..311: 8 pixels in from the right edge, inside what Crop keeps.
+  localparam logic [9:0] BOX_LEFT = 10'd280;
+
+  logic  [6:0] clipped;
+  logic  [3:0] tens;
+  logic  [3:0] units;
+  logic  [3:0] digit;
+  logic  [9:0] box_x;
   logic [34:0] glyph;
   logic  [4:0] glyph_row;
   logic  [2:0] font_x;
   logic  [2:0] font_y;
 
   always_comb begin
-    // Six 16x16 cells aligned to the right edge: "FPS:nn".  The 5x7 font is
-    // doubled to 10x14 pixels, matching the existing debug screen's style.
-    box_pixel = (h_count >= 10'd224) && (h_count < 10'd320) &&
+    // The 5x7 font is doubled to 10x14 pixels.
+    box_x = h_count - BOX_LEFT;
+    box_pixel = (h_count >= BOX_LEFT) && (h_count < BOX_LEFT + 10'd32) &&
                 (v_count < 10'd16);
-    case (h_count[8:4])
-      5'd14: character = "F";
-      5'd15: character = "P";
-      5'd16: character = "S";
-      5'd17: character = ":";
-      5'd18: character = decimal_ascii(fps, 1'b0);
-      5'd19: character = decimal_ascii(fps, 1'b1);
-      default: character = " ";
-    endcase
 
-    font_x = h_count[3:1];
+    clipped = (fps > 7'd99) ? 7'd99 : fps;
+    tens = clipped / 10;
+    units = clipped % 10;
+    digit = box_x[4] ? units : tens;
+
+    font_x = box_x[3:1];
     font_y = v_count[3:1];
-    glyph = glyph_bits(character);
+    glyph = glyph_bits(digit);
     glyph_row = (font_y < 7) ? (glyph >> ((6-font_y)*5)) : 5'd0;
     glyph_pixel = box_pixel && (font_x < 5) && glyph_row[4-font_x];
   end
