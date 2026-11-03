@@ -4126,12 +4126,11 @@ begin
                         else
                            decodeMemReadEnable     <= '1';
                            decodeCOP1ReadEnable    <= '1';
+                           decodeExcType           <= EXCTYPE_ADDRW;
+                           decodeExcCode           <= x"4";
                         end if;
 
                      when 16#32# => -- LWC2 -> NOP
-                        null;
-                        
-                     when 16#33# => -- LWC3 -> NOP
                         null;
 
                      when 16#34# => -- LLD 
@@ -4152,6 +4151,8 @@ begin
                         else
                            decodeMemReadEnable     <= '1';
                            decodeCOP1ReadEnable    <= '1';
+                           decodeExcType           <= EXCTYPE_ADDRD;
+                           decodeExcCode           <= x"4";
                         end if;
 
                      when 16#37# => -- LD
@@ -4183,12 +4184,11 @@ begin
                            decodeExcCOP            <= "01";
                         else
                            decodeMemWriteEnable    <= '1';
+                           decodeExcType           <= EXCTYPE_ADDRW;
+                           decodeExcCode           <= x"5";
                         end if;  
                         
                      when 16#3A# => -- SWC2 -> NOP
-                        null;
-                        
-                     when 16#3B# => -- SWC3 -> NOP
                         null;
    
                      when 16#3C# => -- SCD 
@@ -4211,6 +4211,8 @@ begin
                            decodeExcCOP            <= "01";
                         else
                            decodeMemWriteEnable    <= '1';
+                           decodeExcType           <= EXCTYPE_ADDRD;
+                           decodeExcCode           <= x"5";
                         end if;
                
                      when 16#3F# => -- SD

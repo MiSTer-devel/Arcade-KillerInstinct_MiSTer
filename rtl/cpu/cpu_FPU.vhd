@@ -317,15 +317,9 @@ begin
 --------------- Combinatorial ---------------------------------------
 ---------------------------------------------------------------------
 
-   cmp_inputInvalid_a <= '1' when (nanA = '1' and OP(3) = '1') else
-                         '1' when (nanA = '1' and OP(3) = '0' and bit64 = '1' and command_op1(51) = '1') else
-                         '1' when (nanA = '1' and OP(3) = '0' and bit64 = '0' and command_op1(22) = '1') else 
-                         '0';
-                         
-   cmp_inputInvalid_b <= '1' when (nanB = '1' and OP(3) = '1') else
-                         '1' when (nanB = '1' and OP(3) = '0' and bit64 = '1' and command_op2(51) = '1') else
-                         '1' when (nanB = '1' and OP(3) = '0' and bit64 = '0' and command_op2(22) = '1') else 
-                         '0';
+   cmp_inputInvalid_a <= '1' when (nanA = '1' and OP(3) = '1') else '0';
+
+   cmp_inputInvalid_b <= '1' when (nanB = '1' and OP(3) = '1') else '0';
    
    cmp_equal <= '1' when (zeroA = '1' and zeroB = '1') else
                 '1' when (signA = signB and expA = expB and mantA = mantB) else
@@ -1464,7 +1458,7 @@ begin
                if (infA_1 = '1' or zeroB_1 = '1') then
                   shortcut_exp <= (others => '1');
                end if;
-               if (zeroB_1 = '1') then
+               if (zeroB_1 = '1' and infA_1 = '0') then
                   flag_divbyzero <= '1';
                end if;
             end if;
