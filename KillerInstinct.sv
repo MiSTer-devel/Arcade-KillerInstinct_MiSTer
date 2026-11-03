@@ -122,7 +122,7 @@ module emu
 
 localparam CONF_STR = {
 	"KillerInstinct;;",
-	"S0,IMG,Mount HDD Image;",
+	"H0S0,IMG,Mount HDD Image;",
 	"-;",
 	"P1,Video Settings;",
 	"P1O1,Aspect Ratio,Original,Wide Screen;",
@@ -163,7 +163,6 @@ wire img_mounted;
 wire img_readonly;
 wire [63:0] img_size;
 wire hdd_image_present = (img_size >= 64'd512);
-wire startup_osd_button;
 wire [31:0] sd_lba;
 wire [5:0] sd_blk_cnt;
 wire sd_rd;
@@ -241,7 +240,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.status(status),
 	.status_in(status),
 	.status_set(1'b0),
-	.status_menumask(16'h0000),
+	.status_menumask(16'h0001),
 	.video_rotated(1'b0),
 	.new_vmode(1'b0),
 	.ioctl_download(ioctl_download),
@@ -265,16 +264,6 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),
 	.img_size(img_size)
-);
-
-ki_startup_osd_button startup_osd_button_inst
-(
-	.clk_i(clk_core),
-	.reset_i(~pll_locked | RESET),
-	.rom_download_i(ioctl_download),
-	.rom_index_i(ioctl_index),
-	.image_present_i(hdd_image_present),
-	.osd_button_o(startup_osd_button)
 );
 
 reg game_ki2 = 1'b0;
@@ -1653,7 +1642,7 @@ assign HDMI_BOB_DEINT = 1'b0;
 assign LED_USER = ioctl_download | ~boot_loaded | (|cpu_errors);
 assign LED_POWER = 2'b00;
 assign LED_DISK = {2{sd_rd | sd_wr}};
-assign BUTTONS = {1'b0, startup_osd_button};
+assign BUTTONS = {1'b0, 1'b0};
 // DCS is a mono board, so both channels carry the same sample. AUDIO_S stays 1
 // because dcs_audio is signed.
 assign AUDIO_L = dcs_audio;
