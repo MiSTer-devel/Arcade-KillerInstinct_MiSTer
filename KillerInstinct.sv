@@ -345,6 +345,18 @@ wire        native_vs;
 wire        native_vblank;
 wire        native_frame_start;
 
+// The timing is reset only until the PLL locks. ROM and DIP downloads and HDD
+// mounts all reset the core; resetting the timing with it stopped CE_PIXEL and
+// both syncs for a whole download, then restarted them mid-frame. MiSTer's
+// video_calc reports each stop or short frame as a new video mode, and with
+// vsync_adjust, VRR or vscale_mode >= 4 the HPS reprograms the HDMI PLL for
+// every one - the reconfiguration sys/ascal.vhd notes can leave its output
+// stuck. Free-running, the scaler and analog displays see one steady signal
+// from configuration on. The framebuffer and CPU still reset with the core:
+// the picture is black until lines are fetched again, and vblank arrives at
+// whatever phase the timing is in, as it would on the board.
+wire video_reset = ~pll_locked;
+
 // Keep the original generator running in both modes. Its CE_PIXEL is the
 // common 6.25 MHz pixel strobe. The alternate counters below step on its
 // advance output instead - the clock before CE_PIXEL, whose edge steps the
@@ -355,7 +367,7 @@ wire        native_frame_start;
 ki_video_timing #(.CLOCK_DIVIDE(8)) video_timing
 (
 	.clk(clk_core),
-	.reset(core_reset),
+	.reset(video_reset),
 	.ce_pixel(native_ce_pixel),
 	.advance(native_advance),
 	.h_count(native_h_count),
@@ -387,7 +399,7 @@ reg crt_frame_start = 1'b0;
 always @(posedge clk_core) begin
 	crt_frame_start <= 1'b0;
 
-	if(core_reset) begin
+	if(video_reset) begin
 		crt_h_count <= 10'd0;
 		crt_v_count <= 10'd0;
 	end
@@ -448,8 +460,34 @@ assign frame_start = crt_60hz ? crt_frame_start : native_frame_start;
 // order from bit 4: High Quick, High Medium, High Fierce, Low Quick,
 // Low Medium, Low Fierce, Start, Coin, Service, Test, Pause.
 //
-// Merge the arcade keyboard controls with the matching MiSTer joystick bits
-// before translating them to the board's active-low ports.
+// DB15 SNAC through the MiSTer user port, matching the Irem M72 connection:
+// USER_OUT[0] = LOAD, USER_OUT[1] = CLK, USER_IN[5] = DATA.
+// A-F map to the six KI attack buttons, Start to Start and Select to Coin.
+// Leave all user-port outputs released while DB15 is disabled.
+wire        db15_en = status[26];
+wire        db15_clk;
+wire        db15_load;
+wire [15:0] db15_joy1;
+wire [15:0] db15_joy2;
+
+joy_db15 db15_reader
+(
+	.clk(clk_core),
+	.rst(~db15_en),
+	.JOY_CLK(db15_clk),
+	.JOY_LOAD(db15_load),
+	.JOY_DATA(USER_IN[5]),
+	.joystick1(db15_joy1),
+	.joystick2(db15_joy2)
+);
+
+// Bit 12 (service) and higher are not provided by the DB15 adapter.
+// The enable mask also prevents any stale data affecting USB inputs.
+wire [12:0] db15_p1 = db15_en ? {1'b0, db15_joy1[11:0]} : 13'd0;
+wire [12:0] db15_p2 = db15_en ? {1'b0, db15_joy2[11:0]} : 13'd0;
+
+// Merge arcade keyboard, USB, and DB15 controls before translating them
+// to the board's active-low ports.
 wire [12:0] keyboard_p1;
 wire [12:0] keyboard_p2;
 wire        keyboard_pause;
@@ -463,8 +501,8 @@ ki_keyboard keyboard
 	.pause_o(keyboard_pause)
 );
 
-wire [12:0] controls_p1 = joystick_0[12:0] | keyboard_p1;
-wire [12:0] controls_p2 = joystick_1[12:0] | keyboard_p2;
+wire [12:0] controls_p1 = joystick_0[12:0] | keyboard_p1 | db15_p1;
+wire [12:0] controls_p2 = joystick_1[12:0] | keyboard_p2 | db15_p2;
 
 // Active low throughout: the board reads a released control as 1.
 wire [31:0] input_p1 = {
@@ -957,6 +995,13 @@ assign fps_box_pixel   = 1'b0;
 assign fps_glyph_pixel = 1'b0;
 `endif
 
+// Keep RGB black while the ROM is loading or the CPU is held in reset.
+// cpu_reset already includes ioctl_download, !boot_loaded, !sdram_ready,
+// shell reset and the HDD-mount reset. Unlike waiting for a framebuffer page
+// flip, releasing this gate lets the game's blue boot screen appear normally.
+// Video timing (clock, DE, HS and VS) continues uninterrupted.
+wire video_blank = cpu_reset;
+
 reg [7:0] red;
 reg [7:0] green;
 reg [7:0] blue;
@@ -964,7 +1009,7 @@ always @(*) begin
 	red = 8'h00;
 	green = 8'h00;
 	blue = 8'h00;
-	if(VGA_DE) begin
+	if(VGA_DE && !video_blank) begin
 		red = framebuffer_red;
 		green = framebuffer_green;
 		blue = framebuffer_blue;
@@ -1012,7 +1057,7 @@ assign DDRAM_CLK = clk_ddr;
 assign SDRAM_CLK = clk_sdram_pin;
 
 assign {UART_RTS, UART_TXD, UART_DTR} = 3'b000;
-assign USER_OUT = 7'h7f;
+assign USER_OUT = db15_en ? {5'b11111, db15_clk, db15_load} : 7'h7f;
 
 `ifdef MISTER_FB
 // The framebuffer is in on-chip block RAM, not DDR3, so use the FPGA scanout
