@@ -29,6 +29,10 @@ implements:
 - MAME-compatible keyboard mappings
 - DB15 SNAC
 
+## Accuracy
+
+See [Core vs Original Hardware](core-hardware-comparison.md)
+
 ## Media
 
 ROM and disk data are not included. MRAs are supplied for the dumped KI and

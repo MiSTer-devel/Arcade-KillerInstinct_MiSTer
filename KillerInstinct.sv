@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Killer Instinct MiSTer board-shell bring-up top level.
 
-// Comment this line out for a release build.
-//`define KI_DEBUG_BUILD
-
 module emu
 (
 	input         CLK_50M,
@@ -122,19 +119,21 @@ module emu
 
 localparam CONF_STR = {
 	"KillerInstinct;;",
-	"H0S0,IMG,Mount HDD Image;",
+	"H0S0,IMG,HDD Image;",
 	"-;",
 	"P1,Video Settings;",
 	"P1O1,Aspect Ratio,Original,Wide Screen;",
 	"P1O2,Video Timing,Native,60Hz CRT;",
 	"P1OD,Crop,Off,On;",
-`ifdef KI_DEBUG_BUILD
-	"P1O3,FPS Overlay,Off,On;",
-`endif
 	"-;",
 	"O8,OSD Pause,Off,On;",
 	"-;",
 	"DIP;",
+	"-;",
+	"h1P2,Extras;",
+	"h1P2-,Use on Character Selection;",
+	"h1P2R4,Activate Gargos (P1);",
+	"h1P2R5,Activate Gargos (P2);",
 	"-;",
 	"R0,Reset;",
 	"J1,High Quick,High Medium,High Fierce,Low Quick,Low Medium,Low Fierce,Start,Coin,Service,Test,Pause;",
@@ -143,6 +142,9 @@ localparam CONF_STR = {
 
 wire [1:0] buttons;
 wire [127:0] status;
+reg [127:0] status_in = 128'd0;
+reg         status_set = 1'b0;
+reg         crop_default_pending = 1'b0;
 wire [31:0] joystick_0;
 wire [31:0] joystick_1;
 wire [10:0] ps2_key;
@@ -232,9 +234,9 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.joystick_0_rumble(16'h0000),
 	.joystick_1_rumble(16'h0000),
 	.status(status),
-	.status_in(status),
-	.status_set(1'b0),
-	.status_menumask(16'h0001),
+	.status_in(status_in),
+	.status_set(status_set),
+	.status_menumask({14'b0, game_ki2, 1'b1}),
 	.video_rotated(1'b0),
 	.new_vmode(1'b0),
 	.ioctl_download(ioctl_download),
@@ -264,9 +266,20 @@ reg game_ki2 = 1'b0;
 reg [15:0] dip_switches = 16'hffff;
 
 always @(posedge clk_core) begin
+	// Pulse once to request a menu update, then leave user changes alone.
+	status_set <= 1'b0;
+
 	if(ioctl_wr && (ioctl_index == 16'h0000) && (ioctl_addr < 27'd2)) begin
 		game_ki2 <= ioctl_dout[0];
+		crop_default_pending <= 1'b1;
 	end
+	else if(crop_default_pending && !ioctl_download) begin
+		// Default Crop to On for KI2 and Off for KI1; preserve other settings.
+		status_in <= {status[127:14], game_ki2, status[12:0]};
+		status_set <= 1'b1;
+		crop_default_pending <= 1'b0;
+	end
+
 	if(ioctl_wr && (ioctl_index == 16'h00fe) && (ioctl_addr < 27'd2)) begin
 		dip_switches <= ioctl_dout;
 	end
@@ -380,7 +393,7 @@ ki_video_timing #(.CLOCK_DIVIDE(8)) video_timing
 );
 
 // NTSC-consumer-CRT-friendly 240p timing. Active video is kept at the same
-// 0..319 / 0..239 coordinates expected by ki_framebuffer and ki_fps_overlay.
+// 0..319 / 0..239 coordinates expected by ki_framebuffer.
 // Horizontal: 320 active + 16 front + 32 sync + 30 back = 398.
 // Vertical:   240 active +  3 front +  3 sync + 16 back = 262.
 localparam int CRT_H_ACTIVE = 320;
@@ -460,7 +473,7 @@ assign frame_start = crt_60hz ? crt_frame_start : native_frame_start;
 // order from bit 4: High Quick, High Medium, High Fierce, Low Quick,
 // Low Medium, Low Fierce, Start, Coin, Service, Test, Pause.
 //
-// DB15 SNAC through the MiSTer user port, matching the Irem M72 connection:
+// DB15 SNAC through the MiSTer user port:
 // USER_OUT[0] = LOAD, USER_OUT[1] = CLK, USER_IN[5] = DATA.
 // A-F map to the six KI attack buttons, Start to Start and Select to Coin.
 // Leave all user-port outputs released while DB15 is disabled.
@@ -486,8 +499,7 @@ joy_db15 db15_reader
 wire [12:0] db15_p1 = db15_en ? {1'b0, db15_joy1[11:0]} : 13'd0;
 wire [12:0] db15_p2 = db15_en ? {1'b0, db15_joy2[11:0]} : 13'd0;
 
-// Merge arcade keyboard, USB, and DB15 controls before translating them
-// to the board's active-low ports.
+//MAME style keyboard input
 wire [12:0] keyboard_p1;
 wire [12:0] keyboard_p2;
 wire        keyboard_pause;
@@ -501,8 +513,27 @@ ki_keyboard keyboard
 	.pause_o(keyboard_pause)
 );
 
-wire [12:0] controls_p1 = joystick_0[12:0] | keyboard_p1 | db15_p1;
-wire [12:0] controls_p2 = joystick_1[12:0] | keyboard_p2 | db15_p2;
+// Input Codes
+wire [12:0] extras_p1;
+wire [12:0] extras_p2;
+
+ki_extras extras
+(
+    .clk(clk_core),
+    .reset(core_reset),
+    .game_ki2(game_ki2),
+    .osd_open(OSD_STATUS),
+    .core_pause(core_pause),
+    .frame_start(frame_start),
+    .gargos_trigger(status[5:4]),
+    .controls_p1(extras_p1),
+    .controls_p2(extras_p2)
+);
+
+// Merge arcade keyboard, USB, and DB15 controls before translating them
+// to the board's active-low ports.
+wire [12:0] controls_p1 = joystick_0[12:0] | keyboard_p1 | db15_p1 | extras_p1;
+wire [12:0] controls_p2 = joystick_1[12:0] | keyboard_p2 | db15_p2 | extras_p2;
 
 // Active low throughout: the board reads a released control as 1.
 wire [31:0] input_p1 = {
@@ -969,32 +1000,6 @@ ki_ata ata
 	.debug_status()
 );
 
-wire [6:0] fps_value;
-wire fps_box_pixel;
-wire fps_glyph_pixel;
-
-// The FPS overlay is built only with KI_DEBUG_BUILD; otherwise the video mux
-// below folds these constants away.
-`ifdef KI_DEBUG_BUILD
-ki_fps_overlay fps_overlay
-(
-	.clk(clk_core),
-	.reset(core_reset),
-	.frame_start(frame_start),
-	.timing_60hz(crt_60hz),
-	.framebuffer_base(framebuffer_base),
-	.h_count(h_count),
-	.v_count(v_count),
-	.fps(fps_value),
-	.box_pixel(fps_box_pixel),
-	.glyph_pixel(fps_glyph_pixel)
-);
-`else
-assign fps_value       = 7'd0;
-assign fps_box_pixel   = 1'b0;
-assign fps_glyph_pixel = 1'b0;
-`endif
-
 // Keep RGB black while the ROM is loading or the CPU is held in reset.
 // cpu_reset already includes ioctl_download, !boot_loaded, !sdram_ready,
 // shell reset and the HDD-mount reset. Unlike waiting for a framebuffer page
@@ -1013,12 +1018,6 @@ always @(*) begin
 		red = framebuffer_red;
 		green = framebuffer_green;
 		blue = framebuffer_blue;
-
-		if(status[3] && fps_box_pixel) begin
-			red = fps_glyph_pixel ? 8'hf0 : 8'h08;
-			green = fps_glyph_pixel ? 8'hf0 : 8'h08;
-			blue = fps_glyph_pixel ? 8'hf0 : 8'h08;
-		end
 	end
 end
 
@@ -1079,4 +1078,3 @@ assign FB_PAL_WR = 1'b0;
 
 endmodule
 
-`undef KI_DEBUG_BUILD
