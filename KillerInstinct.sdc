@@ -47,8 +47,7 @@ derive_clock_uncertainty
 #     written in clk1x only while its own fetch is outstanding and copied
 #     into clk93 only when that fetch's completion has crossed the response
 #     FIFO, so its last beat is in no later than the completion;
-#   - the first stage of a two-flop synchroniser (irq_meta, trace_trigger_meta,
-#     debug_vblank_cpu_meta, the debug counter mirrors below).
+#   - the first stage of a two-flop synchroniser (irq_meta, pause_meta).
 # Reset was the one exception: the caches' clk1x fill processes were reset by
 # reset_93. They now take reset_1x, which ki_cpu_core already synchronises
 # into that domain, so nothing crosses unsynchronised.
@@ -60,8 +59,27 @@ derive_clock_uncertainty
 set_clock_groups -asynchronous \
   -group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[1].gpll~PLL_OUTPUT_COUNTER|divclk}] \
   -group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[3].gpll~PLL_OUTPUT_COUNTER|divclk \
-                      emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk \
                       emu|pll|pll_inst|altera_pll_i|general[5].gpll~PLL_OUTPUT_COUNTER|divclk}]
+
+# THE CPU CLOCK AND clk_sdram_ctl ARE RELATED. The data cache's direct fill
+# path (cpu.vhd, fast_go) hands its request - a toggle, a line address mapped
+# in ki_fast_fill, and the stream flag (fast_req_stream: a read-ahead line
+# marked a stream's, written only with the toggle) - straight from the CPU's
+# clock to the controller's. Both are 100 MHz outputs of one PLL, the
+# controller's 500 ps later, which leaves 0.5 ns to the very next controller
+# edge. The whole request, address and flag alike, holds from its toggle until
+# the next request, which cannot come before this one's line is back, so it is
+# given TWO controller clocks, 10.5 ns. The hold check stays at
+# the edge 0.5 ns after the launch: the controller must see the old value
+# there, and the new one at the edge after.
+#
+# The other way, a demand fill's line goes back through clk_core, but an
+# uncached qword read's qword, and each qword of a direct read-ahead's line,
+# come straight back on this pair (ki_fast_fill, unc_valid and ra_valid): a
+# pulse one controller clock long, which the CPU's next edge, 9.5 ns after its
+# launch, takes exactly once. That needs the default single-cycle setup
+# relationship here, and the two clocks at one frequency.
+set_multicycle_path -setup -end -from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[1].gpll~PLL_OUTPUT_COUNTER|divclk}] -to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk}] 2
 
 # Physical SDRAM runs from clk_sdram_ctl (PLL output 4) at 100 MHz. The pin
 # clock is PLL output 3 at the same frequency with a 6.75 ns (243 deg) shift.
@@ -137,17 +155,3 @@ set_multicycle_path -hold -end   -from [get_clocks {emu|pll|pll_inst|altera_pll_
 # assuming any of this still holds.
 set_multicycle_path -setup -end   -rise_from [get_clocks {KI_SDRAM_CLK}]   -rise_to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[5].gpll~PLL_OUTPUT_COUNTER|divclk}] 2
 set_multicycle_path -setup -end   -rise_from [get_clocks {KI_SDRAM_CLK}]   -rise_to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk}] 2
-
-# Passive CPU diagnostics cross from the 100 MHz CPU domain through explicit
-# two-stage synchronizers. Only the metastability-catching stages are async.
-set_false_path -to [get_keepers {*|debug_cpu_pc_meta[*]}]
-set_false_path -to [get_keepers {*|debug_cpu_retired_meta[*]}]
-
-# The frozen pre-event trace. debug_trace_frozen_meta is the ordinary
-# metastability-catching stage; debug_trace_shadow is a 736-bit single-shot
-# capture of a source that has already stopped changing, taken only after the
-# frozen flag has been synchronised and allowed to settle. Neither is a
-# functional path and neither may be allowed to set the clk_core critical
-# path - this is a diagnostic, and it must not cost the design a fit.
-set_false_path -to [get_keepers {*|debug_trace_frozen_meta}]
-set_false_path -to [get_keepers {*|debug_trace_shadow[*]}]

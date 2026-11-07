@@ -20,11 +20,11 @@ implements:
   ROM banks.
 - Original 320 x 240 video, framebuffer page flipping and BGR555 output.
 - ATA PIO access to raw disk images through MiSTer's mounted-image interface.
-- Controls, coins, Start, Service, Test and Pause
+- Controls, Coin, Start, Service, Test and Pause
 - Game DIP switches.
 - Native/60 Hz CRT timing modes.
 - Original/Wide Screen aspect ratios
-- Optional horizontal crop
+- Horizontal Crop; KI1 2 pixels & KI2 8 pixels
 - Core Pause
 - MAME-compatible keyboard mappings
 - DB15 SNAC

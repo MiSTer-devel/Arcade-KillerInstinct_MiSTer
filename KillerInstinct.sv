@@ -124,7 +124,7 @@ localparam CONF_STR = {
 	"P1,Video Settings;",
 	"P1O1,Aspect Ratio,Original,Wide Screen;",
 	"P1O2,Video Timing,Native,60Hz CRT;",
-	"P1OD,Crop,Off,On;",
+	"P1OD,Crop,On,Off;",
 	"-;",
 	"O8,OSD Pause,Off,On;",
 	"-;",
@@ -142,9 +142,6 @@ localparam CONF_STR = {
 
 wire [1:0] buttons;
 wire [127:0] status;
-reg [127:0] status_in = 128'd0;
-reg         status_set = 1'b0;
-reg         crop_default_pending = 1'b0;
 wire [31:0] joystick_0;
 wire [31:0] joystick_1;
 wire [10:0] ps2_key;
@@ -234,8 +231,8 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.joystick_0_rumble(16'h0000),
 	.joystick_1_rumble(16'h0000),
 	.status(status),
-	.status_in(status_in),
-	.status_set(status_set),
+	.status_in(status),
+	.status_set(1'b0),
 	.status_menumask({14'b0, game_ki2, 1'b1}),
 	.video_rotated(1'b0),
 	.new_vmode(1'b0),
@@ -266,18 +263,8 @@ reg game_ki2 = 1'b0;
 reg [15:0] dip_switches = 16'hffff;
 
 always @(posedge clk_core) begin
-	// Pulse once to request a menu update, then leave user changes alone.
-	status_set <= 1'b0;
-
 	if(ioctl_wr && (ioctl_index == 16'h0000) && (ioctl_addr < 27'd2)) begin
 		game_ki2 <= ioctl_dout[0];
-		crop_default_pending <= 1'b1;
-	end
-	else if(crop_default_pending && !ioctl_download) begin
-		// Default Crop to On for KI2 and Off for KI1; preserve other settings.
-		status_in <= {status[127:14], game_ki2, status[12:0]};
-		status_set <= 1'b1;
-		crop_default_pending <= 1'b0;
 	end
 
 	if(ioctl_wr && (ioctl_index == 16'h00fe) && (ioctl_addr < 27'd2)) begin
@@ -442,12 +429,15 @@ wire crt_vs = ~((crt_v_count >= CRT_V_ACTIVE + CRT_V_FP) &&
                 (crt_v_count <  CRT_V_ACTIVE + CRT_V_FP + CRT_V_SYNC));
 wire crt_vblank = (crt_v_count >= CRT_V_ACTIVE);
 
-// Crop blanks the first and last 8 columns of the 320-pixel line, leaving
-// 304 x 240 active in either timing mode. Only DE changes: sync, the
+// Crop removes 2 columns per side for KI1 (316 x 240), or 8 per side
+// for KI2 (304 x 240), in either timing mode. Only DE changes: sync, the
 // framebuffer fetch and the vblank IRQ still run on the full line, so game
 // timing is identical with it on or off. VIDEO_ARX/ARY follow it below.
-wire crop = status[13];
-wire crop_de = !crop || ((h_count >= 10'd8) && (h_count < 10'd312));
+// On is menu value 0; Off is menu value 1.
+wire crop = ~status[13];
+wire [9:0] crop_left  = game_ki2 ? 10'd8   : 10'd2;
+wire [9:0] crop_right = game_ki2 ? 10'd312 : 10'd318;
+wire crop_de = !crop || ((h_count >= crop_left) && (h_count < crop_right));
 
 assign CE_PIXEL = native_ce_pixel;
 assign h_count = crt_60hz ? crt_h_count : native_h_count;
@@ -1025,11 +1015,11 @@ assign CLK_VIDEO = clk_core;
 assign VGA_R = red;
 assign VGA_G = green;
 assign VGA_B = blue;
-// Original is square pixels, so the cropped 304 x 240 picture is 19:15 rather
-// than 4:3; the dropped columns are removed, not stretched over. Wide Screen
-// fills 16:9 with whatever is active either way.
-assign VIDEO_ARX = status[1] ? 13'd16 : (crop ? 13'd19 : 13'd4);
-assign VIDEO_ARY = status[1] ? 13'd9 : (crop ? 13'd15 : 13'd3);
+// Original uses square pixels: KI1 cropped is 316 x 240 (79:60),
+// KI2 cropped is 304 x 240 (19:15), and uncropped is 320 x 240 (4:3).
+// Wide Screen fills 16:9 with whatever is active.
+assign VIDEO_ARX = status[1] ? 13'd16 : (crop ? (game_ki2 ? 13'd19 : 13'd79) : 13'd4);
+assign VIDEO_ARY = status[1] ? 13'd9  : (crop ? (game_ki2 ? 13'd15 : 13'd60) : 13'd3);
 assign VGA_F1 = 1'b0;
 assign VGA_SL = 2'b00;
 assign VGA_SCALER = 1'b0;
