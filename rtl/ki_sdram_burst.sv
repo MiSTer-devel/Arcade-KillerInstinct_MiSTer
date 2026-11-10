@@ -3,7 +3,7 @@
 
 // Burst-capable 16-bit SDRAM controller for Killer Instinct.
 //
-// Five design choices provide the required throughput:
+// Six design choices provide the required throughput:
 //
 // 1. ADDRESS DECOMPOSITION. The controller uses col = addr[9:1],
 //    row = addr[22:10], bank = addr[24:23], so 512
@@ -17,12 +17,12 @@
 //
 // 3. NO CLOCK THE DEVICE DOES NOT NEED. A row change issues PRECHARGE, waits
 //    out tRP and issues ACTIVE from S_IDLE on the next clock, a read that
-//    hits the open row issues its first READ from S_IDLE itself (HIT_READ) -
-//    the direct port's qword read, and a stream's line read, on the edge
-//    that takes it (FAST_ISSUE, RA_LINE_ISSUE) - a read releases on the edge
-//    that captures its last word, and a write with its last WRITE command
-//    (WR_EARLY_READY): its tWR runs out in S_TURNAROUND behind the release,
-//    and a request taken meanwhile waits there for S_IDLE.
+//    hits the open row issues its first READ from S_IDLE itself - the direct
+//    port's qword read, and a stream's line read, on the edge that takes it,
+//    its row compared as it arrives - a read releases on the edge that
+//    captures its last word, and a write with its last WRITE command: its
+//    tWR runs out in S_TURNAROUND behind the release, and a request taken
+//    meanwhile waits there for S_IDLE.
 //    ki_sdram_adapter launches an arriving request directly and passes words
 //    straight through.
 //
@@ -39,14 +39,15 @@
 //    first: such loads come in runs through one row, and the next then hits
 //    it. So does a line read its requester marks as a stream's (fast_stream:
 //    the data cache's read-ahead of the line after one the CPU waited for),
-//    for ROW_HOLD_RA idle clocks (RA_ROW_HOLD), unless it is the last line of
-//    its row: the stream's next line then hits the row and, marked the same
-//    way, issues its first READ on the edge that takes it, as FAST_ISSUE
-//    does for a qword (RA_LINE_ISSUE). Any request taken ends a hold, so only
-//    those reads leave a row open, and refresh still closes it.
+//    for ROW_HOLD_RA idle clocks, unless it is the last line of its row: the
+//    stream's next line then hits the row and, marked the same way, issues
+//    its first READ on the edge that takes it, as a qword read does. Any
+//    request taken ends a hold, so only those reads leave a row open, and
+//    refresh still closes it.
 //
-//    A stream line that IS the last of its row opens the row after it
-//    (RA_ROW_NEXT): S_IDLE precharges as above and, tRP later - with nothing
+//    A stream line that IS the last of its row opens the row after it. Its
+//    drain precharges the row on its first edge, tRAS allowing - S_IDLE
+//    closes it as above otherwise - and S_IDLE, tRP later - with nothing
 //    pending, nothing taken on that edge and no refresh due - issues the
 //    ACTIVE for the next row number, carrying into the bank bits, with no
 //    request behind it (S_RCD_NEXT waits out tRCD). It then holds that row
@@ -67,6 +68,20 @@
 //    first word is back); it is taken when the first has drained. fast_stream
 //    holds beside fast_addr, like it, and marks a line read as a stream's
 //    (design choice 4).
+//
+// 6. REFRESH BESIDE THE READS. A refresh due while a read drains starts in
+//    S_READ_DRAIN: PRECHARGE on the first edge that sees it - the edge after
+//    the last READ at the earliest, which at CAS latency 2 still returns that
+//    READ's word - and AUTO_REFRESH T_RP later; the release then goes to
+//    S_REFRESH for the rest of tRFC. Never on the release edge, so S_IDLE,
+//    which refreshes on the edge after it, still finds tRP met. A stream line
+//    read whose last READ comes within RF_EARLY clocks of the refresh falling
+//    due ends the refresh period on its drain's first edge, as the counter
+//    would have, and refreshes there: the stream's next line would otherwise
+//    find it due. The period only ever ends early. S_IDLE's own refresh
+//    precharges on the edge that sees it and waits T_RP - 1, and S_REFRESH
+//    counts T_RFC - 1: tRP and tRFC exactly, as the row change's PRECHARGE
+//    and ACTIVE wait T_RP and T_RCD.
 //
 // Writes burst up to 16 words. A write burst needs no streaming handshake
 // because the payload is presented all at once: `din` is 16 words wide - one
@@ -90,9 +105,11 @@ module ki_sdram_burst #(
   // precharge 30 ns after its ACTIVE. Every ACTIVE waits for T_RC from the
   // last one and every PRECHARGE for T_RAS.
   //
-  // T_RP and T_RCD must be at least 2: the row-change and open-row paths each
-  // spend a counted wait state between their two commands, so a 1 would
-  // silently behave as 2.
+  // T_RP must be 2 and T_RCD at least 2: the row-change and open-row paths
+  // each spend a counted wait state between their two commands, so a 1 would
+  // silently behave as 2; and S_IDLE may decide a command on the edge after a
+  // release, two clocks after a PRECHARGE the drain decided on the edge
+  // before it (design choice 6).
   parameter [3:0] T_RP  = 4'd2,
   parameter [3:0] T_RCD = 4'd2,
   parameter [4:0] T_RAS = 5'd5,
@@ -101,59 +118,7 @@ module ki_sdram_burst #(
   parameter [3:0] T_WR  = 4'd2,
   parameter [2:0] CAS_LATENCY = 3'd2,
   parameter [14:0] STARTUP_CYCLES = 15'd12000,  // 120 us, >= 100 us
-  parameter [12:0] REFRESH_PERIOD = 13'd730,    // 7.3 us, < 7.8 us
-  // Idle clocks a row stays open after a direct qword read (design choice
-  // 4); 0 closes it at once, as after any other access.
-  parameter [5:0] ROW_HOLD = 6'd32,
-  // A read hitting the open row issues its first READ from S_IDLE, not a
-  // clock later from S_READ (design choice 3).
-  parameter bit HIT_READ = 1'b1,
-  // The direct port's qword read hitting the open row issues its first READ
-  // on the edge that takes it, its row compared as it arrives, not a clock
-  // later from req_* (design choice 3). The port's inputs come from the
-  // CPU's clock and have two controller clocks to settle (KillerInstinct.sdc).
-  // A line read still waits a clock in req_*, except a stream's with
-  // RA_LINE_ISSUE (below).
-  parameter bit FAST_ISSUE = 1'b1,
-  // A write raises ready with its last WRITE command, not when tWR has run
-  // out (design choice 3). 0 raises it when S_TURNAROUND ends.
-  parameter bit WR_EARLY_READY = 1'b1,
-  // A direct line read marked fast_stream keeps its row open for ROW_HOLD_RA
-  // idle clocks, unless it is the last line of the row (design choice 4).
-  // 0 closes it at once, as after any other line.
-  parameter bit RA_ROW_HOLD = 1'b1,
-  parameter [5:0] ROW_HOLD_RA = 6'd12,
-  // With RA_ROW_HOLD and FAST_ISSUE, a direct line read marked fast_stream
-  // and hitting the open row issues its first READ on the edge that takes
-  // it, as a qword read does (design choice 3). 0 holds the row only.
-  parameter bit RA_LINE_ISSUE = 1'b1,
-  // With RA_ROW_HOLD, a direct line read marked fast_stream that is the last
-  // line of its row opens the row after it once the row has closed, and
-  // holds it ROW_HOLD_RA idle clocks (design choice 4). 0 leaves it closed.
-  // Ignored without RA_ROW_HOLD.
-  parameter bit RA_ROW_NEXT = 1'b1,
-  // A refresh due while a read drains starts in S_READ_DRAIN: PRECHARGE on
-  // the first edge that sees it - the edge after the last READ at the
-  // earliest, which at CAS latency 2 still returns that READ's word - and
-  // AUTO_REFRESH T_RP later; the release then goes to S_REFRESH for the rest
-  // of tRFC. Never on the release edge, so S_IDLE, which refreshes on the
-  // edge after it, still finds tRP met. 0 leaves every refresh to S_IDLE.
-  parameter bit RF_DRAIN = 1'b1,
-  // With RF_DRAIN, a stream line read (fast_stream) whose last READ comes
-  // within RF_EARLY clocks of the refresh falling due ends the refresh
-  // period on its drain's first edge, as the counter would have, and
-  // refreshes there: the stream's next line would otherwise find it due. The
-  // period only ever ends early. 0 never ends it early.
-  parameter [4:0] RF_EARLY = 5'd8,
-  // S_IDLE's refresh precharges on the edge that sees it and waits T_RP - 1,
-  // and S_REFRESH counts T_RFC - 1: tRP and tRFC exactly, as the row
-  // change's PRECHARGE and ACTIVE wait T_RP and T_RCD. 0 precharges from
-  // S_PRECHARGE a clock later and waits a clock more for each.
-  parameter bit RF_TIGHT = 1'b1,
-  // With RA_ROW_HOLD and RA_ROW_NEXT, a stream line read that is the last
-  // line of its row precharges on its drain's first edge, so S_IDLE opens
-  // the row after on the edge after the release. 0 closes it from S_IDLE.
-  parameter bit RA_END_PRE = 1'b1
+  parameter [12:0] REFRESH_PERIOD = 13'd730     // 7.3 us, < 7.8 us
 ) (
   input  wire         init,
   input  wire         clk,
@@ -202,7 +167,7 @@ module ki_sdram_burst #(
   // earlier; KillerInstinct.sdc gives that path two of these clocks.
   input  wire         fast_tog,
   input  wire  [24:0] fast_addr,
-  // A line read is a stream's; see RA_ROW_HOLD. Ignored without it.
+  // A line read is a stream's; see design choice 4.
   input  wire         fast_stream,
   output logic        fast_valid = 1'b0
 );
@@ -212,6 +177,15 @@ module ki_sdram_burst #(
   localparam [4:0] MAX_WRITE_BURST = 5'd16;
   localparam logic [12:0] MODE =
       {3'b000, 1'b1 /*single write*/, 2'b00, CAS_LATENCY, 1'b0, 3'b000};
+
+  // Idle clocks a row stays open after a direct qword read, and after a
+  // stream's line read in mid-row or the row after's ACTIVE (design choice
+  // 4).
+  localparam [5:0] ROW_HOLD    = 6'd32;
+  localparam [5:0] ROW_HOLD_RA = 6'd12;
+  // How close to the refresh falling due a stream line's last READ ends the
+  // refresh period early (design choice 6).
+  localparam [4:0] RF_EARLY = 5'd8;
 
   localparam [2:0] CMD_NOP          = 3'b111;
   localparam [2:0] CMD_ACTIVE       = 3'b011;
@@ -227,13 +201,13 @@ module ki_sdram_burst #(
     $error("ki_sdram_burst: T_RP %0d and T_RCD %0d must each be at least 2",
            T_RP, T_RCD);
   end
-  if ((RF_TIGHT || RF_DRAIN) && (T_RFC < 4'd2)) begin : g_bad_rfc
-    $error("ki_sdram_burst: T_RFC %0d must be at least 2 with RF_TIGHT or RF_DRAIN", T_RFC);
+  if (T_RFC < 4'd2) begin : g_bad_rfc
+    $error("ki_sdram_burst: T_RFC %0d must be at least 2", T_RFC);
   end
   // S_IDLE may decide a command on the edge after a release, two clocks after
   // a PRECHARGE the drain decided on the edge before it.
-  if ((RF_DRAIN || RA_END_PRE) && (T_RP != 4'd2)) begin : g_bad_drain_rp
-    $error("ki_sdram_burst: RF_DRAIN and RA_END_PRE need T_RP 2, not %0d", T_RP);
+  if (T_RP != 4'd2) begin : g_bad_drain_rp
+    $error("ki_sdram_burst: T_RP must be 2, not %0d", T_RP);
   end
   // rf_near compares refresh_cnt with REFRESH_PERIOD - RF_EARLY: at or past
   // the period that is zero or wraps, and every stream line would end it.
@@ -247,8 +221,8 @@ module ki_sdram_burst #(
   // $error, so an instance of a module that does not exist stops it
   // instead; the module's name says why.
   generate
-    if ((RF_DRAIN || RA_END_PRE) && (T_RP != 4'd2)) begin : g_need_t_rp_2
-      ki_sdram_burst_RF_DRAIN_and_RA_END_PRE_need_T_RP_2 stop ();
+    if (T_RP != 4'd2) begin : g_need_t_rp_2
+      ki_sdram_burst_needs_T_RP_2 stop ();
     end
   endgenerate
 
@@ -260,10 +234,9 @@ module ki_sdram_burst #(
     S_READ,
     S_READ_DRAIN,
     S_WRITE,
-    S_PRECHARGE,
     S_TURNAROUND,
     S_RP,
-    // tRCD after the ACTIVE of the row after a stream's row end (RA_ROW_NEXT).
+    // tRCD after the ACTIVE of the row after a stream's row end.
     S_RCD_NEXT
   } state_t;
 
@@ -275,13 +248,13 @@ module ki_sdram_burst #(
   logic refresh_due = 1'b0;
   logic [3:0] wait_cnt = '0;
   logic [3:0] refresh_wait = '0;
-  // The drain has closed the row (for a refresh, or for RA_END_PRE) / has
-  // decided its AUTO_REFRESH (tRFC then runs in refresh_wait).
+  // The drain has closed the row (for a refresh, or for a stream's row end)
+  // / has decided its AUTO_REFRESH (tRFC then runs in refresh_wait).
   logic rf_pre = 1'b0;
   logic rf_ref = 1'b0;
   // The edge before was in S_READ_DRAIN, so this one is not its first.
   logic drain_d = 1'b0;
-  // RF_EARLY: the refresh falls due within RF_EARLY clocks of the edge before.
+  // The refresh falls due within RF_EARLY clocks of the edge before.
   logic rf_near = 1'b0;
 
   // Clocks since the last ACTIVE, saturating. tRAS and tRC are the only two
@@ -303,10 +276,9 @@ module ki_sdram_burst #(
   // fast_valid. Changes only when a request is taken, after the last word of
   // the one before.
   logic        req_fast = 1'b0;
-  // ...and a line read marked fast_stream, with RA_ROW_HOLD. Changes with
-  // req_fast.
+  // ...and a line read marked fast_stream. Changes with req_fast.
   logic        req_stream = 1'b0;
-  // RA_ROW_NEXT: S_IDLE is to open the row after a stream line read that
+  // S_IDLE is to open the row after a stream line read that
   // ended its row, next_bank_row as {bank, row} - that row's number plus
   // one, carrying into the bank, registered at the release so that no adder
   // sits on S_IDLE's command path. Cleared by any request taken and by a
@@ -382,15 +354,15 @@ module ki_sdram_burst #(
   wire        new_req   = new_rd || new_we;
 
   // The direct port's request as it arrives, before req_* holds it, and
-  // whether S_IDLE starts it on this edge (FAST_ISSUE): a qword read - or,
-  // with RA_ROW_HOLD and RA_LINE_ISSUE, a line read marked fast_stream - to
-  // the open row, with nothing pending and no refresh due.
+  // whether S_IDLE starts it on this edge: a qword read, or a line read
+  // marked fast_stream, to the open row, with nothing pending and no refresh
+  // due.
   wire  [8:0] fast_col   = fast_addr[9:1];
   wire [12:0] fast_row   = fast_addr[22:10];
   wire  [1:0] fast_bank  = fast_addr[24:23];
   wire        fast_take  = !init && (fast_tog != fast_seen) && ready && !pending && !new_req;
-  wire        fast_line_issue = RA_ROW_HOLD && RA_LINE_ISSUE && !fast_addr[0] && fast_stream;
-  wire        fast_issue = FAST_ISSUE && HIT_READ && fast_take &&
+  wire        fast_line_issue = !fast_addr[0] && fast_stream;
+  wire        fast_issue = fast_take &&
                            (fast_addr[0] || fast_line_issue) &&
                            (state == S_IDLE) && !refresh_due && open_valid &&
                            (fast_row == open_row) && (fast_bank == open_bank);
@@ -424,13 +396,12 @@ module ki_sdram_burst #(
   wire  cas_take = cas_d3;
   // S_READ_DRAIN's release: the edge capturing the last word.
   wire  rd_release = (beats_out == 0) || ((beats_out == 5'd1) && cas_take);
-  // RF_EARLY on a stream line's drain's first edge.
-  wire  rf_early = (RF_EARLY != 0) && RF_DRAIN && !drain_d && rf_near && req_stream;
-  // RA_END_PRE on the drain's first edge of a stream line ending its row.
-  wire  end_pre = RA_END_PRE && RA_ROW_NEXT && RA_ROW_HOLD && !drain_d && req_stream &&
-                  (req_addr[9:5] == 5'h1F);
+  // The refresh period ended early, on a stream line's drain's first edge.
+  wire  rf_early = !drain_d && rf_near && req_stream;
+  // The row closed on the drain's first edge of a stream line ending its row.
+  wire  end_pre = !drain_d && req_stream && (req_addr[9:5] == 5'h1F);
   // The drain's AUTO_REFRESH, decided on this edge: tRP met after its close.
-  wire  dr_ref_now = RF_DRAIN && rf_pre && !rf_ref && (wait_cnt <= 1) && refresh_due;
+  wire  dr_ref_now = rf_pre && !rf_ref && (wait_cnt <= 1) && refresh_due;
 
   always_ff @(posedge clk) begin
     command    <= cmd_d;
@@ -473,7 +444,7 @@ module ki_sdram_burst #(
     end else begin
       refresh_cnt <= refresh_cnt + 1'b1;
     end
-    rf_near <= (RF_EARLY != 0) && (refresh_cnt >= REFRESH_PERIOD - RF_EARLY);
+    rf_near <= (refresh_cnt >= REFRESH_PERIOD - RF_EARLY);
     drain_d <= (state == S_READ_DRAIN);
 
     case (state)
@@ -505,18 +476,16 @@ module ki_sdram_burst #(
           // come back: refresh_due is still set, and open_valid will be clear.
           if (open_valid) begin
             if (ras_ok) begin
-              if (RF_TIGHT) begin
-                open_valid <= 1'b0;
-                cmd_d <= CMD_PRECHARGE;
-                a_d[10] <= 1'b1;             // all banks
-                wait_cnt <= T_RP - 4'd1;
-                state <= S_RP;
-              end else state <= S_PRECHARGE;
+              open_valid <= 1'b0;
+              cmd_d <= CMD_PRECHARGE;
+              a_d[10] <= 1'b1;             // all banks
+              wait_cnt <= T_RP - 4'd1;
+              state <= S_RP;
             end
           end else begin
             cmd_d <= CMD_AUTO_REFRESH;
             refresh_due <= 1'b0;
-            refresh_wait <= RF_TIGHT ? (T_RFC - 4'd1) : T_RFC;
+            refresh_wait <= T_RFC - 4'd1;
             next_due <= 1'b0;
             state <= S_REFRESH;
           end
@@ -531,7 +500,7 @@ module ki_sdram_burst #(
             beats_out <= req_we ? 5'd0 : req_burst;
             wr_index <= 4'd0;
             state <= req_we ? S_WRITE : S_READ;
-            if (HIT_READ && !req_we) begin
+            if (!req_we) begin
               // The first READ now, as S_READ would issue it a clock later;
               // S_READ goes on from the second.
               cmd_d <= CMD_READ;
@@ -571,8 +540,7 @@ module ki_sdram_burst #(
           end
         end else if (fast_issue) begin
           // The direct port's qword read - or stream line read - arriving on
-          // this edge: the ROW HIT branch above, from the request itself
-          // (FAST_ISSUE).
+          // this edge: the ROW HIT branch above, from the request itself.
           hold_cnt <= 6'd0;
           ba_d <= fast_bank;
           beats_out <= fast_addr[0] ? 5'd4 : 5'd16;
@@ -599,7 +567,7 @@ module ki_sdram_burst #(
           wait_cnt <= T_RP - 4'd1;
           state <= S_RP;
         end else if (next_due && !open_valid && rc_ok && !new_req && !fast_take) begin
-          // RA_ROW_NEXT: the row after a stream's row end, with no request
+          // The row after a stream's row end, with no request
           // behind it, opened and held for the stream's next line (design
           // choice 4). Last, so a refresh, a pending request and a request
           // taken on this edge all come first; the take-edge READ, the hold
@@ -651,7 +619,7 @@ module ki_sdram_burst #(
       S_READ_DRAIN: begin
         // Wait for every issued read to return before closing the row.
         // STRICTLY zero outstanding. Releasing while the final beat is still in
-        // the CAS pipe would be wrong now that IDLE can start the next burst
+        // the CAS pipe would be wrong, because IDLE can start the next burst
         // immediately on a row hit: that last beat would land after beats_out
         // has been reloaded, and be counted into the following burst.
         //
@@ -660,32 +628,31 @@ module ki_sdram_burst #(
         // is left in the pipe, and the next burst cannot load beats_out before
         // the next edge. It saves the clock spent seeing zero.
         //
-        // RF_DRAIN: a refresh due, or with RF_EARLY about to fall due behind
-        // a stream line, closes the row and refreshes while the last words
-        // are on their way in.
-        if (RF_DRAIN || RA_END_PRE) begin
-          if (rf_ref) begin
-            if (refresh_wait > 1) refresh_wait <= refresh_wait - 1'b1;
-          end else if (rf_pre) begin
-            if (wait_cnt > 1) wait_cnt <= wait_cnt - 1'b1;
-            else if (dr_ref_now) begin
-              cmd_d <= CMD_AUTO_REFRESH;
-              refresh_due <= 1'b0;
-              refresh_wait <= T_RFC - 4'd1;
-              rf_ref <= 1'b1;
-            end
-          end else if (((RF_DRAIN && (refresh_due || rf_early)) || end_pre) &&
-                       open_valid && ras_ok && !rd_release) begin
-            open_valid <= 1'b0;
-            cmd_d <= CMD_PRECHARGE;
-            a_d[10] <= 1'b1;             // all banks
-            wait_cnt <= T_RP;
-            rf_pre <= 1'b1;
-            if (rf_early && !refresh_due) begin
-              // RF_EARLY: the period ends here, as the counter ends it.
-              refresh_cnt <= '0;
-              refresh_due <= 1'b1;
-            end
+        // A refresh due, or about to fall due behind a stream line, closes
+        // the row and refreshes while the last words are on their way in; a
+        // stream line ending its row closes it for the row after (design
+        // choices 4 and 6).
+        if (rf_ref) begin
+          if (refresh_wait > 1) refresh_wait <= refresh_wait - 1'b1;
+        end else if (rf_pre) begin
+          if (wait_cnt > 1) wait_cnt <= wait_cnt - 1'b1;
+          else if (dr_ref_now) begin
+            cmd_d <= CMD_AUTO_REFRESH;
+            refresh_due <= 1'b0;
+            refresh_wait <= T_RFC - 4'd1;
+            rf_ref <= 1'b1;
+          end
+        end else if ((refresh_due || rf_early || end_pre) &&
+                     open_valid && ras_ok && !rd_release) begin
+          open_valid <= 1'b0;
+          cmd_d <= CMD_PRECHARGE;
+          a_d[10] <= 1'b1;             // all banks
+          wait_cnt <= T_RP;
+          rf_pre <= 1'b1;
+          if (rf_early && !refresh_due) begin
+            // The period ends here, as the counter ends it.
+            refresh_cnt <= '0;
+            refresh_due <= 1'b1;
           end
         end
         if (rd_release) begin
@@ -698,9 +665,9 @@ module ki_sdram_burst #(
           hold_cnt <= (rf_pre || rf_ref) ? 6'd0 :
                       (req_fast && req_burst == 5'd4) ? ROW_HOLD :
                       (req_stream && (req_addr[9:5] != 5'h1F)) ? ROW_HOLD_RA : 6'd0;
-          // One that does, with RA_ROW_NEXT: the row after is opened once
-          // this one has closed - not after a refresh, which drops it.
-          next_due <= RA_ROW_NEXT && req_stream && (req_addr[9:5] == 5'h1F) &&
+          // One that does: the row after is opened once this one has
+          // closed - not after a refresh, which drops it.
+          next_due <= req_stream && (req_addr[9:5] == 5'h1F) &&
                       !(rf_ref || (rf_pre && refresh_due));
           next_bank_row <= req_addr[24:10] + 15'd1;
           rf_pre <= 1'b0;
@@ -725,26 +692,18 @@ module ki_sdram_burst #(
         if (beats_left <= 1) begin
           wait_cnt <= T_WR;
           state <= S_TURNAROUND;         // row open until S_IDLE closes it
-          if (WR_EARLY_READY) ready <= 1'b1;
+          ready <= 1'b1;
         end else beats_left <= beats_left - 1'b1;
       end
 
-      // tWR before any PRECHARGE that follows, and tWTR before any READ. With
-      // WR_EARLY_READY a request may be taken here; it is pending, and ready
-      // stays low for it, as in S_RP.
+      // tWR before any PRECHARGE that follows, and tWTR before any READ. A
+      // request may be taken here; it is pending, and ready stays low for it,
+      // as in S_RP.
       S_TURNAROUND: begin
         if (wait_cnt <= 1) begin
           if (!pending) ready <= 1'b1;
           state <= S_IDLE;
         end else wait_cnt <= wait_cnt - 1'b1;
-      end
-
-      S_PRECHARGE: begin
-        open_valid <= 1'b0;
-        cmd_d <= CMD_PRECHARGE;
-        a_d[10] <= 1'b1;             // all banks
-        wait_cnt <= T_RP;
-        state <= S_RP;
       end
 
       S_RP: begin
@@ -787,11 +746,9 @@ module ki_sdram_burst #(
       act_age <= 5'd31;
     end
 
-    // Edge-detected request capture, matching the stock controller's contract.
-    // Every request is held in req_* and left pending; S_IDLE acts on it from
-    // there on a later clock - but for the direct port's qword read that
-    // S_IDLE started on this edge (FAST_ISSUE), which is held but not
-    // pending.
+    // Edge-detected request capture. Every request is held in req_* and left pending; S_IDLE acts on it from
+    // there on a later clock - but for the direct port's read that S_IDLE
+    // started on this edge, which is held but not pending.
     old_we <= we;
     if (new_we) begin
       req_addr <= addr;
@@ -828,7 +785,7 @@ module ki_sdram_burst #(
       pending <= !fast_issue;
       ready <= 1'b0;
       req_fast <= 1'b1;
-      req_stream <= RA_ROW_HOLD && !fast_addr[0] && fast_stream;
+      req_stream <= !fast_addr[0] && fast_stream;
       next_due <= 1'b0;
       fast_seen <= fast_tog;
     end

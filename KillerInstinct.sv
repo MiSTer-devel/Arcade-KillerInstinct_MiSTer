@@ -173,7 +173,9 @@ wire sd_buff_wr;
 //   clk_core          0         50 MHz   0       video, I/O, bridge
 //   clk_cpu           1         100 MHz  0       the MIPS core. RELATED to
 //                                                clk_core at 2:1 and timed
-//                                                against it (SYNC_CROSSING);
+//                                                against it: the CPU
+//                                                crosses without
+//                                                synchronisers;
 //                                                see KillerInstinct.sdc.
 //   clk_ddr           2         100 MHz  0       DDRAM_CLK and the bridge's
 //                                                DDR side
@@ -187,12 +189,9 @@ wire sd_buff_wr;
 // are kept as two wires because they have two unrelated jobs, and because the
 // merge is the fitter's decision to make, not this file's.
 //
-// Inside the CPU, clk_cpu arrives as clk93 and clk_core as clk1x. Those names
-// come from the N64 core this CPU is derived from (93.75 and 62.5 MHz) and are
-// wrong here - but the `_93` and `_1x` SUFFIXES on ~28 signals below them are
-// a domain tag that CDC code depends on, so renaming the clocks without
-// renaming every suffix would be worse than leaving both. This table is the
-// mapping.
+// Inside the CPU, clk_cpu arrives as clk2x and clk_core as clk1x: the CPU
+// clock must be exactly twice clk_core. The `_2x` and `_1x` suffixes on the
+// signals below them tag each one's domain, which the CDC code depends on.
 //
 // The SDRAM phases above cannot be derived from nominal timing;
 // rtl/pll/pll_0002.v records why.
@@ -673,7 +672,7 @@ assign io_done = board_io_done | ata_done;
 wire        cpu_fast_ok;
 wire        cpu_fast_req_tog;
 wire [31:0] cpu_fast_req_line;
-// The line read is a stream's; ki_sdram_burst's RA_ROW_HOLD.
+// The line read is a stream's; ki_sdram_burst holds its row open.
 wire        cpu_fast_req_stream;
 wire        cpu_fast_window;
 wire        cpu_fast_beat;
@@ -693,7 +692,7 @@ wire        controller_fast_valid;
 ki_cpu_core cpu
 (
 	.clk1x(clk_core),
-	.clk93(clk_cpu),
+	.clk2x(clk_cpu),
 	.reset(cpu_reset),
 	.irq(cpu_irq),
 	.pause(core_pause),
@@ -1067,4 +1066,3 @@ assign FB_PAL_WR = 1'b0;
 `endif
 
 endmodule
-

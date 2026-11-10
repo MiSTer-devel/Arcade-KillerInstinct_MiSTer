@@ -26,26 +26,23 @@ entity cpu_cop0 is
       -- with UX set reaches under a 32-bit kernel. With this set it is
       -- written from the same sign-extended 32-bit address as BadVAddr, so it
       -- adds no width to the capture.
-      ADDR32_ONLY           : boolean := false
+      ADDR32_ONLY           : boolean := false;
+      -- cpu's NO_ADDRESS_ERROR: no AdEL or AdES reaches exception3, so the
+      -- address-error capture into BadVAddr, Context, XContext and EntryHi is
+      -- not built. TLB exceptions still capture their address.
+      NO_ADDRESS_ERROR      : boolean := false
    );
    port 
    (
-      clk93                   : in  std_logic;
-      ce                      : in  std_logic;
+      clk2x                   : in  std_logic;
       stall                   : in  unsigned(4 downto 0);
       stall4Masked            : in  unsigned(4 downto 0);
       executeNew              : in  std_logic;
       reset                   : in  std_logic;
-      preNMI                  : in  std_logic;
       -- The system is paused: Count stands still, so software that times
       -- itself with Count sees no time pass.
       cpuPaused               : in  std_logic := '0';
-      
-      RANDOMMISS              : in  unsigned(3 downto 0);
-      DISABLE_BOOTCOUNT       : in  std_logic;
-      DISABLE_DTLBMINI        : in  std_logic;
-      ALECK64                 : in  std_logic;
-            
+
       error_exception         : out std_logic := '0';
       error_TLB               : out std_logic := '0';
             
@@ -127,14 +124,7 @@ entity cpu_cop0 is
       TLB_dataStall           : out std_logic;
       TLB_dataUnStall         : out std_logic;
       TLB_dataAddrOutFound    : out unsigned(31 downto 0);
-      TLB_dataAddrOutLookup   : out unsigned(31 downto 0);
-            
-      SS_reset                : in  std_logic;
-      loading_savestate       : in  std_logic;
-      SS_DataWrite            : in  std_logic_vector(63 downto 0);
-      SS_Adr                  : in  unsigned(11 downto 0);
-      SS_wren_CPU             : in  std_logic;
-      SS_rden_CPU             : in  std_logic
+      TLB_dataAddrOutLookup   : out unsigned(31 downto 0)
    );
 end entity;
 
@@ -230,10 +220,6 @@ architecture arch of cpu_cop0 is
    
    signal cop0Written6                    : integer range 0 to 2 := 0;
    signal cop0Written9                    : integer range 0 to 3 := 0;
-   signal cop0FirstWrite9                 : std_logic := '0';
-   signal DISABLE_BOOTCOUNT_INTERN        : std_logic := '0';
-   
-   --signal irq_offCount                    : unsigned(13 downto 0);
    
    
    -- tlb
@@ -283,7 +269,6 @@ architecture arch of cpu_cop0 is
    signal TLBINIT_virtAddr                : std_logic_vector(26 downto 0);
    signal TLBINIT_ASID                    : std_logic_vector(7 downto 0);
    signal TLBINIT_region                  : std_logic_vector(1 downto 0);
-   signal TLBINIT_random                  : std_logic;
    
    signal TLBWRITE_global                 : std_logic;
    signal TLBWRITE_valid0                 : std_logic;
@@ -298,7 +283,6 @@ architecture arch of cpu_cop0 is
    signal TLBWRITE_virtAddr               : unsigned(26 downto 0);
    signal TLBWRITE_ASID                   : unsigned(7 downto 0);
    signal TLBWRITE_region                 : unsigned(1 downto 0);
-   signal TLBWRITE_random                 : std_logic;
    
    signal TLBREAD_global                  : std_logic;
    signal TLBREAD_valid0                  : std_logic;
@@ -313,13 +297,12 @@ architecture arch of cpu_cop0 is
    signal TLBREAD_virtAddr                : unsigned(26 downto 0);
    signal TLBREAD_ASID                    : unsigned(7 downto 0);
    signal TLBREAD_region                  : unsigned(1 downto 0);
-   signal TLBREAD_random                  : std_logic;
    
    signal TLBMEM_writeEnable              : std_logic;
-   signal TLBMEM_writeData                : std_logic_vector(100 downto 0);
+   signal TLBMEM_writeData                : std_logic_vector(99 downto 0);
    signal TLBMEM_writeAddr                : std_logic_vector(5 downto 0);
    signal TLBMEM_readAddr                 : std_logic_vector(5 downto 0);
-   signal TLBMEM_readData                 : std_logic_vector(100 downto 0);
+   signal TLBMEM_readData                 : std_logic_vector(99 downto 0);
    
    signal TLB_ExcInstrRead                : std_logic;
    signal TLB_ExcInstrMiss                : std_logic;
@@ -343,10 +326,8 @@ architecture arch of cpu_cop0 is
    signal TLB_fetchExcNotFound            : std_logic := '0';
    signal TLB_fetchCached                 : std_logic := '0';
    signal TLB_fetchDirty                  : std_logic := '0';
-   signal TLB_fetchRandom                 : std_logic := '0';
    signal TLB_fetchSource                 : unsigned(5 downto 0) := (others => '0');
    signal TLB_fetchAddrOut                : unsigned(31 downto 0) := (others => '0');
-   signal TLB_fetchAddrOutMasked          : unsigned(31 downto 0) := (others => '0');
    
 -- synthesis translate_off
    type tTLBENTRY is record
@@ -363,15 +344,11 @@ architecture arch of cpu_cop0 is
       virtAddr               : unsigned(26 downto 0);
       ASID                   : unsigned(7 downto 0);
       region                 : unsigned(1 downto 0);
-      random                 : std_logic;
    end record; 
    type tTLBENTRYS  is array(0 to 63) of tTLBENTRY;
    signal TLBENTRYS : tTLBENTRYS;
 -- synthesis translate_on
    
-   -- savestates
-   type t_ssarray is array(0 to 31) of unsigned(63 downto 0);
-   signal ss_in  : t_ssarray := (others => (others => '0'));  
 
 begin 
 
@@ -533,21 +510,20 @@ begin
       end case;
    end process;
 
-   process (clk93)
+   process (clk2x)
       variable mode        : unsigned(1 downto 0); 
       variable nextEPC     : unsigned(63 downto 0);
       variable excAddr     : unsigned(63 downto 0);   
-      variable excAddrWE   : std_logic;   
+      variable excAddrWE   : std_logic;
+      variable excFetch    : std_logic;   
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
          error_exception     <= '0';
          error_TLB           <= '0';
          TLB_Instr_fetchDone <= '0';
          TLB_Data_fetchDone  <= '0';
          TLBInvalidate       <= '0';
-      
-         DISABLE_BOOTCOUNT_INTERN <= DISABLE_BOOTCOUNT;
       
          if (COP0_12_SR_errorLevel = '1') then
             eretPC <= COP0_30_EPCERROR;
@@ -580,19 +556,12 @@ begin
             end if;
             
          end if;
-         if (bit64mode = '1') then
-            exceptionPC(63 downto 32) <= (others => '1');
-         else
-            exceptionPC(63 downto 32) <= (others => '0');
-         end if;
+         -- Every vector has bit 31 set, and a 32-bit address is its sign
+         -- extension, so the upper half is all ones in either mode. Zeros here
+         -- made the vector a User-segment address to a fetch still decoding
+         -- in 64-bit mode (an exception from User code with UX set).
+         exceptionPC(63 downto 32) <= (others => '1');
          
-         --if (COP0_12_SR_interruptEnable = '1' or COP0_12_SR_exceptionLevel = '1') then    
-         --   irq_offCount <= (others => '0');
-         --else
-         --   irq_offCount <= irq_offCount + 1;
-         --end if;
-         --error_exception <= irq_offCount(13);
-      
          if (reset = '1') then
          
             COP0_0_INDEX_tlbEntry           <= (others => '0');
@@ -611,41 +580,41 @@ begin
             COP0_4_CONTEXT_PTE              <= (others => '0');
             COP0_4_CONTEXT_BADVPN           <= (others => '0');
             COP0_5_PAGEMASK                 <= (others => '0');
-            COP0_6_WIRED                    <= ss_in(6)(5 downto 0); -- (others => '0');
+            COP0_6_WIRED                    <= (others => '0');
             COP0_8_BADVIRTUALADDRESS        <= (others => '0');
-            COP0_9_COUNT                    <= ss_in(9)(31 downto 0) & '0'; -- (others => '0');
+            COP0_9_COUNT                    <= (others => '0');
             COP0_10_ENTRYHI_addressSpaceID  <= (others => '0'); 
             COP0_10_ENTRYHI_virtualAddress  <= (others => '0'); 
             COP0_10_ENTRYHI_region          <= (others => '0'); 
-            COP0_11_COMPARE                 <= ss_in(11)(31 downto 0); -- (others => '0');
-            COP0_12_SR_interruptEnable      <= ss_in(12)(0);           -- '0';
-            COP0_12_SR_exceptionLevel       <= ss_in(12)(1);           -- '0';
-            COP0_12_SR_errorLevel           <= ss_in(12)(2);           -- '1';
-            COP0_12_SR_privilegeMode        <= ss_in(12)(4 downto 3);  -- (others => '0');
-            COP0_12_SR_userExtendedAddr     <= ss_in(12)(5);           -- '0';
-            COP0_12_SR_supervisorAddr       <= ss_in(12)(6);           -- '0';
-            COP0_12_SR_kernelExtendedAddr   <= ss_in(12)(7);           -- '0';
-            COP0_12_SR_interruptMask        <= ss_in(12)(15 downto 8); -- (others => '1');
-            COP0_12_SR_de                   <= ss_in(12)(16);          -- '0';
-            COP0_12_SR_ce                   <= ss_in(12)(17);          -- '0';
-            COP0_12_SR_condition            <= ss_in(12)(18);          -- '0';
-            COP0_12_SR_softReset            <= ss_in(12)(20);          -- '1';
-            COP0_12_SR_tlbShutdown          <= ss_in(12)(21);          -- '0';
-            COP0_12_SR_vectorLocation       <= ss_in(12)(22);          -- '1';
-            COP0_12_SR_instructionTracing   <= ss_in(12)(24);          -- '0';
-            COP0_12_SR_reverseEndian        <= ss_in(12)(25);          -- '0';
-            COP0_12_SR_floatingPointMode    <= ss_in(12)(26);          -- '1';
-            COP0_12_SR_lowPowerMode         <= ss_in(12)(27);          -- '0';
-            COP0_12_SR_enable_cop0          <= ss_in(12)(28);          -- '1';
-            COP0_12_SR_enable_cop1          <= ss_in(12)(29);          -- '1';
-            COP0_12_SR_enable_cop2          <= ss_in(12)(30);          -- '0';
-            COP0_12_SR_enable_cop3          <= ss_in(12)(31);          -- '0';
+            COP0_11_COMPARE                 <= (others => '0');
+            COP0_12_SR_interruptEnable      <= '0';
+            COP0_12_SR_exceptionLevel       <= '0';
+            COP0_12_SR_errorLevel           <= '1';
+            COP0_12_SR_privilegeMode        <= (others => '0');
+            COP0_12_SR_userExtendedAddr     <= '0';
+            COP0_12_SR_supervisorAddr       <= '0';
+            COP0_12_SR_kernelExtendedAddr   <= '0';
+            COP0_12_SR_interruptMask        <= (others => '1');
+            COP0_12_SR_de                   <= '0';
+            COP0_12_SR_ce                   <= '0';
+            COP0_12_SR_condition            <= '0';
+            COP0_12_SR_softReset            <= '1';
+            COP0_12_SR_tlbShutdown          <= '0';
+            COP0_12_SR_vectorLocation       <= '1';
+            COP0_12_SR_instructionTracing   <= '0';
+            COP0_12_SR_reverseEndian        <= '0';
+            COP0_12_SR_floatingPointMode    <= '1';
+            COP0_12_SR_lowPowerMode         <= '0';
+            COP0_12_SR_enable_cop0          <= '1';
+            COP0_12_SR_enable_cop1          <= '1';
+            COP0_12_SR_enable_cop2          <= '0';
+            COP0_12_SR_enable_cop3          <= '0';
             COP0_13_CAUSE_exceptionCode     <= (others => '0'); 
             COP0_13_CAUSE_interruptPending  <= (others => '0'); 
             COP0_13_CAUSE_coprocessorError  <= (others => '0'); 
-            COP0_13_CAUSE_branchDelay       <= ss_in(13)(31);          -- '0'
-            COP0_14_EPC                     <= 32x"0" & ss_in(14)(31 downto 0); -- (others => '0'); will not work for savestates with TLB
-            COP0_16_CONFIG_cacheAlgoKSEG0   <= ss_in(16)(1 downto 0); -- (others => '0'); required for systemtest
+            COP0_13_CAUSE_branchDelay       <= '0';
+            COP0_14_EPC                     <= (others => '0');
+            COP0_16_CONFIG_cacheAlgoKSEG0   <= (others => '0');
             COP0_16_CONFIG_cu               <= (others => '0'); 
             if LITTLE_ENDIAN then
                COP0_16_CONFIG_bigEndian     <= '0';
@@ -671,7 +640,6 @@ begin
             
             cop0Written6                    <= 0;
             cop0Written9                    <= 0;
-            cop0FirstWrite9                 <= (not loading_savestate) and (not DISABLE_BOOTCOUNT_INTERN);
             
             TLBState                        <= TLBIDLE;
             TLBDone                         <= '0';
@@ -682,13 +650,10 @@ begin
             exlAtException                  <= '0';
             xtlbAtException                 <= '0';
 
-         elsif (ce = '1') then
+         else
          
             -- interrupt
             COP0_13_CAUSE_interruptPending(3 downto 2) <= unsigned(irqRequest);
-            if (preNMI = '1') then
-               COP0_13_CAUSE_interruptPending(4) <= preNMI;
-            end if;
 
             -- count
             if (cop0Written9 = 0) then
@@ -727,13 +692,6 @@ begin
                   COP0_17_LOADLINKEDADDRESS <= 39x"0" & executeLLAddr(28 downto 4);
                end if;
             end if;
-            
-            -- when debugging systemtest...
--- synthesis translate_off
-            --COP0_9_COUNT  <= (others => '0');
-            --COP0_1_RANDOM <= (others => '0');
-            --COP0_13_CAUSE_interruptPending(7) <= '0';
--- synthesis translate_on
             
             -- CPU access
             if (exception = '1') then
@@ -783,10 +741,6 @@ begin
                         when 9 => 
                            COP0_9_COUNT    <= writeValue(31 downto 0) & '0';
                            cop0Written9    <= 3;
-                           cop0FirstWrite9 <= '0';
-                           if (cop0FirstWrite9 = '1') then -- compensate for RDRAM calibration wait time, e.g. battletanx or waverace shindue
-                              COP0_9_COUNT(24 downto 21) <= x"F";
-                           end if;
                         
                         when 10 =>
                            COP0_10_ENTRYHI_addressSpaceID <= writeValue(7 downto 0);
@@ -962,11 +916,13 @@ begin
             
             -- addr exception
             excAddrWE := '0';
+            excFetch  := '0';
             excAddr   := TLB_dataAddrIn; -- unmodified mem address
             
-            if (exception3 = '1' and (exceptionCode_3 = x"4" or exceptionCode_3 = x"5")) then
+            if ((not NO_ADDRESS_ERROR) and exception3 = '1' and (exceptionCode_3 = x"4" or exceptionCode_3 = x"5")) then
                excAddrWE := '1';
                if (exceptionNewPC = '1') then
+                  excFetch := '1';
                   excAddr := exceptionPCStore;
                end if;
             end if;
@@ -978,6 +934,7 @@ begin
             
             if (TLB_ExcInstrRead = '1') then
                excAddrWE := '1';
+               excFetch  := '1';
                excAddr   := TLB_Instr_fetchAddrIn; 
             end if;
 
@@ -1014,13 +971,16 @@ begin
                   COP0_20_XCONTEXT_BadVPN        <= excAddr(39 downto 13);
                end if;
 
-               -- An R4600 taking an exception in User or Supervisor mode with
+               -- An R4600 taking an exception on a User-mode load or store with
                -- 32-bit addressing, on an address with bit 31 set, reports
                -- BadVAddr bits 63:32 as 0x3FFFFF00, not as a sign extension.
-               -- Measured on a KI board for a User load from KSEG0; Kernel
-               -- mode, and addresses below 0x80000000, sign-extend.
-               if (xtlbNow = '0' and excAddr(31) = '1' and COP0_12_SR_exceptionLevel = '0' and
-                   COP0_12_SR_errorLevel = '0' and COP0_12_SR_privilegeMode /= "00") then
+               -- Measured on a KI board for User loads from KSEG0-3 and a User
+               -- store to KSEG0. A User fetch from KSEG0, a Supervisor load
+               -- from KSEG0, Kernel mode and addresses below 0x80000000
+               -- sign-extend.
+               if (xtlbNow = '0' and excAddr(31) = '1' and excFetch = '0' and
+                   COP0_12_SR_exceptionLevel = '0' and COP0_12_SR_errorLevel = '0' and
+                   COP0_12_SR_privilegeMode = "10") then
                   COP0_8_BADVIRTUALADDRESS(63 downto 32) <= x"3FFFFF00";
                end if;
             end if;
@@ -1148,7 +1108,6 @@ begin
                            end if;
                            
                            TLB_fetchDirty <= TLB_dirty;
-                           TLB_fetchRandom <= TLBREAD_random;
 
                            
                            if (TLBState = TLBINSTR) then
@@ -1165,11 +1124,11 @@ begin
             
             end case;
 
-         end if; -- ce
+         end if;
          
          TLB_init <= '0';
          
-         if (SS_reset = '1' or TLB_InstrClearEna = '1') then
+         if (reset = '1' or TLB_InstrClearEna = '1') then
             if (TLB_InstrClearEna = '1') then
                TLB_init         <= '1';
                TLB_resetAddr    <= TLB_InstrClearIndex;
@@ -1190,7 +1149,6 @@ begin
             TLBINIT_virtAddr <= (others => '0');
             TLBINIT_ASID     <= (others => '0');
             TLBINIT_region   <= (others => '0');
-            TLBINIT_random   <= '0';
          end if;
          
          if (TLB_resetMode = '1') then
@@ -1200,32 +1158,6 @@ begin
                TLB_resetMode <= '0';
             end if;
          end if;
-         
-         if (SS_wren_CPU = '1') then
-            if (SS_Adr(0) = '0') then
-               TLBINIT_phyAddr0 <= SS_DataWrite(19 downto  0);
-               TLBINIT_phyAddr1 <= SS_DataWrite(51 downto 32);
-               TLBINIT_cache0   <= SS_DataWrite(60 downto 58);
-               TLBINIT_cache1   <= SS_DataWrite(63 downto 61);
-            else
-               TLBINIT_virtAddr <= SS_DataWrite(26 downto  0);
-               TLBINIT_ASID     <= SS_DataWrite(39 downto 32);
-               TLBINIT_pageMask <= SS_DataWrite(51 downto 40);
-               TLBINIT_region   <= SS_DataWrite(55 downto 54);
-               TLBINIT_global   <= SS_DataWrite(56);
-               TLBINIT_valid0   <= SS_DataWrite(57);
-               TLBINIT_valid1   <= SS_DataWrite(58);
-               TLBINIT_dirty0   <= SS_DataWrite(59);
-               TLBINIT_dirty1   <= SS_DataWrite(60);
-               TLBINIT_random   <= SS_DataWrite(61);
-            end if;
-         end if;
-         
-         if (SS_wren_CPU = '1' and SS_Adr >= 256 and SS_Adr < 256 + 2 * (TLB_LAST + 1)) then
-            TLB_resetAddr <= SS_Adr(6 downto 1);
-            TLB_init      <= SS_Adr(0);
-         end if;
-         
          
       end if;
    end process;
@@ -1260,7 +1192,6 @@ begin
    TLBWRITE_virtAddr(11 downto  0) <= COP0_10_ENTRYHI_virtualAddress(11 downto 0) and (not TLBWRITE_pageMask);
    TLBWRITE_ASID     <= COP0_10_ENTRYHI_addressSpaceID;
    TLBWRITE_region   <= COP0_10_ENTRYHI_region;
-   TLBWRITE_random   <= TLBWR;
    
    TLBMEM_writeData(0)            <= TLBINIT_global    when (TLB_init = '1') else TLBWRITE_global;  
    TLBMEM_writeData(1)            <= TLBINIT_valid0    when (TLB_init = '1') else TLBWRITE_valid0;  
@@ -1275,7 +1206,6 @@ begin
    TLBMEM_writeData(89 downto 63) <= TLBINIT_virtAddr  when (TLB_init = '1') else std_logic_vector(TLBWRITE_virtAddr);
    TLBMEM_writeData(97 downto 90) <= TLBINIT_ASID      when (TLB_init = '1') else std_logic_vector(TLBWRITE_ASID);    
    TLBMEM_writeData(99 downto 98) <= TLBINIT_region    when (TLB_init = '1') else std_logic_vector(TLBWRITE_region); 
-   TLBMEM_writeData(100)          <= TLBINIT_random    when (TLB_init = '1') else TLBWRITE_random;   
 
    TLBMEM_writeEnable <= '1' when (TLB_init = '1') else
                          '1' when (exception = '0' and stall4Masked = 0 and executeNew = '1' and (TLBWI = '1' or TLBWR = '1')) else 
@@ -1288,11 +1218,11 @@ begin
    iTLBMEM : entity mem.RamMLAB
 	GENERIC MAP
    (
-      width      => 101,
+      width      => 100,
       widthad    => 6
 	)
 	PORT MAP (
-      inclock    => clk93,
+      inclock    => clk2x,
       wren       => TLBMEM_writeEnable,
       data       => TLBMEM_writeData,
       wraddress  => TLBMEM_writeAddr,
@@ -1316,23 +1246,12 @@ begin
    TLBREAD_virtAddr <= unsigned(TLBMEM_readData(89 downto 63));
    TLBREAD_ASID     <= unsigned(TLBMEM_readData(97 downto 90));
    TLBREAD_region   <= unsigned(TLBMEM_readData(99 downto 98));
-   TLBREAD_random   <= TLBMEM_readData(100);
-   
-   -- A stock N64 exposes a 29-bit physical bus, so the console path masks
-   -- TLB PFNs as before. Aleck64 software deliberately maps full 32-bit
-   -- physical regions at C0000000, C0800000 and D0000000; truncating those
-   -- aliases input/video/board RAM onto ordinary N64 memory.
-   TLB_fetchAddrOutMasked <= TLB_fetchAddrOut when ALECK64 = '1' else
-                             "000" & TLB_fetchAddrOut(28 downto 0);
    
    icpu_TLB_instr : entity work.cpu_TLB_instr
    port map
    (
-      clk93                => clk93,    
-      ce                   => ce,
+      clk2x                => clk2x,    
       reset                => reset,   
-
-      RANDOMMISS           => RANDOMMISS,
                                        
       TLBInvalidate        => TLBInvalidate,          
                                        
@@ -1357,9 +1276,8 @@ begin
       TLB_fetchExcInvalid  => TLB_fetchExcInvalid,  
       TLB_fetchExcNotFound => TLB_fetchExcNotFound,
       TLB_fetchCached      => TLB_fetchCached,     
-      TLB_fetchRandom      => TLB_fetchRandom,
       TLB_fetchSource      => TLB_fetchSource,
-      TLB_fetchAddrOut     => TLB_fetchAddrOutMasked 
+      TLB_fetchAddrOut     => TLB_fetchAddrOut
    );
    
    icpu_TLB_data : entity work.cpu_TLB_data
@@ -1369,10 +1287,8 @@ begin
    )
    port map
    (
-      clk93                => clk93,          
+      clk2x                => clk2x,          
       reset                => reset,    
-
-      DISABLE_DTLBMINI     => DISABLE_DTLBMINI,
                                        
       TLBInvalidate        => TLBInvalidate,                 
                                        
@@ -1400,13 +1316,13 @@ begin
       TLB_fetchCached      => TLB_fetchCached,     
       TLB_fetchDirty       => TLB_fetchDirty,     
       TLB_fetchSource      => TLB_fetchSource, 
-      TLB_fetchAddrOut     => TLB_fetchAddrOutMasked 
+      TLB_fetchAddrOut     => TLB_fetchAddrOut
    );
    
    -- synthesis translate_off
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
          if (TLBMEM_writeEnable = '1') then
             TLBENTRYS(to_integer(unsigned(TLBMEM_writeAddr))).global   <= TLBMEM_writeData(0);           
             TLBENTRYS(to_integer(unsigned(TLBMEM_writeAddr))).valid0   <= TLBMEM_writeData(1);           
@@ -1421,37 +1337,11 @@ begin
             TLBENTRYS(to_integer(unsigned(TLBMEM_writeAddr))).virtAddr <= unsigned(TLBMEM_writeData(89 downto 63));
             TLBENTRYS(to_integer(unsigned(TLBMEM_writeAddr))).ASID     <= unsigned(TLBMEM_writeData(97 downto 90));
             TLBENTRYS(to_integer(unsigned(TLBMEM_writeAddr))).region   <= unsigned(TLBMEM_writeData(99 downto 98));
-            TLBENTRYS(to_integer(unsigned(TLBMEM_writeAddr))).random   <= TLBMEM_writeData(100);
          end if;
       end if;
    end process;
 -- synthesis translate_on
    
---##############################################################
---############################### savestates
---##############################################################
-
-   process (clk93)
-   begin
-      if (rising_edge(clk93)) then
-      
-         if (SS_reset = '1') then
-         
-            for i in 0 to 31 loop
-               ss_in(i) <= (others => '0');
-            end loop;
-            
-            ss_in(12)(31 downto 0) <= x"3450FF04"; --cop12
-            ss_in(16)(31 downto 0) <= x"7006E460"; --cop16
-            
-         elsif (SS_wren_CPU = '1' and SS_Adr >= 64 and SS_Adr < 96) then
-            ss_in(to_integer(SS_Adr(4 downto 0))) <= unsigned(SS_DataWrite);
-         end if;
-      
-      end if;
-   end process;
-
-
    debug_cause(16)           <= COP0_12_SR_exceptionLevel;
    debug_cause(17)           <= COP0_12_SR_errorLevel;
    debug_cause(19 downto 18) <= COP0_12_SR_privilegeMode;

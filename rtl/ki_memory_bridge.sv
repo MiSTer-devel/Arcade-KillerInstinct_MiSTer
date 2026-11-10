@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 `default_nettype none
 
-module ki_memory_bridge #(
-  // A read of a framebuffer line streams, a qword a cycle - a read-ahead's
-  // with FB_RA_GAPS hand-backs; see FB_READ_ISSUE. 0 reads every qword in
-  // two cycles.
-  parameter bit FB_STREAM = 1'b1,
-  // A stream of gathered stores to SDRAM keeps moving: a line's burst goes
-  // out on the edge that absorbs its fourth store, one store is absorbed
-  // while the line is written, and the store waiting when the write completes
-  // is absorbed on that edge. See THE STORE STREAM. 0 sends a line from
-  // SDRAM_WB_FLUSH_ISSUE and takes no store until it is written.
-  parameter bit WB_STREAM = 1'b1,
-  // A framebuffer read of a qword or less gives the RAM its address from
-  // IDLE and goes straight to FB_READ_WAIT; see fb_early. 0 registers the
-  // address first, in FB_READ_ISSUE.
-  parameter bit FB_READ_EARLY = 1'b1,
-  // A read-ahead's framebuffer line streams as a demand line does, but
-  // hands back to FB_READ_ISSUE this many times (0 to 3), after its first
-  // qwords, a cycle each. -1 reads its every qword in two cycles, WAIT
-  // handing back to FB_READ_ISSUE after each. See FB_READ_ISSUE.
-  parameter int FB_RA_GAPS = 1
-) (
+module ki_memory_bridge (
   input  wire         clk,
   input  wire         ddr_clk,
   input  wire         reset,
@@ -99,29 +79,29 @@ module ki_memory_bridge #(
   input  wire   [2:0] video_words,
   output logic [63:0] video_data,
   // One pulse per assembled 64-bit word, in address order, each strictly
-  // before video_done. A single-word requester can ignore it and keep reading
-  // video_data at video_done as before.
+  // before video_done. A single-word requester can ignore it and read
+  // video_data at video_done.
   output logic        video_data_valid,
   output logic        video_done,
 
-  // DCS sound ROM read port, from KillerInstinct_MiSTer-audio. The ADSP-2105
-  // fetches its program and sample data out of the DCS banks the loader put in
-  // DDR3 at STORE_DCS, so this is a third requester on the DDR service state
-  // machine alongside the CPU's write and read. It crosses to ddr_clk through
-  // the same mailbox-and-toggle pattern the CPU read already uses rather than
-  // a second mechanism.
+  // DCS sound ROM read port, from ki_dcs_audio. The ADSP-2105 fetches its
+  // program and sample data out of the DCS banks the loader put in DDR3 at
+  // STORE_DCS, so this is a second requester on the DDR service state machine
+  // alongside the download's writes. It crosses to ddr_clk through the same
+  // mailbox-and-toggle pattern those writes use rather than a second
+  // mechanism.
   input  wire         dcs_rom_request,
   input  wire  [18:0] dcs_rom_address,
   output logic        dcs_rom_ready,
   output logic [63:0] dcs_rom_data,
 
   output logic [24:0] sdram_address,
-  // Up to four words, low word first, with one byte-enable pair per word.
-  // Up to 16 words - one 32-byte cache line. A dirty line is gathered here
-  // and written as a single burst; see the gather block below.
+  // Up to 16 words - one 32-byte cache line - low word first, with one
+  // byte-enable pair per word. A dirty line is gathered here and written as a
+  // single burst; see the gather block below.
   output logic [255:0] sdram_write_data,
   output logic  [31:0] sdram_byte_enable,
-  // Words to transfer: reads 1..SDRAM_MAX_BURST, writes 1..4.
+  // Words to transfer: 1..SDRAM_MAX_BURST.
   output logic  [4:0] sdram_burst,
   output logic        sdram_read,
   output logic        sdram_write,
@@ -133,7 +113,7 @@ module ki_memory_bridge #(
   // assumed.
   input  wire  [31:0] sdram_read_data,
   input  wire   [1:0] sdram_read_be,
-  // One pulse per returned word of a burst read, in address order. The final
+  // One pulse per returned beat of a burst read, in address order. The final
   // pulse always precedes sdram_done.
   input  wire         sdram_data_valid,
   input  wire         sdram_done,
@@ -325,12 +305,12 @@ module ki_memory_bridge #(
   logic [7:0] ddr_write_mailbox_be = 8'd0;
   logic ddr_write_request_toggle = 1'b0;
   logic ddr_write_ack_toggle = 1'b0;
-  (* ASYNC_REG = "TRUE" *) logic ddr_write_ack_sync1 = 1'b0;
-  (* ASYNC_REG = "TRUE" *) logic ddr_write_ack_sync2 = 1'b0;
+  logic ddr_write_ack_sync1 = 1'b0;
+  logic ddr_write_ack_sync2 = 1'b0;
   logic ddr_write_ack_seen = 1'b0;
 
-  (* ASYNC_REG = "TRUE" *) logic ddr_write_request_sync1 = 1'b0;
-  (* ASYNC_REG = "TRUE" *) logic ddr_write_request_sync2 = 1'b0;
+  logic ddr_write_request_sync1 = 1'b0;
+  logic ddr_write_request_sync2 = 1'b0;
   logic ddr_write_request_seen = 1'b0;
 
   // DCS sound ROM mailbox.
@@ -341,13 +321,13 @@ module ki_memory_bridge #(
   logic [63:0] dcs_rom_mailbox_data = 64'd0;
   logic dcs_rom_request_toggle = 1'b0;
   logic dcs_rom_done_toggle = 1'b0;
-  (* ASYNC_REG = "TRUE" *) logic dcs_rom_done_sync1 = 1'b0;
-  (* ASYNC_REG = "TRUE" *) logic dcs_rom_done_sync2 = 1'b0;
+  logic dcs_rom_done_sync1 = 1'b0;
+  logic dcs_rom_done_sync2 = 1'b0;
   logic dcs_rom_done_seen = 1'b0;
   logic dcs_rom_inflight = 1'b0;
   logic dcs_rom_request_seen_level = 1'b0;
-  (* ASYNC_REG = "TRUE" *) logic dcs_rom_request_sync1 = 1'b0;
-  (* ASYNC_REG = "TRUE" *) logic dcs_rom_request_sync2 = 1'b0;
+  logic dcs_rom_request_sync1 = 1'b0;
+  logic dcs_rom_request_sync2 = 1'b0;
   logic dcs_rom_request_seen = 1'b0;
 
   typedef enum logic [1:0] {
@@ -477,11 +457,6 @@ module ki_memory_bridge #(
   // Writes are acknowledged as soon as they are absorbed, so correctness
   // rests on one rule: every OTHER requester flushes the buffer before it is
   // served, reads included.
-  //
-  // Set to 0 to disable gathering without removing it (the eligibility test
-  // folds to a constant), which is the first thing to try if hardware
-  // misbehaves.
-  localparam logic WB_GATHER = 1'b1;
 
   logic   [2:0] wb_count = 3'd0;     // 64-bit chunks held, 0..4
   logic  [24:0] wb_addr = 25'd0;     // word address of the first chunk
@@ -496,8 +471,9 @@ module ki_memory_bridge #(
   // The board ignores DQM, so masked words inside a write burst would be
   // written anyway, while every simulation model honours it.
   logic         wb_split = 1'b0;
-  // WB_STREAM: the line being written went out from the absorb of its fourth
-  // store, so its data is all in sdram_write_data and wb_* holds the next.
+  // The line being written went out from the absorb of its fourth store, so
+  // its data is all in sdram_write_data and wb_* holds the next (THE STORE
+  // STREAM).
   logic         wb_free = 1'b0;
   logic   [3:0] wb_qmask = 4'd0;     // qwords still to write in split mode
 
@@ -618,7 +594,7 @@ module ki_memory_bridge #(
   endfunction
 
   // A 32-byte cache-line read is four 64-bit words; a 64-bit or 32-bit access
-  // is one. fb_stream: this read takes a word a cycle (FB_READ_ISSUE).
+  // is one. A line streams, a word a cycle after its first (FB_READ_ISSUE).
   logic [2:0] fb_qwords_left = 3'd0;
   // A line read starts at the qword its address names and goes on in the
   // R4600's sub-block order, that qword XOR the count: fb_rd_line is the
@@ -626,10 +602,8 @@ module ki_memory_bridge #(
   // line address names qword 0, and the order is then the plain one.
   logic [15:0] fb_rd_line = 16'd0;
   logic [1:0]  fb_rd_start = 2'd0, fb_rd_k = 2'd0;
-  logic       fb_stream = 1'b0;
-  // FB_RA_GAPS: the hand-backs to FB_READ_ISSUE a streamed read-ahead line
-  // still has to make.
-  logic [1:0] fb_gaps_left = 2'd0;
+  // A read-ahead's line still has its hand-back to FB_READ_ISSUE to make.
+  logic       fb_ra_gap = 1'b0;
 
   // A WHOLE-LINE write into the framebuffer: a dirty data-cache line written
   // back. KI2 draws its framebuffer through a WRITE-BACK cache on the board -
@@ -656,11 +630,11 @@ module ki_memory_bridge #(
                      ((active_address >= FB1_LOW) &&
                       (active_address < FB1_HIGH));
 
-  // FB_READ_EARLY: in IDLE, with no write of port A's in this cycle, the RAM
-  // takes the request's own address rather than fb_addr, so a read accepted
-  // here has its word in the cycle after. One of a qword or less goes from
-  // here to FB_READ_WAIT; a line still streams from FB_READ_ISSUE.
-  wire        fb_early    = FB_READ_EARLY && (state == IDLE) && !fb_we && cpu_hits_fb;
+  // In IDLE, with no write of port A's in this cycle, the RAM takes the
+  // request's own address rather than fb_addr, so a read accepted here has
+  // its word in the cycle after. One of a qword or less goes from here to
+  // FB_READ_WAIT; a line still streams from FB_READ_ISSUE.
+  wire        fb_early    = (state == IDLE) && !fb_we && cpu_hits_fb;
   wire [15:0] fb_addr_ram = fb_early ? fb_index(active_address) : fb_addr;
 
   // synthesis translate_off
@@ -738,7 +712,7 @@ module ki_memory_bridge #(
   // continues the one being held. The boot-table window is excluded so the
   // snoop in SDRAM_WRITE_WAIT still sees every store there.
   wire wb_elig =
-      WB_GATHER && cpu_turn && !active_rnw && !active_line_write &&
+      cpu_turn && !active_rnw && !active_line_write &&
       active_req64 && (active_write_mask == 8'hff) &&
       !io_selected && !cpu_hits_fb &&
       is_memory_address(active_address) &&
@@ -752,10 +726,10 @@ module ki_memory_bridge #(
               (active_word_address ==
                (wb_addr + {20'd0, wb_count, 2'b00}))));
   // One that starts a line, whatever is held: on a write's done edge the
-  // held line is no longer wb_*'s (WB_STREAM).
+  // held line is no longer wb_*'s (THE STORE STREAM).
   wire wb_start_ok = wb_elig && (active_word_address[3:0] == 4'd0);
 
-  // THE STORE STREAM (WB_STREAM). An uncached store stream to SDRAM, four
+  // THE STORE STREAM. An uncached store stream to SDRAM, four
   // full-mask stores a line, is held to the length of the lines' writes:
   //   * the edge that absorbs a line's fourth store issues its burst - no IDLE
   //     edge to notice the full line, no SDRAM_WB_FLUSH_ISSUE;
@@ -796,12 +770,6 @@ module ki_memory_bridge #(
   end
 
 `ifndef SYNTHESIS
-  // FB_RA_GAPS is -1 (a read-ahead's line not streamed) or 0 to 3.
-  initial if (FB_RA_GAPS < -1 || FB_RA_GAPS > 3) begin
-    $error("bridge: FB_RA_GAPS %0d is not -1 to 3", FB_RA_GAPS);
-    $fatal(1);
-  end
-
   // A line write to an address the burst path cannot take would fall through
   // to the ordinary single-write path and go out as 64 bits, losing 24 of its
   // 32 bytes. The data cache only ever writes back cached memory, so this
@@ -810,8 +778,8 @@ module ki_memory_bridge #(
   // Address-only, and deliberately NOT the active_* signals line_req uses:
   // those follow whichever request is PENDING, so an earlier framebuffer or
   // I/O request in flight would make this fire on a perfectly good
-  // write-back. line_req's other terms - video's turn, a request already
-  // pending - are deferrals, not errors.
+  // write-back. line_req's other term - cpu_turn, which cpu_hold defers - is
+  // a deferral, not an error.
   //
   // The framebuffer is not on this list: FB_LINE_WRITE takes a line written
   // back into it, which a cached framebuffer produces on every dirty line.
@@ -1132,8 +1100,8 @@ module ki_memory_bridge #(
             wb_idle <= 6'd0;
             cpu_pending <= 1'b0;
             cpu_done <= 1'b1;
-            // WB_STREAM: the fourth store's edge issues the line.
-            if (WB_STREAM && (wb_count == 3'd3) && !wb_split && sdram_ready) begin
+            // The fourth store's edge issues the line (THE STORE STREAM).
+            if ((wb_count == 3'd3) && !wb_split && sdram_ready) begin
               sdram_address <= wb_addr;
               sdram_write_data <= {active_data_write, wb_data[191:0]};
               sdram_byte_enable <= {active_write_mask, wb_be[23:0]};
@@ -1214,9 +1182,7 @@ module ki_memory_bridge #(
                 fb_rd_line <= fb_index({active_address[31:5], 5'd0});
                 fb_rd_start <= active_address[4:3];
                 fb_rd_k <= 2'd0;
-                fb_stream <= FB_STREAM && (!active_line_ra || (FB_RA_GAPS >= 0));
-                fb_gaps_left <= (active_line_ra && (FB_RA_GAPS > 0)) ?
-                                FB_RA_GAPS[1:0] : 2'd0;
+                fb_ra_gap <= active_line_ra;
                 fb_qwords_left <=
                     (active_read_words < 5'd4) ? 3'd1 : active_read_words[4:2];
                 if (active_rnw) begin
@@ -1444,9 +1410,9 @@ module ki_memory_bridge #(
           end
         end
 
-        // Everything held goes out as one burst: wb_count chunks is
-        // wb_count * 4 words, and the line is 32-byte aligned so it cannot
-        // cross a row.
+        // Everything held goes out as one burst - a split line as one 4-word
+        // burst per qword: wb_count chunks is wb_count * 4 words, and the
+        // line is 32-byte aligned so it cannot cross a row.
         SDRAM_WB_FLUSH_ISSUE: begin
           if (wb_split && wb_qmask == 4'd0) begin
             // A line with no qword to write: nothing goes out.
@@ -1491,10 +1457,10 @@ module ki_memory_bridge #(
               wb_idle <= 6'd0;
               wb_split <= 1'b0;
               state <= IDLE;
-              // WB_STREAM: the store waiting is absorbed on this edge, as IDLE
-              // would absorb it on the next - continuing the held chunks, or
+              // The store waiting is absorbed on this edge, as IDLE would
+              // absorb it on the next - continuing the held chunks, or
               // starting a line when nothing of wb_*'s is held.
-              if (WB_STREAM && (wb_free ? wb_gather_ok : wb_start_ok)) begin
+              if (wb_free ? wb_gather_ok : wb_start_ok) begin
                 if (!wb_free || (wb_count == 3'd0)) wb_addr <= active_word_address;
                 wb_data[{(wb_free ? wb_count[1:0] : 2'd0), 6'd0} +: 64] <= active_data_write;
                 wb_be[{(wb_free ? wb_count[1:0] : 2'd0), 3'd0} +: 8] <= active_write_mask;
@@ -1509,7 +1475,7 @@ module ki_memory_bridge #(
                   debug_main_write_count <= debug_main_write_count + 1'b1;
               end
             end
-          end else if (WB_STREAM && wb_free && (wb_count == 3'd0) && wb_gather_ok) begin
+          end else if (wb_free && (wb_count == 3'd0) && wb_gather_ok) begin
             // One store, a line's first, while the issued line is written.
             wb_addr <= active_word_address;
             wb_data[63:0] <= active_data_write;
@@ -1615,19 +1581,17 @@ module ki_memory_bridge #(
         // addressed, while the next address is being registered. No SDRAM is
         // involved.
         //
-        // A read-ahead's line streams too, but its first fb_gaps_left WAITs
-        // (FB_RA_GAPS) with a word still to come hand back to ISSUE without
-        // moving the address: it already names the next word, which the RAM
-        // reads again in ISSUE, and ISSUE moves the address on past it as a
-        // streamed ISSUE does. Each costs one cycle; the words come in the
-        // same order. Streamed without one, the core would read cached VRAM
-        // faster than the real board's test ROM does, because the ROM's read
-        // loop runs on the read-ahead. With FB_RA_GAPS -1 (fb_stream low) a
-        // read-ahead's line takes two cycles a word, WAIT handing back to
-        // ISSUE after each.
+        // A read-ahead's line streams too, but its first WAIT with a word
+        // still to come hands back to ISSUE without moving the address: it
+        // already names the next word, which the RAM reads again in ISSUE,
+        // and ISSUE moves the address on past it as a streamed ISSUE does.
+        // That costs one cycle; the words come in the same order. Streamed
+        // without it, the core would read cached VRAM faster than the real
+        // board's test ROM does, because the ROM's read loop runs on the
+        // read-ahead.
         FB_READ_ISSUE: begin
           state <= FB_READ_WAIT;
-          if (fb_stream && (fb_qwords_left > 3'd1)) begin
+          if (fb_qwords_left > 3'd1) begin
             fb_addr <= fb_rd_line | {14'd0, fb_rd_start ^ (fb_rd_k + 2'd1)};
             fb_rd_k <= fb_rd_k + 2'd1;
           end
@@ -1650,18 +1614,12 @@ module ki_memory_bridge #(
             state <= IDLE;
           end else begin
             fb_qwords_left <= fb_qwords_left - 3'd1;
-            if (fb_stream && (fb_gaps_left != 2'd0)) begin
-              fb_gaps_left <= fb_gaps_left - 2'd1;
+            if (fb_ra_gap) begin
+              fb_ra_gap <= 1'b0;
               state <= FB_READ_ISSUE;
-            end else if (fb_stream) begin
-              if (fb_qwords_left > 3'd2) begin
-                fb_addr <= fb_rd_line | {14'd0, fb_rd_start ^ (fb_rd_k + 2'd1)};
-                fb_rd_k <= fb_rd_k + 2'd1;
-              end
-            end else begin
+            end else if (fb_qwords_left > 3'd2) begin
               fb_addr <= fb_rd_line | {14'd0, fb_rd_start ^ (fb_rd_k + 2'd1)};
               fb_rd_k <= fb_rd_k + 2'd1;
-              state <= FB_READ_ISSUE;
             end
           end
         end
@@ -1714,9 +1672,9 @@ module ki_memory_bridge #(
     end
   end
 
-  // MiSTer's DDR interface is serviced at 100 MHz, matching the proven
-  // Aleck64/N64 arrangement. Complete read bursts are captured here before
-  // they are exposed to the 50 MHz CPU cache domain. Commands remain asserted
+  // MiSTer's DDR interface is serviced at 100 MHz. A DCS ROM read's qword is
+  // captured in its mailbox here before it crosses to the 50 MHz bridge
+  // clock. Commands remain asserted
   // with stable payloads until BUSY is low on a following clock edge; this is
   // the acceptance contract used by MiSTer's DDR frontend.
   always_ff @(posedge ddr_clk) begin

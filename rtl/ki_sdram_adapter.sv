@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 `default_nettype none
 
-module ki_sdram_adapter #(
-  // See ki_fast_fill.
-  parameter bit UNC_CTL_RETURN = 1'b1
-) (
+module ki_sdram_adapter (
   input  wire         clk,
   // The controller's clock, 2 x clk from the same PLL. ki_sdram_x2, which
   // lives inside here, packs the controller's 16-bit words two to a beat, one
@@ -14,7 +11,7 @@ module ki_sdram_adapter #(
   input  wire         clk2x,
   input  wire         reset,
 
-  // The requester (CPU/video/download bridge).
+  // The requester (ki_memory_bridge).
   // Word address (16-bit words); only [23:0] reach the 25-bit byte-addressed
   // controller.
   input  wire  [24:0] request_address,
@@ -22,8 +19,8 @@ module ki_sdram_adapter #(
   // single burst instead of four.
   input  wire [255:0] request_write_data,
   input  wire  [31:0] request_byte_enable,
-  // Words to transfer: 1..16 on a read, 1..4 on a write (the controller
-  // clamps writes to the width of its 4-word payload).
+  // Words to transfer: 1..16 (the controller clamps writes to the width of
+  // its 16-word payload).
   input  wire   [4:0] request_burst,
   input  wire         request_read,
   input  wire         request_write,
@@ -33,7 +30,7 @@ module ki_sdram_adapter #(
   // single-word requester may still take its data at the completion handshake.
   output wire  [31:0] request_read_data,
   output wire   [1:0] request_read_be,
-  // One pulse per returned word, in address order, for burst reads. The
+  // High for each returned beat, in address order, for burst reads. The
   // single-word path may ignore this and take request_read_data at done.
   output logic        request_data_valid,
   output logic        request_done,
@@ -63,8 +60,6 @@ module ki_sdram_adapter #(
   output wire         controller_read,
   output wire         controller_write,
   input  wire  [15:0] controller_read_data,
-  // A controller without per-beat validity may tie this low; single-word read
-  // data is then taken at the completion handshake.
   input  wire         controller_dout_valid,
   input  wire         controller_ready,
   output wire         controller_fast_tog,
@@ -103,7 +98,7 @@ module ki_sdram_adapter #(
   // The direct fill path bypasses the state machine below: ki_sdram_burst takes
   // its requests on a port of their own, and only when nothing else is
   // pending. ki_fast_fill maps the line and assembles what comes back.
-  ki_fast_fill #(.UNC_CTL_RETURN(UNC_CTL_RETURN)) fast (
+  ki_fast_fill fast (
     .clk(clk), .clk_ctl(clk2x),
     .req_tog(fast_req_tog), .req_line(fast_req_line), .req_stream(fast_req_stream),
     .ctl_tog(controller_fast_tog), .ctl_addr(controller_fast_addr),
@@ -206,7 +201,8 @@ module ki_sdram_adapter #(
         ADAPTER_ACK: state <= ADAPTER_IDLE;
       endcase
 
-      // Sequenced last on purpose: see rule 1 in the header comment. A
+      // Sequenced last on purpose: a request arriving on the clock a queued
+      // one launches must win over that launch's clear of req_pending. A
       // request launched directly above is not queued as well.
       if (request_now && !launch_direct) begin
         req_pending <= 1'b1;

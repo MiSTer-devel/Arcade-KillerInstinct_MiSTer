@@ -6,24 +6,22 @@ use STD.textio.all;
 entity cpu_FPU is
    generic
    (
-      -- An ADD or SUB whose sum has its carry or hidden bit set needs at most
-      -- a one-bit right shift to normalize. It rounds the cycle after the
-      -- add, from the sum itself, instead of passing through the shared
-      -- shifter's registered input first. Any other sum (cancellation, zero)
-      -- takes the shifter as before.
-      ADD_FAST_NORM  : boolean := false;
-      -- result_fwd carries a result in the cycle it is rounded or converted;
-      -- see result_fwd_valid.
-      RESULT_FORWARD : boolean := false;
       -- cvt.s.l and cvt.d.l convert through the shared 57-bit path only, and
       -- a value outside +-2^55 takes an Unimplemented Operation trap. Without
       -- it, a 64-bit value is first shifted right into that path with its
       -- lost bits kept as sticky, and every value converts, as on the R4600.
-      CVT_L_NARROW   : boolean := false
+      CVT_L_NARROW   : boolean := false;
+      -- No trap: the FPU obeys none of FCSR's exception enables (FCSR still
+      -- reads back what was written), so an IEEE exception sets its cause and
+      -- flag as a disabled one does, a ctc1 that sets an enabled cause only
+      -- writes FCSR, and exceptionFPU is never raised. An operation that would
+      -- take an Unimplemented Operation trap completes and writes a result
+      -- that is not defined. Without it every trap is taken, as on the R4600.
+      NO_EXCEPTION   : boolean := false
    );
    port
    (
-      clk93             : in  std_logic;
+      clk2x             : in  std_logic;
       reset             : in  std_logic;
       error_FPU         : out std_logic := '0';
       
@@ -61,10 +59,7 @@ entity cpu_FPU is
       -- register is not written, and the exception discards whatever took
       -- the value. MUL, DIV and SQRT do not forward.
       result_fwd        : out unsigned(63 downto 0);
-      result_fwd_valid  : out std_logic;
-
-      SS_FPU_CF         : in  std_logic;
-      SS_CSR            : in  unsigned(24 downto 0)
+      result_fwd_valid  : out std_logic
    );
 end entity;
 
@@ -117,11 +112,14 @@ architecture arch of cpu_FPU is
    alias csr_flag_overflow          is csr(4);
    alias csr_flag_divisionByZero    is csr(5);
    alias csr_flag_invalidOperation  is csr(6);
-   alias csr_ena_inexact            is csr(7);
-   alias csr_ena_underflow          is csr(8);
-   alias csr_ena_overflow           is csr(9);
-   alias csr_ena_divisionByZero     is csr(10);
-   alias csr_ena_invalidOperation   is csr(11);
+   -- The exception enables the FPU obeys: FCSR's, or none under NO_EXCEPTION.
+   -- FCSR itself still holds and reads back what software wrote.
+   signal csr_ena                   : unsigned(4 downto 0);
+   alias csr_ena_inexact            is csr_ena(0);
+   alias csr_ena_underflow          is csr_ena(1);
+   alias csr_ena_overflow           is csr_ena(2);
+   alias csr_ena_divisionByZero     is csr_ena(3);
+   alias csr_ena_invalidOperation   is csr_ena(4);
    alias csr_cause_inexact          is csr(12);
    alias csr_cause_underflow        is csr(13);
    alias csr_cause_overflow         is csr(14);
@@ -320,6 +318,8 @@ begin
    -- synthesis translate_on
    
    FPU_CF <= csr_compare;
+
+   csr_ena <= (others => '0') when NO_EXCEPTION else csr(11 downto 7);
    
 
    bit64   <= command_code(21);
@@ -608,9 +608,15 @@ begin
          if ((round_overflow = '1' or flag_overflow = '1') and csr_ena_overflow = '1') then
             exceptionFPU <= '1';
          end if;
-         
+
       end if;
-  
+
+      -- See NO_EXCEPTION. The last assignment wins, so none of the trap
+      -- conditions above reaches the pipeline or the write port.
+      if (NO_EXCEPTION) then
+         exceptionFPU <= '0';
+      end if;
+
    end process;
    
 ---------------------------------------------------------------------
@@ -618,9 +624,9 @@ begin
 ---------------------------------------------------------------------
    
 
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
          bit64_1         <= bit64;
          signA_1         <= signA;
@@ -650,8 +656,8 @@ begin
       
          if (reset = '1') then
          
-            csr         <= SS_CSR; -- (others => '0');
-            csr_compare <= SS_FPU_CF;  -- '0';
+            csr         <= (others => '0');
+            csr_compare <= '0';
            
          else 
          
@@ -969,9 +975,13 @@ begin
          if (toInt_store = '1' or round_store = '1') then
             -- update flags
             if (flag_underflow = '1' and (csr_flushSubnormals = '0' or csr_ena_underflow = '1' or csr_ena_inexact = '1')) then
-            
+
                csr_cause_unimplemented    <= '1';
-               FPUWriteEnable             <= '0';
+               -- An Unimplemented Operation: no write, as the trap takes
+               -- the instruction. Without the trap (NO_EXCEPTION) it writes.
+               if (not NO_EXCEPTION) then
+                  FPUWriteEnable          <= '0';
+               end if;
             
             else
             
@@ -1053,19 +1063,20 @@ begin
 
    end process;
 
+   -- result_fwd carries a result in the cycle it is rounded or converted.
    result_fwd       <= round_result when (toInt_store = '0') else
                        toInt_Result when (bit64Out = '1') else
                        32x"0" & toInt_Result(31 downto 0);
-   result_fwd_valid <= '1' when (RESULT_FORWARD and ((round_store = '1' and fwd_class = '1') or toInt_store = '1')) else '0';
+   result_fwd_valid <= '1' when ((round_store = '1' and fwd_class = '1') or toInt_store = '1') else '0';
 
 ---------------------------------------------------------------------
 --------------- shared processing  ----------------------------------
 ---------------------------------------------------------------------
    
    -- leading zero count for int
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
       clz_result <= 56;
       for i in 0 to 55 loop
@@ -1107,9 +1118,9 @@ begin
    end process;
 
    -- shifter
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
          shifter_lostbits <= shifter_lostbits_in;
 
@@ -1215,9 +1226,12 @@ begin
    -- The sum's carry or hidden bit is set: no cancellation, so the normalize
    -- is a right shift by one (carry) or nothing. Its exponent is not zero -
    -- that needs two zero or denormal operands, and a denormal one never
-   -- reaches stage 1 - so it cannot underflow either.
+   -- reaches stage 1 - so it cannot underflow either. Such a sum rounds the
+   -- cycle after the add, from the sum itself, instead of passing through
+   -- the shared shifter's registered input first. Any other sum
+   -- (cancellation, zero) takes the shifter.
    ADD_fast_carry <= ADD_result(56) when (bit64Out = '1') else ADD_result(27);
-   ADD_fast       <= '1' when (ADD_FAST_NORM and ADD_stage1 = '1' and
+   ADD_fast       <= '1' when (ADD_stage1 = '1' and
                                (ADD_fast_carry = '1' or
                                 (bit64Out = '1' and ADD_result(55) = '1') or
                                 (bit64Out = '0' and ADD_result(26) = '1'))) else '0';
@@ -1261,10 +1275,10 @@ begin
    end process;
    
    -- DIV
-   process (clk93)
+   process (clk2x)
       variable dividend_next : unsigned(55 downto 0);
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
          if (command_ena = '1' and op = 3) then
             dividend     <= 4x"0" & mantA;
@@ -1308,7 +1322,7 @@ begin
    icpu_FPU_sqrt : entity work.cpu_FPU_sqrt
    port map
    (
-      clk               => clk93,
+      clk               => clk2x,
       reset             => reset,
                         
       start             => SQRT_startcalc,
@@ -1324,9 +1338,9 @@ begin
 --------------- clocked calculations --------------------------------
 ---------------------------------------------------------------------
 
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
          round_store     <= '0';
          toInt_store     <= '0';
@@ -1908,9 +1922,9 @@ begin
    end process;
 
    -- synthesis translate_off
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
 
          if (reset = '1') then
             debug_calc_count <= 0;
@@ -1951,7 +1965,7 @@ begin
          
          while (true) loop
             
-            wait until rising_edge(clk93);
+            wait until rising_edge(clk2x);
             
             if (FPUWriteEnable = '1') then
                export_rs   := FPUWriteData;

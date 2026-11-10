@@ -64,22 +64,24 @@ module ki_dcs_audio #(
     // configured DCS_ENGINE_HZ cadence is what reproduces the DSP's
     // approximately 10 MIPS throughput from the core-wide 50 MHz clock.
     localparam integer DCS_PHASE_W = $clog2(CLK_HZ);
-    localparam logic [DCS_PHASE_W:0] DCS_PHASE_STEP = DCS_ENGINE_HZ;
-    localparam logic [DCS_PHASE_W:0] DCS_PHASE_MOD = CLK_HZ;
+    localparam logic [DCS_PHASE_W:0] DCS_PHASE_STEP = DCS_ENGINE_HZ[DCS_PHASE_W:0];
+    localparam logic [DCS_PHASE_W:0] DCS_PHASE_MOD = CLK_HZ[DCS_PHASE_W:0];
     logic [DCS_PHASE_W-1:0] dcs_phase;
     logic [DCS_PHASE_W:0] dcs_phase_sum;
+    logic [DCS_PHASE_W:0] dcs_phase_wrap;
     wire dcs_ce = !pause && (dcs_phase_sum >= DCS_PHASE_MOD);
 
     // Both cadences hold their phase through a pause, so the DSP and the DAC
     // pick up exactly where they stopped relative to each other.
     always_comb dcs_phase_sum = {1'b0, dcs_phase} + DCS_PHASE_STEP;
+    always_comb dcs_phase_wrap = dcs_phase_sum - DCS_PHASE_MOD;
     always_ff @(posedge clk) begin
         if (rst)
             dcs_phase <= '0;
         else if (pause)
             dcs_phase <= dcs_phase;
         else if (dcs_ce)
-            dcs_phase <= dcs_phase_sum - DCS_PHASE_MOD;
+            dcs_phase <= dcs_phase_wrap[DCS_PHASE_W-1:0];
         else
             dcs_phase <= dcs_phase_sum[DCS_PHASE_W-1:0];
     end
@@ -98,9 +100,7 @@ module ki_dcs_audio #(
             dac_div_ctr <= dac_div_ctr + 1'b1;
     end
 
-    // The ADSP samples dac_ce_in on every fabric clock, independently of
-    // core_ce. Each physical DAC slot must therefore be exactly one fabric
-    // clock wide; stretching it would advance the autobuffer once per cycle.
+    // Each physical DAC slot is exactly one fabric clock wide.
     wire dcs_dac_ce = dac_slot_ce;
 
     // The main board produces a one-clock command strobe. Retain it until one
@@ -249,7 +249,7 @@ module ki_dcs_audio #(
                 if (startup_gain != STARTUP_GAIN_FULL) begin
                     // Ramp from silence without changing the full-scale
                     // steady-state PCM path.
-                    audio <= startup_product >>> STARTUP_RAMP_BITS;
+                    audio <= startup_product[STARTUP_RAMP_BITS+15:STARTUP_RAMP_BITS];
                     if (pcm_head != 16'sh0000)
                         startup_gain <= startup_gain + 1'b1;
                 end else begin

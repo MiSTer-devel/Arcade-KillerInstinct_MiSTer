@@ -18,20 +18,17 @@ derive_clock_uncertainty
 # AT 2:1 THE PAIR IS RELATED AGAIN, ON PURPOSE. clk_cpu and clk_core are PLL
 # outputs 1 and 0, both at 0 ps: every clk_core edge falls on a clk_cpu edge,
 # and each direction has a 10 ns setup window. The CPU-to-bridge crossing
-# relies on that under SYNC_CROSSING (cpu.vhd, "THE CROSSING"; ki_cpu_core
-# defaults it on): its mailbox request and acknowledge, the write-back line
-# release and the response FIFO's pointers are read straight from the other
-# domain's register, with no synchroniser - 4.9% of KI2's renderer, measured
-# in tb_ki_renderbench. Those paths MUST be timed. A false path or an
+# relies on that (cpu.vhd, "THE CROSSING"): its mailbox request and
+# acknowledge, the write-back line release and the response FIFO's pointers
+# are read straight from the other domain's register, with no synchroniser -
+# 4.9% of KI2's renderer, measured in tb_ki_renderbench. Those paths MUST be timed. A false path or an
 # asynchronous group here would let the fitter route one of them in 12 ns,
 # and nothing else protects them.
 #
-# THE 2:1 RATIO IS THE CONTRACT. Before moving the CPU clock off twice
-# clk_core, build with SYNC_CROSSING=0 and make the CPU clock asynchronous to
-# everything again.
+# THE 2:1 RATIO IS THE CONTRACT. The crossing has no synchronisers, so the
+# CPU clock cannot move off twice clk_core without them.
 #
-# With SYNC_CROSSING=0 the crossing is asynchronous by construction, and
-# timing it as well costs nothing. Every crossing is one of:
+# Every crossing is one of:
 #   - the memory REQUEST mailbox in cpu.vhd, a two-phase req/ack handshake
 #     whose payload is held stable until the acknowledge returns;
 #   - the memory RESPONSE FIFO (cpu_cdc_fifo.vhd), whose gray-coded pointers
@@ -40,16 +37,16 @@ derive_clock_uncertainty
 #     bundled data on the same argument as the mailbox's payload register:
 #     an entry is complete no later than the pointer that exposes it;
 #   - the cache fill line address (cpu_instrcache fill_addrTag_sav,
-#     cpu_datacache fill_line_saved), written only in the clk93 state
+#     cpu_datacache fill_line_saved), written only in the clk2x state
 #     machine's IDLE state and frozen from the request until ram_done, which
 #     is itself produced by the response handshake;
 #   - the data cache read-ahead's fetched line (cpu.vhd line_fill_1x),
 #     written in clk1x only while its own fetch is outstanding and copied
-#     into clk93 only when that fetch's completion has crossed the response
+#     into clk2x only when that fetch's completion has crossed the response
 #     FIFO, so its last beat is in no later than the completion;
 #   - the first stage of a two-flop synchroniser (irq_meta, pause_meta).
 # Reset was the one exception: the caches' clk1x fill processes were reset by
-# reset_93. They now take reset_1x, which ki_cpu_core already synchronises
+# reset_2x. They now take reset_1x, which ki_cpu_core already synchronises
 # into that domain, so nothing crosses unsynchronised.
 #
 # This must stay in THIS file: sys.tcl loads sys_top.sdc first, and its

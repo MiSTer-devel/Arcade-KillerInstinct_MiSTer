@@ -2,96 +2,17 @@ library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
+-- clk1x and clk2x must be phase-0 outputs of one PLL at 2:1, with
+-- KillerInstinct.sdc timing the paths between them: cpu.vhd crosses between
+-- them without synchronisers (see its "THE CROSSING").
 entity ki_cpu_core is
-   generic
-   (
-      -- 64-bit store misses skip their fill; see cpu.vhd's DCACHE_SKIP_FILL.
-      DCACHE_SKIP_FILL : integer := 1;
-      -- Partial framebuffer stores skip their fill too; see cpu.vhd's
-      -- DCACHE_FB_PARTIAL.
-      DCACHE_FB_PARTIAL : integer := 1;
-      -- A write-back followed by an ALLOC does not wait for the line to
-      -- cross; see cpu.vhd's DCACHE_WB_EARLY.
-      DCACHE_WB_EARLY : integer := 1;
-      -- The load-delay bubble only for a dependent instruction; see cpu.vhd's
-      -- LOAD_INTERLOCK.
-      LOAD_INTERLOCK : integer := 1;
-      -- A one-entry store buffer in the data cache; see cpu.vhd's
-      -- DCACHE_STORE_BUFFER.
-      DCACHE_STORE_BUFFER : integer := 1;
-      -- A load of the buffered doubleword is answered from the buffer; see
-      -- cpu.vhd's DCACHE_SB_FORWARD.
-      DCACHE_SB_FORWARD : integer := 1;
-      -- A load miss is answered as soon as its own qword is in, and the next
-      -- demand fill may queue behind the rest of the line; see cpu.vhd's
-      -- DCACHE_EARLY_RESTART.
-      DCACHE_EARLY_RESTART : integer := 1;
-      -- A load missing on the staged read-ahead line is answered from the
-      -- staging register as the copy ends; see cpu.vhd's DCACHE_RA_ANSWER.
-      DCACHE_RA_ANSWER : integer := 1;
-      -- A framebuffer line is filled from its access's qword, in sub-block
-      -- order; see cpu.vhd's DCACHE_CWF_FB.
-      DCACHE_CWF_FB : integer := 1;
-      -- A framebuffer miss with a dirty victim is filled before the victim is
-      -- written back; see cpu.vhd's DCACHE_FILL_FIRST.
-      DCACHE_FILL_FIRST : integer := 1;
-      -- That fill is asked for at the miss, the victim staged while it comes;
-      -- see cpu.vhd's DCACHE_FILL_AT_MISS.
-      DCACHE_FILL_AT_MISS : integer := 1;
-      -- A direct uncached load completes without the rotation; see cpu.vhd's
-      -- UNC_FAST_DONE.
-      UNC_FAST_DONE : integer := 1;
-      -- The uncached qword load waiting in stage 3 goes to the direct port on
-      -- the edge the uncached load in stage 4 completes; see cpu.vhd's
-      -- UNC_LAUNCH_S3.
-      UNC_LAUNCH_S3 : integer := 1;
-      -- An uncached 64-bit load through the bridge completes without the
-      -- rotation; see cpu.vhd's UNC_BRIDGE_FAST_DONE.
-      UNC_BRIDGE_FAST_DONE : integer := 1;
-      -- The crossing to the bridge without synchronisers; see cpu.vhd's
-      -- SYNC_CROSSING. clk_cpu and clk_core are phase-0 outputs of one PLL
-      -- at 2:1, and KillerInstinct.sdc times the paths between them.
-      SYNC_CROSSING : integer := 1;
-      -- An LWL/LWR/LDL/LDR behind a load of its rt takes no bubble, as on the
-      -- R4600; see cpu.vhd's LOAD_MERGE_BYPASS.
-      LOAD_MERGE_BYPASS : integer := 1;
-      -- A load's follower waits for its rt field only if it reads rt, as on
-      -- the R4600; see cpu.vhd's LOAD_RT_EXACT.
-      LOAD_RT_EXACT : integer := 1;
-      -- An FPU add or subtract with no cancellation takes 4 cycles to a
-      -- dependent instruction, as on the R4600; see cpu.vhd's FPU_ADD_FAST
-      -- and FPU_FORWARD.
-      FPU_ADD_FAST : integer := 1;
-      FPU_FORWARD : integer := 1;
-      -- The data cache reads the next line ahead; see cpu.vhd's
-      -- DCACHE_READ_AHEAD. KI's heavy frames miss almost always on the line
-      -- after the previous miss.
-      DCACHE_READ_AHEAD : integer := 1;
-      -- A clean data-cache demand miss fetches its line straight from
-      -- ki_sdram_burst's second port, as do the read-ahead's line fetch and
-      -- an uncached 64-bit load of SDRAM RAM; see cpu.vhd's DIRECT_FILL.
-      DIRECT_FILL : integer := 1;
-      -- The read-ahead's line fetch takes the direct port from the data
-      -- cache's ask, a cycle sooner; see cpu.vhd's RA_LAUNCH_EARLY.
-      RA_LAUNCH_EARLY : integer := 1;
-      -- The data cache's read-ahead crosses a 4 KB page for an unmapped load
-      -- of low or main RAM; see cpu.vhd's DCACHE_RA_CROSS_PAGE.
-      RA_CROSS_PAGE : integer := 1;
-      -- A direct read-ahead's line comes back a qword at a time on the
-      -- controller's clock, as an uncached qword does; see cpu.vhd's
-      -- RA_CTL_RETURN.
-      RA_CTL_RETURN : integer := 1;
-      -- The read-ahead after the one the data cache waits for leaves as that
-      -- one completes; see cpu.vhd's RA_CHAIN (1, or 2 a cycle sooner).
-      RA_CHAIN : integer := 1
-   );
    port
    (
       clk1x          : in  std_logic;
-      clk93          : in  std_logic;
+      clk2x          : in  std_logic;
       reset          : in  std_logic;
       irq            : in  std_logic_vector(1 downto 0);
-      -- The system is paused. Synchronised into clk93, it stops Count and
+      -- The system is paused. Synchronised into clk2x, it stops Count and
       -- keeps the stall watchdog from flagging a CPU the memory bridge is
       -- holding on purpose; see ki_memory_bridge's cpu_hold.
       pause          : in  std_logic := '0';
@@ -141,16 +62,18 @@ architecture rtl of ki_cpu_core is
    signal address_u      : unsigned(31 downto 0);
    signal size_u         : unsigned(2 downto 0);
    signal reset_1x_pipe  : std_logic_vector(1 downto 0) := (others => '1');
-   signal reset_93_pipe  : std_logic_vector(1 downto 0) := (others => '1');
+   signal reset_2x_pipe  : std_logic_vector(1 downto 0) := (others => '1');
    signal irq_meta       : std_logic_vector(1 downto 0) := (others => '0');
    signal irq_sync       : std_logic_vector(1 downto 0) := (others => '0');
    signal pause_meta     : std_logic := '0';
    signal pause_sync     : std_logic := '0';
 
-   -- The core's lost-cycle census, cpu.vhd's debug_perf_events. Nothing
-   -- here reads it; it is there to measure the CPU by, and synthesis prunes
-   -- it.
+   -- The core's lost-cycle census, cpu.vhd's debug_perf_events, in
+   -- simulation only. Nothing here reads it; it is there to measure the CPU
+   -- by.
+-- synthesis translate_off
    signal perf_events    : std_logic_vector(11 downto 0);
+-- synthesis translate_on
 begin
    mem_address <= std_logic_vector(address_u);
    mem_size    <= std_logic_vector(size_u);
@@ -165,16 +88,16 @@ begin
       end if;
    end process;
 
-   process (clk93, reset)
+   process (clk2x, reset)
    begin
       if (reset = '1') then
-         reset_93_pipe <= (others => '1');
+         reset_2x_pipe <= (others => '1');
          irq_meta      <= (others => '0');
          irq_sync      <= (others => '0');
          pause_meta    <= '0';
          pause_sync    <= '0';
-      elsif (rising_edge(clk93)) then
-         reset_93_pipe <= reset_93_pipe(0) & '0';
+      elsif (rising_edge(clk2x)) then
+         reset_2x_pipe <= reset_2x_pipe(0) & '0';
          irq_meta      <= irq;
          irq_sync      <= irq_meta;
          pause_meta    <= pause;
@@ -186,31 +109,6 @@ begin
       generic map
       (
          LITTLE_ENDIAN        => true,
-         DCACHE_SKIP_FILL     => (DCACHE_SKIP_FILL /= 0),
-         DCACHE_FB_PARTIAL    => (DCACHE_FB_PARTIAL /= 0),
-         DCACHE_WB_EARLY      => (DCACHE_WB_EARLY /= 0),
-         LOAD_INTERLOCK       => (LOAD_INTERLOCK /= 0),
-         DCACHE_STORE_BUFFER  => (DCACHE_STORE_BUFFER /= 0),
-         DCACHE_SB_FORWARD    => (DCACHE_SB_FORWARD /= 0),
-         DCACHE_EARLY_RESTART => (DCACHE_EARLY_RESTART /= 0),
-         DCACHE_RA_ANSWER     => (DCACHE_RA_ANSWER /= 0),
-         DCACHE_CWF_FB        => (DCACHE_CWF_FB /= 0),
-         DCACHE_FILL_FIRST    => (DCACHE_FILL_FIRST /= 0),
-         DCACHE_FILL_AT_MISS  => (DCACHE_FILL_AT_MISS /= 0),
-         UNC_FAST_DONE        => (UNC_FAST_DONE /= 0),
-         UNC_LAUNCH_S3        => (UNC_LAUNCH_S3 /= 0),
-         UNC_BRIDGE_FAST_DONE => (UNC_BRIDGE_FAST_DONE /= 0),
-         SYNC_CROSSING        => (SYNC_CROSSING /= 0),
-         LOAD_MERGE_BYPASS    => (LOAD_MERGE_BYPASS /= 0),
-         LOAD_RT_EXACT        => (LOAD_RT_EXACT /= 0),
-         FPU_ADD_FAST         => (FPU_ADD_FAST /= 0),
-         FPU_FORWARD          => (FPU_FORWARD /= 0),
-         DCACHE_READ_AHEAD    => (DCACHE_READ_AHEAD /= 0),
-         DIRECT_FILL          => (DIRECT_FILL /= 0),
-         RA_LAUNCH_EARLY      => (RA_LAUNCH_EARLY /= 0),
-         DCACHE_RA_CROSS_PAGE => (RA_CROSS_PAGE /= 0),
-         RA_CTL_RETURN        => (RA_CTL_RETURN /= 0),
-         RA_CHAIN             => RA_CHAIN,
          -- KI uses the 32-bit exception-address contract.
          ADDR32_ONLY          => true,
          -- KI does not use the optional trap-instruction exception path.
@@ -218,30 +116,22 @@ begin
          -- KI instruction fetches use KSEG0/KSEG1.
          INSTR_KSEG_ONLY      => true,
          -- KI never converts a long outside +-2^55 to floating point.
-         FPU_CVT_L_NARROW     => true
+         FPU_CVT_L_NARROW     => true,
+         -- Both games' exception handlers serve only the timer interrupt and
+         -- restart the board on any other cause, so neither takes an address
+         -- error or a floating-point trap.
+         NO_ADDRESS_ERROR     => true,
+         NO_FPU_EXCEPTION     => true
       )
       port map
       (
          clk1x                 => clk1x,
-         clk93                 => clk93,
-         ce_1x                 => '1',
-         ce_93                 => '1',
+         clk2x                 => clk2x,
          reset_1x              => reset_1x_pipe(1),
-         reset_93              => reset_93_pipe(1),
-         preNMI                => '0',
-         INSTRCACHEON          => '1',
-         DATACACHEON           => '1',
-         DATACACHESLOW         => (others => '0'),
-         DATACACHEFORCEWEB     => '0',
-         -- KI writes code and its visible framebuffers through KSEG0 during
-         -- bootstrap. Keep those stores coherent with instruction fetch and
-         -- scanout until the complete R4600 cache-op path is proven.
+         reset_2x              => reset_2x_pipe(1),
+         -- The data cache is write-back, as on the R4600; write-through is
+         -- not used.
          DATACACHEWRITETHROUGH => '0',
-         DATACACHETLBON        => '1',
-         RANDOMMISS            => (others => '0'),
-         DISABLE_BOOTCOUNT     => '0',
-         DISABLE_DTLBMINI      => '0',
-         ALECK64               => '1',
          irqRequest            => irq_sync,
          cpuPaused             => pause_sync,
          error_instr           => errors(0),
@@ -257,7 +147,11 @@ begin
          -- Simulation-only taps.
          debug_cop0_cause_live   => open,
          debug_cop0_epc_live     => open,
+-- synthesis translate_off
          debug_perf_events       => perf_events,
+         cpu_done              => open,
+         cpu_export            => open,
+-- synthesis translate_on
          mem_request           => mem_request,
          mem_rnw               => mem_rnw,
          mem_address           => address_u,
@@ -272,7 +166,6 @@ begin
          mem_dataRead          => mem_dataRead,
          mem_done              => mem_done,
          rdram_granted2x       => cache_grant,
-         rdram_done            => '0',
          ddr3_DOUT             => cache_data,
          ddr3_DOUT_READY       => cache_data_ready,
          fast_ok               => fast_ok,
@@ -286,21 +179,6 @@ begin
          fast_done_tog         => fast_done_tog,
          fast_unc_valid        => fast_unc_valid,
          fast_unc_qword        => fast_unc_qword,
-         fast_ra_valid         => fast_ra_valid,
-         ram_done              => '0',
-         ram_rnw               => '1',
-         ram_dataRead          => (others => '0'),
--- synthesis translate_off
-         cpu_done              => open,
-         cpu_export            => open,
--- synthesis translate_on
-         SS_reset              => reset_93_pipe(1),
-         loading_savestate     => '0',
-         SS_DataWrite          => (others => '0'),
-         SS_Adr                => (others => '0'),
-         SS_wren_CPU           => '0',
-         SS_rden_CPU           => '0',
-         SS_DataRead_CPU       => open,
-         SS_idle               => open
+         fast_ra_valid         => fast_ra_valid
       );
 end architecture;

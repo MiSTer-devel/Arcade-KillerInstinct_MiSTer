@@ -159,7 +159,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // combinational because S_MEM already stages its effective address before
     // S_EXEC commits a write; adding another address/data register changes the
     // ADSP program-memory contract. At most one access is issued per port per
-    // clock (see the ONE-READ-ONE-WRITE-PER-PORT AUDIT below).
+    // clock (see the one-read/one-write-per-port contract table at the main FSM).
     wire [13:0] pmb_addr;   wire [23:0] pmb_q;
     wire [13:0] dm_addr;    reg [15:0] dm_q;
     always @(posedge clk) begin
@@ -259,7 +259,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // Sound-ROM port (request/ready handshake, see dcs_mem): the requester
     // (bank-window S_MEM stall, or the S_BOOT stream) holds rom_req with
     // rom_addr stable and waits for rom_rdy; behind it, dcs_mem fetches from the
-    // HPS DDR3 read path (Partition C).
+    // HPS DDR3 read path.
     wire        rom_req;
     wire [22:0] rom_addr;
     wire        rom_rdy;
@@ -814,11 +814,11 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
         begin
             c_nz = a;
             if ((r & 32'h0000ffff)==0) c_nz = c_nz | 16'h0001;
-            c_nz = c_nz | ((r >> 14) & 16'h0002);
+            c_nz = c_nz | (16'(r >> 14) & 16'h0002);
         end
     endfunction
     function [15:0] c_v(input [15:0] a, input [31:0] s, input [31:0] d, input [31:0] r);
-        c_v = a | (((s ^ d ^ r ^ (r>>1)) >> 13) & 16'h0004);   // V flag
+        c_v = a | (16'((s ^ d ^ r ^ (r>>1)) >> 13) & 16'h0004);   // V flag
     endfunction
 
     // Combinational ALU result generator. Returns
@@ -849,9 +849,9 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             astn = c_nz(astn, {15'h0, r});
             s32 = {16'h0, xv}; d32 = {16'h0, yv}; r32 = {15'h0, r};
             case (sub)
-              4'h2,4'h3: begin astn=c_v(astn,s32,d32,r32); astn=astn | ((r32>>13)&16'h0008); end
-              4'h6,4'h7: begin astn=c_v(astn,s32,d32,r32); astn=astn | (((~r32)>>13)&16'h0008); end
-              4'h9,4'ha: begin astn=c_v(astn,d32,s32,r32); astn=astn | (((~r32)>>13)&16'h0008); end
+              4'h2,4'h3: begin astn=c_v(astn,s32,d32,r32); astn=astn | (16'(r32>>13)&16'h0008); end
+              4'h6,4'h7: begin astn=c_v(astn,s32,d32,r32); astn=astn | (16'((~r32)>>13)&16'h0008); end
+              4'h9,4'ha: begin astn=c_v(astn,d32,s32,r32); astn=astn | (16'((~r32)>>13)&16'h0008); end
               4'h1: if(yv==16'h7fff) astn=astn|16'h0004; else if(yv==16'hffff) astn=astn|16'h0008;
               4'h5: begin if(yv==16'h8000) astn=astn|16'h0004; if(yv==16'h0000) astn=astn|16'h0008; end
               4'h8: if(yv==16'h8000) astn=astn|16'h0004; else if(yv==16'h0000) astn=astn|16'h0008;
@@ -1156,6 +1156,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
         reg [15:0] xr; reg signed [31:0] xs; reg [31:0] xu, res;
         integer e; reg signed [15:0] sev;
         begin
+            xs = 32'sh0; xu = 32'h0; e = 0; sev = 16'sh0;
             o_res=32'h0; o_se=16'h0; o_ss=1'b0; o_sbr=16'h0;
             o_se_we=1'b0; o_ss_we=1'b0; o_sbr_we=1'b0;
             xr = shift_xreg(xi);
@@ -1163,36 +1164,36 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             case (mode)
               4'h0, 4'h1: begin // LSHIFT (HI[,OR])
                   xu = {xr, 16'h0};
-                  if (sc > 0) res = (sc < 32)   ? (xu << sc)    : 32'h0;
-                  else        res = (sc > -32)  ? (xu >> (-sc)) : 32'h0;
+                  if (sc > 0) res = (sc < 32)   ? (xu << $unsigned(sc))    : 32'h0;
+                  else        res = (sc > -32)  ? (xu >> $unsigned(-sc)) : 32'h0;
               end
               4'h2, 4'h3: begin // LSHIFT (LO[,OR])
                   xu = {16'h0, xr};
-                  if (sc > 0) res = (sc < 32)   ? (xu << sc)    : 32'h0;
-                  else        res = (sc > -32)  ? (xu >> (-sc)) : 32'h0;
+                  if (sc > 0) res = (sc < 32)   ? (xu << $unsigned(sc))    : 32'h0;
+                  else        res = (sc > -32)  ? (xu >> $unsigned(-sc)) : 32'h0;
               end
               4'h4, 4'h5: begin // ASHIFT (HI[,OR])
                   xs = $signed({xr, 16'h0});
-                  if (sc > 0) res = (sc < 32)   ? (xs <<  sc)   : 32'h0;
-                  else        res = (sc > -32)  ? (xs >>> (-sc)) : (xs >>> 31);
+                  if (sc > 0) res = (sc < 32)   ? (xs <<  $unsigned(sc))   : 32'h0;
+                  else        res = (sc > -32)  ? (xs >>> $unsigned(-sc)) : (xs >>> 31);
               end
               4'h6, 4'h7: begin // ASHIFT (LO[,OR])
                   xs = $signed({{16{xr[15]}}, xr});
-                  if (sc > 0) res = (sc < 32)   ? (xs <<  sc)   : 32'h0;
-                  else        res = (sc > -32)  ? (xs >>> (-sc)) : (xs >>> 31);
+                  if (sc > 0) res = (sc < 32)   ? (xs <<  $unsigned(sc))   : 32'h0;
+                  else        res = (sc > -32)  ? (xs >>> $unsigned(-sc)) : (xs >>> 31);
               end
               4'h8, 4'h9: begin // NORM (HI[,OR])
                   xs = $signed({xr, 16'h0});
                   if (sc > 0) begin
                       xu  = {astat[3], xs[31:1]};     // xop>>1, carry into bit31
-                      res = xu >> (sc - 1);
+                      res = xu >> $unsigned(sc - 1);
                   end else
-                      res = (sc > -32) ? (xs << (-sc)) : 32'h0;
+                      res = (sc > -32) ? (xs << $unsigned(-sc)) : 32'h0;
               end
               4'hA, 4'hB: begin // NORM (LO[,OR])
                   xu = {16'h0, xr};
-                  if (sc > 0) res = (sc < 32)  ? (xu >> sc)    : 32'h0;
-                  else        res = (sc > -32) ? (xu << (-sc)) : 32'h0;
+                  if (sc > 0) res = (sc < 32)  ? (xu >> $unsigned(sc))    : 32'h0;
+                  else        res = (sc > -32) ? (xu << $unsigned(-sc)) : 32'h0;
               end
               4'hC: begin       // EXP (HI)
                   xs = $signed({{16{xr[15]}}, xr});
@@ -1203,7 +1204,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                       o_ss = 1'b0; o_ss_we = 1'b1;     // clear SS
                       e = clz32(xs) - 16 - 1;
                   end
-                  sev = -e; o_se = sev; o_se_we = 1'b1; // SE = -res (int8 range)
+                  sev = 16'(-e); o_se = sev; o_se_we = 1'b1; // SE = -res (int8 range)
               end
               4'hD: begin       // EXP (HIX)
                   xs = $signed({{16{xr[15]}}, xr});
@@ -1216,20 +1217,20 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                       end else begin
                           o_ss = 1'b0; o_ss_we = 1'b1; e = clz32(xs) - 16 - 1;
                       end
-                      sev = -e; o_se = sev; o_se_we = 1'b1;
+                      sev = 16'(-e); o_se = sev; o_se_we = 1'b1;
                   end
               end
               4'hE: begin       // EXP (LO)
                   if ($signed(`G0(9)[7:0]) == -8'sd15) begin
                       xs = $signed({{16{xr[15]}}, xr});
                       e  = clz32((astat[7] ? ~xs : xs) & 32'h0000ffff) - 1;
-                      sev = -e; o_se = sev; o_se_we = 1'b1;
+                      sev = 16'(-e); o_se = sev; o_se_we = 1'b1;
                   end
               end
               4'hF: begin       // EXPADJ
                   xs = $signed({{16{xr[15]}}, xr});
                   e  = clz32((xs < 0) ? ~xs : xs) - 16 - 1;
-                  if (e < -$signed(`SBR)) begin sev = -e; o_sbr = sev; o_sbr_we = 1'b1; end
+                  if (e < -$signed(`SBR)) begin sev = 16'(-e); o_sbr = sev; o_sbr_we = 1'b1; end
               end
             endcase
             if (mode < 4'hC) begin                    // SR-result modes
@@ -1345,7 +1346,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // S_EXEC. Register-file operands remain combinational flop/LUTRAM reads.
     //
     // One-read/one-write-per-port contract by state:
-    //  state    | PM-A (fetch)   | PM-B (pmb/PM-writes)      | DM read | DM write | ROM port
+    //  state    | PM-B (fetch)   | PM-A (pmb/PM-writes)      | DM read | DM write | ROM port
     //  S_BOOT   | idle re-read   | <=1 WRITE (word commit)   | -       | -        | req (stream)
     //  S_FETCH  | READ pm[pc]    | -                         | -       | -        | idle
     //  S_DECODE | re-read (same) | -                         | -       | -        | req starts (bank rd)
@@ -1355,9 +1356,9 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     //  S_MEM    | re-read        | READ ea (alias/PM/RMW)    | READ ea | -        | req held
     //  S_EXEC   | re-read        | <=1 WRITE (PM-data write  | -       | <=1 WRITE| req held
     //           |                |  OR alias-RMW merge)      |         | (dm_write)| (consume)
-    //  * PM-A: the registered fetch port re-reads pm[pc] every clock (pc moves
+    //  * PM-B: the registered fetch port re-reads pm[pc] every clock (pc moves
     //    only at EXEC) -- exactly one read per clock on a read-only port.
-    //  * PM-B: reads are consumed only from S_MEM/S_DRAIN issues; writes land
+    //  * PM-A: reads are consumed only from S_MEM/S_DRAIN issues; writes land
     //    only in S_EXEC (one per instruction: the PM-data write variants and
     //    the alias RMW are mutually exclusive opcode classes) or S_BOOT (one
     //    word commit per completed byte-triplet). Reads and writes never share
@@ -1365,7 +1366,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     //  * DM: reads issued in S_MEM/S_DRAIN only; writes in S_EXEC only (one
     //    dm_write per instruction). The sim's always-reading registered port
     //    is 1 read/clock; the unconsumed reloads are don't-cares.
-    //  * S_DRAIN reads BOTH PM-B and DM at dr_cur each clock -- one read on
+    //  * S_DRAIN reads BOTH PM-A and DM at dr_cur each clock -- one read on
     //    EACH port (legal); only the region-selected value is consumed.
     //  * ROM port: one level-held request in flight at a time (S_BOOT stream
     //    xor one bank-window read; muxed by boot_active).
@@ -1613,7 +1614,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             end else begin
                 div_t = {div_rem, div_nd[15]};    // shift in next dividend bit
                 if (div_t >= {1'b0, div_v}) begin
-                    div_rem <= div_t - {1'b0, div_v};   // fits 17 bits: rem < divisor
+                    div_rem <= 17'(div_t - {1'b0, div_v});   // fits 17 bits: rem < divisor
                     div_q   <= {div_q[14:0], 1'b1};
                 end else begin
                     div_rem <= div_t[16:0];             // < divisor <= 0x1FFFE
@@ -1748,7 +1749,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                         ab_reg = {16'h0, baseR[ab_ireg]};  // reset to base
                         irq1_pulse <= 1'b1;         // pulse IRQ1 on wrap
                     end
-                    iR[ab_ireg]  <= ab_reg & 16'h3FFF;
+                    iR[ab_ireg]  <= ab_reg[15:0] & 16'h3FFF;
                     // write-back re-bases too
                     baseR[ab_ireg] <= ab_reg[13:0] & lmask[ab_ireg];
                     // Consume the drain-due flag. The DAC-slot
@@ -1867,10 +1868,10 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                   if (op[3])  mstat_tmp = (mstat_tmp & ~16'h0040) | (op[2]  ? 16'h0040 : 16'h0); // GOMODE
                   if (op[13]) mstat_tmp = (mstat_tmp & ~16'h0010) | (op[12] ? 16'h0010 : 16'h0); // INTEGER
                   if (op[15]) mstat_tmp = (mstat_tmp & ~16'h0020) | (op[14] ? 16'h0020 : 16'h0); // TIMER
-                  if (op[5])  mstat_tmp = (mstat_tmp & ~16'h0001) | ((op>>4) & 16'h0001); // BANK
-                  if (op[7])  mstat_tmp = (mstat_tmp & ~16'h0002) | ((op>>5) & 16'h0002); // REVERSE
-                  if (op[9])  mstat_tmp = (mstat_tmp & ~16'h0004) | ((op>>6) & 16'h0004); // STICKYV
-                  if (op[11]) mstat_tmp = (mstat_tmp & ~16'h0008) | ((op>>7) & 16'h0008); // SATURATE
+                  if (op[5])  mstat_tmp = (mstat_tmp & ~16'h0001) | (16'(op>>4) & 16'h0001); // BANK
+                  if (op[7])  mstat_tmp = (mstat_tmp & ~16'h0002) | (16'(op>>5) & 16'h0002); // REVERSE
+                  if (op[9])  mstat_tmp = (mstat_tmp & ~16'h0004) | (16'(op>>6) & 16'h0004); // STICKYV
+                  if (op[11]) mstat_tmp = (mstat_tmp & ~16'h0008) | (16'(op>>7) & 16'h0008); // SATURATE
                   set_mstat(mstat_tmp);
               end
 
@@ -2045,8 +2046,8 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
           end
         endcase
 
-        // ---- board reset line input register: sampled every
-        //      clock; the boundary-check states consume host_rst_r.
+        // ---- board reset line input register: sampled on every
+        //      core_ce clock; the boundary-check states consume host_rst_r.
         if (!rst) host_rst_r <= host_rst;
         // ---- DAC-rate slot accumulator: one dac_ce_in pulse equals
         //      one output sample slot consumed by the SPORT1 DAC frame. While the

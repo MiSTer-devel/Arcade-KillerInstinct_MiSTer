@@ -48,8 +48,8 @@ module ki_sdram_x2 (
   // Two words per beat, LOW word first, which is address order.
   output logic [31:0] req_dout = 32'd0,
   // Which halves of req_dout carry a word. Always 2'b11 except on the final
-  // beat of an ODD burst, which the core never issues: every cache, video and
-  // ROM path uses 2, 4 or 16.
+  // beat of an ODD burst, which the core never issues: every burst the
+  // bridge asks for is an even number of words.
   //
   // Like req_dout, this HOLDS between beats rather than clearing. A
   // single-word requester is allowed to take its data at the completion

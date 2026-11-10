@@ -13,7 +13,7 @@
 // ki_board_pkg::ki_storage_address, and goes to the controller with the
 // toggle. Both hold until the next request, which cannot come before this
 // one's done. req_stream holds beside them and goes to the controller as
-// they do: a line read that is a stream's (ki_sdram_burst, RA_ROW_HOLD).
+// they do: a line read that is a stream's (ki_sdram_burst, design choice 4).
 //
 // The controller returns the line's sixteen words on its clock, one a clock.
 // Four make a qword, which goes on clk - into the cache's fill port, or a
@@ -22,22 +22,21 @@
 // qword completes, and first marks the line's first. A qword completes every
 // four controller clocks, two clk cycles, so clk always keeps up, and the
 // qword register holds for both. window is high from the request until the
-// fourth beat - the first, for a qword - and done_tog changes on that beat;
-// the CPU's clock takes it as the read's completion.
+// fourth beat, and done_tog changes on that beat; the CPU's clock takes it as
+// the read's completion.
 //
-// With UNC_CTL_RETURN a qword read goes back another way: its qword is
-// unc_qword for the one controller clock its fourth word is in the
-// controller's register, while unc_valid is high, and the CPU's clock takes
-// it from there. That clock is the controller's frequency, on the same PLL,
-// so it samples the pulse exactly once. Such a read opens no window and moves
-// neither qtog nor done_tog, so the beats of the line after it are that
-// line's.
+// A qword read goes back another way: its qword is unc_qword for the one
+// controller clock its fourth word is in the controller's register, while
+// unc_valid is high, and the CPU's clock takes it from there. That clock is
+// the controller's frequency, on the same PLL, so it samples the pulse
+// exactly once. Such a read opens no window and moves neither qtog nor
+// done_tog, so the beats of the line after it are that line's.
 //
 // A line read with bit 1 of its address set goes back the same way, a qword
 // at a time: each of its four qwords is unc_qword for the one controller
 // clock its fourth word is in the controller's register, while ra_valid is
-// high, and the CPU's clock takes each and counts them (cpu.vhd,
-// RA_CTL_RETURN). No line address has bit 1 set, as none has bit 0, so the
+// high, and the CPU's clock takes each and counts them (cpu.vhd's direct
+// read-ahead). No line address has bit 1 set, as none has bit 0, so the
 // bit only marks the read. It opens no window and moves neither qtog nor
 // done_tog either.
 //
@@ -46,10 +45,7 @@
 // one's first beat has come, so the controller has taken it. Its window
 // opens when the first's closes. The controller takes it once the first has
 // drained, so its words come after all of the first's.
-module ki_fast_fill #(
-  // An uncached qword read returns on unc_valid; see above.
-  parameter bit UNC_CTL_RETURN = 1'b1
-) (
+module ki_fast_fill (
   input  wire         clk,          // clk_core
   input  wire         clk_ctl,      // clk_sdram_ctl, twice clk, same PLL
   // From the CPU's clock.
@@ -68,8 +64,8 @@ module ki_fast_fill #(
   output wire         first,
   output wire  [63:0] qword,
   output logic        done_tog = 1'b0,
-  // An uncached qword read's qword, on clk_ctl (UNC_CTL_RETURN); and a
-  // marked line read's qwords, on ra_valid, on the same bus.
+  // An uncached qword read's qword, on clk_ctl; and a marked line read's
+  // qwords, on ra_valid, on the same bus.
   output wire         unc_valid,
   output wire  [63:0] unc_qword,
   output wire         ra_valid
@@ -90,7 +86,7 @@ module ki_fast_fill #(
   logic [47:0] acc  = 48'd0;
   logic [63:0] q    = 64'd0;
   logic        qtog = 1'b0;
-  wire         ctl_qword = UNC_CTL_RETURN && req_line[0];
+  wire         ctl_qword = req_line[0];
   wire         ctl_line  = !req_line[0] && req_line[1];
   assign unc_valid = word_valid && (widx == 2'd3) && ctl_qword;
   assign ra_valid  = word_valid && (widx == 2'd3) && ctl_line;
@@ -112,9 +108,7 @@ module ki_fast_fill #(
   // One beat a qword on clk.
   logic       qseen = 1'b0;
   logic       rseen = 1'b0;
-  logic       req_tog_d = 1'b0;
   logic [1:0] bcnt  = 2'd0;
-  logic       qword_read = 1'b0;
   assign beat  = window && (qtog != qseen);
   assign first = beat && (bcnt == 2'd0);
   assign qword = q;
@@ -123,12 +117,11 @@ module ki_fast_fill #(
       rseen      <= req_tog;
       window     <= !ctl_qword && !ctl_line;
       bcnt       <= 2'd0;
-      qword_read <= req_line[0];
     end
     if (beat) begin
       qseen <= qtog;
       bcnt  <= bcnt + 2'd1;
-      if (bcnt == 2'd3 || qword_read) begin
+      if (bcnt == 2'd3) begin
         window   <= 1'b0;
         done_tog <= ~done_tog;
       end
@@ -136,6 +129,7 @@ module ki_fast_fill #(
   end
 
 `ifndef SYNTHESIS
+  logic req_tog_d = 1'b0;
   // The CPU's eligibility test and ki_board_pkg's map describe the same
   // memory: a direct read is a line, or a qword, of low or main RAM outside
   // the framebuffer pages. Bit 1 of a line's address only marks it.

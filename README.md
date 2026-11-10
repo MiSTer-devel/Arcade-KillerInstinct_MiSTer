@@ -59,7 +59,7 @@ Included PDF character move lists can be placed in ```docs/kinst/``` and ```docs
 ## Credits
 Core by [Keith Conger](https://github.com/kconger)
 
-R4300i CPU adapted from the [N64](https://github.com/MiSTer-devel/N64_MiSTer) MiSTer core
+VR4300 CPU adapted from the [N64](https://github.com/MiSTer-devel/N64_MiSTer) MiSTer core
 
 `adsp2105.sv` and `dcs_mem.sv` adapted from the [Wolf Unit](https://github.com/blahm1d/wolf-unit) MiSTer core
 
