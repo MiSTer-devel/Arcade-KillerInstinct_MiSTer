@@ -4,7 +4,7 @@ This report compares results from the Killer Instinct memory, CPU and IDE test R
 
 | Platform | Source | Test ROM build |
 |---|---|---|
-| **Original hardware** | Real KI board, A-19489 | Nov 7 2026 |
+| **Original hardware** | Real KI board, A-19489, measured 2026-11-09 | Nov 7 2026 (current CPU tests) |
 | **MiSTer core** | This core, release build with all six CPU features disabled (section 10), measured 2026-11-08 | Nov 7 2026 |
 
 **Original hardware measurements courtesy of [MisterAddons](https://github.com/misteraddons).**
@@ -17,7 +17,7 @@ The Nov 7 test ROM reorganizes the pages by what they test and adds caches, TLB,
 
 ## Summary
 
-- **The board passes 263 of the 264 CPU tests on the Nov 7 ROM.** The one failure, `umode/kernel_addr_badvaddr`, was the test's own expectation, and the test now expects what the board reported (see section 10). PRId, FIR and Config match the board exactly.
+- **The board passes all 252 CPU tests on the current ROM** (2,708 checks, 0 failed), including the corrected `umode/kernel_addr_badvaddr` (see section 10). PRId, FIR and Config match the board exactly.
 - **With every CPU feature enabled, the core passes all 252 tests on the current ROM.** The release build disables six features that KI does not use, and it fails only the 45 tests that exercise them.
 - **The heavy frame (KI2 barrel explosion) is within 1.2% of the board** (3,615 vs 3,660 kcycles), and the rendered checksum is identical.
 - **Where the board uses its fastest memory (SRAM, VRAM), the core's reads are within 2% of the board.** Uncached SRAM reads are 98.0% of the board's speed. Cached reads are 99.5%.
@@ -111,10 +111,10 @@ On the board, every bar is the same height across SRAM, VRAM0 and VRAM1. On the 
 | Test | Original HW | MiSTer core | Core − HW |
 |---|---:|---:|---:|
 | Chase, 128 KiB shuffled, 4096 nodes | 24.21 | 26.10 | +1.89 |
-| Stride 32 | 24.21 | 26.07 | +1.86 |
-| Stride 64 | 24.21 | 26.10 | +1.89 |
+| Stride 32 | 24.20 | 26.07 | +1.87 |
+| Stride 64 | 24.20 | 26.10 | +1.90 |
 | Stride 128 | 24.21 | 26.07 | +1.86 |
-| Stride 256 | 24.21 | 26.07 | +1.86 |
+| Stride 256 | 24.20 | 26.07 | +1.87 |
 | Stride 512 | 24.20 | 26.10 | +1.90 |
 | Stride 1 Ki | 24.21 | 26.07 | +1.86 |
 | Stride 2 Ki | 24.20 | 26.07 | +1.87 |
@@ -130,7 +130,7 @@ Every latency case on the core is a steady ~1.9 cycles above the board. Neither 
 
 | Test | Original HW | MiSTer core |
 |---|---:|---:|
-| 4 of 4 words | 46.85 | 23.56 |
+| 4 of 4 words | 46.86 | 23.56 |
 | 1 of 4 words | 45.36 | 13.79 |
 | Ratio | 0.96 | 0.58 |
 
@@ -150,11 +150,11 @@ Cycles, best of 3, each loop warmed once first.
 | `lw`, 8 destinations | cyc/load | 1.03 | 1.03 | match |
 | `lw` chain | cyc/load | 2.01 | 2.01 | match |
 | 2 lines per set | cyc/access | 1.03 | 3.03 | +2.00 |
-| 3 lines per set | cyc/access | 24.20 | 13.05 | −11.15 |
+| 3 lines per set | cyc/access | 24.21 | 13.05 | −11.16 |
 | A B A C | cyc/access | 18.15 | 19.57 | +1.42 |
-| Dirty victim | cyc/access | 33.56 | 21.37 | −12.19 |
+| Dirty victim | cyc/access | 33.57 | 21.37 | −12.20 |
 | Index Writeback Invalidate | cyc/op | 12.01 | 4.03 | −7.98 |
-| `sw` + Hit Writeback Invalidate | cyc/op | 68.25 | 74.14 | +5.89 |
+| `sw` + Hit Writeback Invalidate | cyc/op | 68.26 | 74.14 | +5.88 |
 | `lw` + Hit Invalidate | cyc/op | 36.12 | 27.30 | −8.82 |
 
 Both caches keep two lines in a set without a miss, but the core pays 2 cycles more per access for it. With three lines per set, both miss on every access, and the core's miss is cheaper. A write-back of a dirty victim also costs the core less. A Hit Writeback Invalidate after a store is the one cache operation where the core is slower.
@@ -263,7 +263,7 @@ Add, divide and square root match the board to within 0.05 cycles. Multiply is 1
 | Compare interrupt, min | 10.00 | 12.00 |
 | Compare interrupt, max | 54.00 | 88.00 |
 | Vblank interrupt, min | 12.00 | 12.00 |
-| Vblank interrupt, max | 18.00 | 24.00 |
+| Vblank interrupt, max | 20.00 | 24.00 |
 | `syscall` + `eret` | 39.03 | 42.04 |
 
 ### I/O reads (cycles)
@@ -286,7 +286,7 @@ Add, divide and square root match the board to within 0.05 cycles. Multiply is 1
 | DCS acknowledge, max (µs) | 78.94 | 58.14 | |
 | DCS boot (ms) | 0.05 | 0.05 | |
 
-The core's frame period matches the board to 0.03%, but its vblank is 234 µs shorter. Its worst-case interrupt latencies are longer than the board's: 88 cycles against 54 for Compare, and 24 against 18 for vblank. The IDE status register and the boot ROM read faster on the core. The SRAM word read is the one I/O read that is slower, at 28.10 cycles against 12.03. The DCS boot time is 0.05 ms on both, which is too short for a DSP boot, so the test probably times the first byte's handshake.
+The core's frame period matches the board to 0.03%, but its vblank is 234 µs shorter. Its worst-case interrupt latencies are longer than the board's: 88 cycles against 54 for Compare, and 24 against 20 for vblank. The IDE status register and the boot ROM read faster on the core. The SRAM word read is the one I/O read that is slower, at 28.10 cycles against 12.03. The DCS boot time is 0.05 ms on both, which is too short for a DSP boot, so the test probably times the first byte's handshake.
 
 ---
 
@@ -327,7 +327,7 @@ The core finishes the frame 1.2% faster than the board, and every sprite is with
 | D-cache `lw` chain | 2.01 | 2.01 | 2.01 | 2.01 | 2.01 | 2.01 |
 | Uncached SRAM `ld` | 12.06 | 12.07 | 12.07 | 12.17 | 12.18 | 12.20 |
 | Uncached VRAM `ld` | 12.08 | 12.08 | 12.08 | 12.03 | 12.03 | 12.03 |
-| Uncached DRAM `ld` | 14.15 | 14.18 | 14.19 | 12.17 | 12.18 | 12.20 |
+| Uncached DRAM `ld` | 14.15 | 14.17 | 14.19 | 12.17 | 12.18 | 12.20 |
 
 Both platforms are steady from run to run: no kernel varies by more than 0.04 cycles. The core's SRAM and DRAM loads, which share its SDRAM, spread a little more than the board's SRAM loads.
 
@@ -335,29 +335,29 @@ Both platforms are steady from run to run: no kernel varies by more than 0.04 cy
 
 ## 10. CPU tests (iris cpu-tests, R4600 expectations, little-endian)
 
-| | Original HW (Nov 7 ROM) |
+| | Original HW (current 252-test ROM) |
 |---|---|
 | CPU | R4600 |
 | PRId | `0x2020` |
 | FIR | `0x2020` |
 | Config | `0x000264B3` |
-| Checks | 2,764 passed, 2 failed |
-| Tests | 264 run, 1 failed |
+| Checks | 2,708 passed, 0 failed |
+| Tests | 252 run, 0 failed |
 
-The one failure is `umode/kernel_addr_badvaddr`. The test checks what the R4600 writes to the upper half of BadVAddr when 32-bit User or Supervisor code touches a Kernel address. It expected `0x3FFFFF00`, the value the board had reported for a User-mode load from KSEG0. The board reports that value for User-mode loads from KSEG1, KSEG2 and KSEG3 and a User-mode store to KSEG0. It reports the plain sign extension for the other two cases:
+The board passes every test on the current ROM. On the earlier 264-test ROM it failed one, 2,764 checks passed and 2 failed: `umode/kernel_addr_badvaddr`. The test checks what the R4600 writes to the upper half of BadVAddr when 32-bit User or Supervisor code touches a Kernel address. It expected `0x3FFFFF00`, the value the board had reported for a User-mode load from KSEG0. The board reports that value for User-mode loads from KSEG1, KSEG2 and KSEG3 and a User-mode store to KSEG0. It reports the plain sign extension for the other two cases:
 
 | Case | Board's BadVAddr |
 |---|---|
 | User-mode jump to KSEG0 (instruction fetch) | `0xFFFFFFFF88058008` (sign extension) |
 | Supervisor-mode load from KSEG0 | `0xFFFFFFFF80000000` (sign extension) |
 
-So the R4600's `0x3FFFFF00` upper half applies only to User-mode loads and stores. The test now expects exactly that.
+So the R4600's `0x3FFFFF00` upper half applies only to User-mode loads and stores. The test now expects exactly that, and the board passes it.
 
-The current test ROM also adds `excep/user_fetch_via_tlb` and drops the 13 MIPS IV tests (the `mips4` and `mips4_fp` groups). The R4600 is a MIPS III part, so on it those tests only checked that each MIPS IV instruction is refused. That leaves 252 tests. The current build has not been run on the board yet.
+The current test ROM also adds `excep/user_fetch_via_tlb` and drops the 13 MIPS IV tests (the `mips4` and `mips4_fp` groups). The R4600 is a MIPS III part, so on it those tests only checked that each MIPS IV instruction is refused. That leaves 252 tests.
 
 ### Core with every CPU feature enabled
 
-Measured 2026-11-09 on a build with all six generics below set to false, running the current 252-test ROM. **The core passes all 252 tests.** PRId, FIR and Config match the board exactly.
+Measured 2026-11-09 on a build with all six generics below set to false, running the current 252-test ROM. **The core passes all 252 tests, like the board.** PRId, FIR and Config match the board exactly.
 
 | | MiSTer core (all features enabled) |
 |---|---|
@@ -427,7 +427,7 @@ All 45 failures exercise features that KI does not use. None of them affect the 
 | `lwc1` → `add.s` | **+4.03 cycles** | |
 | Dependent-miss latency | **~1.9 cycles slower** (+7.8%) | |
 | Vblank length | 234 µs shorter | Frame period matches to 0.03% |
-| Interrupt latency, worst case | Compare +34 cycles, vblank +6 cycles | Best case matches within 2 cycles |
+| Interrupt latency, worst case | Compare +34 cycles, vblank +4 cycles | Best case matches within 2 cycles |
 | `mfc0 Count` | +2.00 cycles | |
 | D-cache, 2 lines per set | +2.00 cycles | |
 | `mov.s` / `neg.s` / `cvt.w` | ~+1 cycle | |
