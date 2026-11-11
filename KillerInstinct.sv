@@ -137,7 +137,7 @@ localparam CONF_STR = {
 	"-;",
 	"R0,Reset;",
 	"J1,High Quick,High Medium,High Fierce,Low Quick,Low Medium,Low Fierce,Start,Coin,Service,Test,Pause;",
-	"V,1.60"
+	"V,v",`BUILD_DATE
 };
 
 wire [1:0] buttons;
@@ -179,9 +179,10 @@ wire sd_buff_wr;
 //                                                see KillerInstinct.sdc.
 //   clk_ddr           2         100 MHz  0       DDRAM_CLK and the bridge's
 //                                                DDR side
-//   clk_sdram_pin     3         100 MHz  6750ps  leaves the chip as SDRAM_CLK
+//   clk_sdram_pin     3         100 MHz  6750ps  leaves the chip as SDRAM_CLK,
+//                                                through a DDR register
 //   clk_sdram_ctl     4         100 MHz  500ps   ki_sdram_burst's logic
-//   clk_sdram_cap     5         100 MHz  1500ps  captures SDRAM_DQ in the
+//   clk_sdram_cap     5         100 MHz  1250ps  captures SDRAM_DQ in the
 //                                                device's data eye
 //
 // clk_cpu and clk_ddr are configured identically, so Quartus MERGES them onto
@@ -1042,7 +1043,36 @@ assign {SD_SCK, SD_MOSI, SD_CS} = 3'bzzz;
 
 assign DDRAM_CLK = clk_ddr;
 
-assign SDRAM_CLK = clk_sdram_pin;
+// SDRAM_CLK leaves through a DDR output register in the pin's I/O cell. The
+// pin switches when clk_sdram_pin's edge reaches that register over a clock
+// network, which is how clk_sdram_cap reaches SDRAM_DQ's capture registers,
+// so the two delays track each other from the fastest silicon to the slowest.
+// The register outputs 1 while its clock is high and 0 while it is low:
+// SDRAM_CLK is clk_sdram_pin, not its inverse.
+altddio_out
+#(
+	.extend_oe_disable("OFF"),
+	.intended_device_family("Cyclone V"),
+	.invert_output("OFF"),
+	.lpm_hint("UNUSED"),
+	.lpm_type("altddio_out"),
+	.oe_reg("UNREGISTERED"),
+	.power_up_high("OFF"),
+	.width(1)
+)
+sdram_clk_ddr
+(
+	.datain_h(1'b1),
+	.datain_l(1'b0),
+	.outclock(clk_sdram_pin),
+	.dataout(SDRAM_CLK),
+	.aclr(1'b0),
+	.aset(1'b0),
+	.oe(1'b1),
+	.outclocken(1'b1),
+	.sclr(1'b0),
+	.sset(1'b0)
+);
 
 assign {UART_RTS, UART_TXD, UART_DTR} = 3'b000;
 assign USER_OUT = db15_en ? {5'b11111, db15_clk, db15_load} : 7'h7f;

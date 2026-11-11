@@ -20,8 +20,8 @@ set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
 set_global_assignment -name NUM_PARALLEL_PROCESSORS ALL
 set_global_assignment -name SAVE_DISK_SPACE OFF
 set_global_assignment -name SMART_RECOMPILE ON
-set_global_assignment -name MIN_CORE_JUNCTION_TEMP "-40"
-set_global_assignment -name MAX_CORE_JUNCTION_TEMP 100
+set_global_assignment -name MIN_CORE_JUNCTION_TEMP 0
+set_global_assignment -name MAX_CORE_JUNCTION_TEMP 85
 set_global_assignment -name POWER_PRESET_COOLING_SOLUTION "23 MM HEAT SINK WITH 200 LFPM AIRFLOW"
 set_global_assignment -name POWER_BOARD_THERMAL_MODEL "NONE (CONSERVATIVE)"
 set_global_assignment -name TIMEQUEST_MULTICORNER_ANALYSIS OFF
@@ -160,6 +160,10 @@ set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|pll:pll|
 # regional network reaches one quadrant, and the SDRAM_DQ pins are spread
 # across banks. Without it only part of the bus can take its I/O register.
 set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|pll:pll|pll_0002:pll_inst|altera_pll:altera_pll_i|outclk_wire[5]"
+# clk_sdram_pin clocks the DDR register that drives SDRAM_CLK. It takes a
+# global as well, so that its path to that I/O cell matches clk_sdram_cap's
+# path to the SDRAM_DQ cells.
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|pll:pll|pll_0002:pll_inst|altera_pll:altera_pll_i|outclk_wire[3]"
 set_instance_assignment -name ALLOW_SYNCH_CTRL_USAGE OFF -to *|SDRAM_*
 set_location_assignment PIN_AE15 -to SD_SPI_CS
 set_location_assignment PIN_AH8 -to SD_SPI_MISO

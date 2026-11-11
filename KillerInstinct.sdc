@@ -94,11 +94,9 @@ set_multicycle_path -setup -end -from [get_clocks {emu|pll|pll_inst|altera_pll_i
 # is nearer than TCK - 3.25 implies. The sweep's top point is the 10.00 ns
 # period itself, so the true window may extend past it.
 #
-# This is recorded rather than acted on. The value works on hardware, and the
-# sweep's phase is not the PLL's: SDRAM_CLK takes 13.79 ns to reach the device
-# pin while a capture clock takes 8.21 ns to reach a register, and ignoring
-# that 5.58 ns is exactly what produced three broken builds. Moving the pin
-# phase is an A/B on hardware, not an edit.
+#
+# KI_SDRAM_CLK below is clk_sdram_pin followed through that DDR register to
+# the port: the register drives 1 while its clock is high.
 create_generated_clock -name KI_SDRAM_CLK \
   -source [get_pins -compatibility_mode {emu|pll|pll_inst|altera_pll_i|general[3].gpll~PLL_OUTPUT_COUNTER|divclk}] \
   [get_ports {SDRAM_CLK}]
@@ -124,12 +122,24 @@ set_output_delay -clock KI_SDRAM_CLK -min -0.8 \
 # wtbt and burst inputs - is registered on clk_core, so it holds its value for
 # a full clk_core period, which is two clk_sdram cycles.
 #
+# THE HOLD CHECK STAYS AT THE EDGE 0.5 ns AFTER THE LAUNCH, as it does for the
+# CPU's direct port above: nothing launched on a clk_core edge may arrive
+# before the controller edge that follows it by 0.5 ns, so every register
+# takes it at the edge after that one. The strobes are why. issue_read and
+# issue_write fan out to registers that each decide for themselves whether a
+# request has arrived - old_rd and old_we in ki_sdram_burst, the request
+# registers behind new_rd and new_we, rd_d and words_left in ki_sdram_x2 - and
+# they must all decide at the SAME controller edge. If an edge detector sees
+# a strobe one edge before the request registers do, the request is never
+# taken: the controller stays ready, the adapter reports it done, and a write
+# is lost or a read returns nothing. A hold multicycle on this crossing would
+# remove exactly that check, and nothing in the logic replaces it.
+#
 # The OPPOSITE direction gets no such relaxation. The pack's 32-bit beat is
 # held for two clk_sdram_ctl cycles, but which clk_core edge captures it depends
 # on when the burst started, so the honest budget there is one cycle - 9.5 ns at
 # this phase. See ki_sdram_x2's header.
 set_multicycle_path -setup -end   -from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}]   -to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk}] 2
-set_multicycle_path -hold -end   -from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}]   -to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk}] 1
 
 # The DQ capture path: SDRAM_CLK launches, clk_sdram_cap (general[5]) captures.
 #

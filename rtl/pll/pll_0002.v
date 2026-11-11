@@ -26,7 +26,9 @@ module  pll_0002(
 );
 
 	altera_pll #(
-		.fractional_vco_multiplier("true"),
+		// Every output divides the VCO by a whole number, so the PLL runs in
+		// integer mode.
+		.fractional_vco_multiplier("false"),
 		.reference_clock_frequency("50.0 MHz"),
 		.operation_mode("direct"),
 		.number_of_clocks(6),
@@ -46,7 +48,11 @@ module  pll_0002(
 		.phase_shift2("0 ps"),
 		.duty_cycle2(50),
 		.output_clock_frequency3("100.000000 MHz"),
-		// clk_sdram_pin: leaves the chip as SDRAM_CLK.
+		// clk_sdram_pin: leaves the chip as SDRAM_CLK, through a DDR output
+		// register in the pin's I/O cell (KillerInstinct.sv). It reaches that
+		// register over a global clock network, as clk_sdram_cap reaches the
+		// capture registers, so the two delays track each other from the fastest
+		// silicon to the slowest.
 		//
 		// 6750 ps is the 100 MHz descendant of the 16750 ps this design used at
 		// 50 MHz, chosen as TCK - 3.25 ns when the controller captured DQ on its
@@ -94,18 +100,22 @@ module  pll_0002(
 		// negative): the constraint already named the nearest edge and there was no
 		// better one to name.
 		//
-		// 1500 ps is MEASURED: sim/tb_ki_sdram_phase.sv with SWEEP_CAP, the dq_stg
-		// handoff stage present, reports the window as 1.00..2.50 ns of this
-		// phase_shift, checked point by point and not a wrap. 1500 ps sits 0.50 ns
-		// above its low edge; the centre is 1750 ps. The windows quoted below were
-		// measured against clk_sdram_ctl, 0.50 ns later than this reference.
+		// 1250 ps is inside the MEASURED window: sim/tb_ki_sdram_phase.sv with
+		// SWEEP_CAP, the dq_stg handoff stage present, reports it as 1.00..2.50 ns
+		// of this phase_shift, checked point by point and not a wrap, and hardware
+		// has run at 500, 1500 and 2500 ps. Within the window the earlier edge is
+		// the one timing wants: on fast, cold silicon the device's next word
+		// arrives soonest, and the capture edge has to come before it. The windows
+		// quoted below were measured against clk_sdram_ctl, 0.50 ns later than
+		// this reference.
 		//
 		// THIS PHASE IS NOT DERIVABLE, and three attempts to derive it all shipped
 		// broken builds before that was believed:
-		//   6000 ps - ignored insertion delay. SDRAM_CLK spends 13.79 ns reaching
-		//             the device PIN, 8.3 of it in the output buffer, while this
-		//             clock spends 8.21 ns reaching a REGISTER. That 5.58 ns is
-		//             invisible in nominal time and put the capture 3.44 ns early.
+		//   6000 ps - ignored insertion delay. SDRAM_CLK, then routed to its pin
+		//             as a signal, spent 13.79 ns reaching the device PIN, while
+		//             this clock spent 8.21 ns reaching a REGISTER. That 5.58 ns
+		//             is invisible in nominal time and put the capture 3.44 ns
+		//             early.
 		//   4500 ps - traded capture margin for handoff margin by hand. The capture
 		//             and the handoff out of the I/O cell pull opposite ways, and
 		//             guessing the balance is still guessing.
@@ -116,7 +126,7 @@ module  pll_0002(
 		// Adding the handoff stage moved the working window from 3.00-9.50 down to
 		// 0.50-2.50 and narrowed it from 7.00 ns to 2.50. Re-measure after ANY
 		// change to the capture path; do not re-derive.
-		.phase_shift5("1500 ps"),
+		.phase_shift5("1250 ps"),
 		.duty_cycle5(50),
 		.output_clock_frequency6("0 MHz"),
 		.phase_shift6("0 ps"),
