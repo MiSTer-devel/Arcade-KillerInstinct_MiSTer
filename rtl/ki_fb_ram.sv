@@ -14,8 +14,7 @@
 // rtl/cpu/RamMLAB.vhd and rtl/cpu/dpram.vhd both instantiate the primitive
 // directly. This follows them.
 //
-// NUMWORDS is 38400, not 65536: the address is 16 bits because 38400 needs 16
-// bits. The bridge compacts the board's two framebuffer ranges and leaves the
+// WORDS is 38400, not 65536, although the address is 16 bits wide. The bridge compacts the board's two framebuffer ranges and leaves the
 // intervening 10 KiB holes in external SDRAM.
 //
 // Both outputs are UNREGISTERED, which in altsyncram still means the address is

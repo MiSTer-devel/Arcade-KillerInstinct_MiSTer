@@ -15,21 +15,24 @@ module ki_video_timing #(
   input  wire        clk,
   input  wire        reset,
   output logic       ce_pixel,
+  output logic       advance,
   output logic [9:0] h_count,
   output logic [9:0] v_count,
   output logic       display_enable,
   output logic       hsync_n,
   output logic       vsync_n,
   output logic       vblank,
-  output logic       frame_start,
-  output logic [31:0] vblank_count,
-  output logic       vblank_seen,
-  output logic  [9:0] max_v_count
+  output logic       frame_start
 );
   localparam int unsigned DIV_WIDTH =
     (CLOCK_DIVIDE <= 1) ? 1 : $clog2(CLOCK_DIVIDE);
 
   logic [DIV_WIDTH-1:0] pixel_divider;
+
+  // High for the clock whose closing edge steps h_count/v_count and raises
+  // ce_pixel. Logic that has to change on that same edge keys off this, since
+  // ce_pixel itself is a clock later.
+  assign advance = (pixel_divider == CLOCK_DIVIDE - 1);
 
   assign display_enable = (h_count < H_VISIBLE) && (v_count < V_VISIBLE);
   assign hsync_n = !((h_count >= H_SYNC_START) && (h_count < H_SYNC_END));
@@ -45,24 +48,16 @@ module ki_video_timing #(
       v_count       <= 10'd0;
       ce_pixel      <= 1'b0;
       frame_start   <= 1'b0;
-      vblank_count  <= 32'd0;
-      vblank_seen   <= 1'b0;
-      max_v_count   <= 10'd0;
-  end else if (pixel_divider == CLOCK_DIVIDE - 1) begin
+  end else if (advance) begin
       pixel_divider <= '0;
       ce_pixel      <= 1'b1;
       frame_start   <= 1'b0;
-      if (v_count > max_v_count)
-        max_v_count <= v_count;
-      if (vblank)
-        vblank_seen <= 1'b1;
 
       if (h_count == H_TOTAL - 1) begin
         h_count <= 10'd0;
         if (v_count == V_TOTAL - 1) begin
           v_count <= 10'd0;
           frame_start <= 1'b1;
-          vblank_count <= vblank_count + 32'd1;
         end else begin
           v_count <= v_count + 10'd1;
         end

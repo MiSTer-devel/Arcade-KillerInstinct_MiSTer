@@ -14,14 +14,13 @@ entity cpu_instrcache is
    port 
    (
       clk1x             : in  std_logic;
-      clk93             : in  std_logic;
+      clk2x             : in  std_logic;
       -- One reset per domain. The fill path below runs on clk1x, so it must be
-      -- released by a clk1x-synchronised reset: reset_93 crosses domains
-      -- unsynchronised, and once clk93 and clk1x are declared asynchronous
+      -- released by a clk1x-synchronised reset: reset_2x crosses domains
+      -- unsynchronised, and once clk2x and clk1x are declared asynchronous
       -- nothing constrains its recovery/removal any more.
       reset_1x          : in  std_logic;
-      reset_93          : in  std_logic;
-      ce_93             : in  std_logic;
+      reset_2x          : in  std_logic;
 
       ram_request       : out std_logic := '0';
       ram_active        : in  std_logic := '0';
@@ -54,9 +53,7 @@ entity cpu_instrcache is
       CacheCommandAddr  : in  unsigned(31 downto 0);
       
       TagLo_Valid       : in  std_logic;
-      TagLo_Addr        : in  unsigned(19 downto 0);
-
-      SS_reset          : in  std_logic
+      TagLo_Addr        : in  unsigned(19 downto 0)
    );
 end entity;
 
@@ -77,9 +74,9 @@ architecture arch of cpu_instrcache is
 
    -- data
    signal fill_grant       : std_logic;
-   signal fill_active_2x   : std_logic := '0';
-   signal fill_line_2x     : unsigned(8 downto 0) := (others => '0');
-   signal fill_beat_2x     : unsigned(1 downto 0) := (others => '0');
+   signal fill_active_1x   : std_logic := '0';
+   signal fill_line_1x     : unsigned(8 downto 0) := (others => '0');
+   signal fill_beat_1x     : unsigned(1 downto 0) := (others => '0');
    signal cache_ram_addr_a : std_logic_vector(10 downto 0);
    signal cache_wr_a       : std_logic;
    
@@ -114,7 +111,7 @@ begin
    )
    port map
    (
-      inclock    => clk93,
+      inclock    => clk2x,
       wren       => tag_wren_a,
       data       => tag_data_a,
       wraddress  => tag_address_a,
@@ -133,7 +130,7 @@ begin
    )
    port map
    (
-      inclock    => clk93,
+      inclock    => clk2x,
       wren       => tag_wren_a,
       data       => tag_data_a,
       wraddress  => tag_address_a,
@@ -148,30 +145,31 @@ begin
    
    -- The KI bridge returns cache-fill beats in the 50 MHz clk1x domain.
    -- Consume each ready pulse once in that same domain before crossing the
-   -- completed line into the CPU/tag domain (clk93, 100 MHz on hardware).
+   -- completed line into the CPU/tag domain (clk2x, 100 MHz on hardware).
    process (clk1x)
    begin
       if rising_edge(clk1x) then
          if (reset_1x = '1') then
-            fill_active_2x <= '0';
-            fill_line_2x   <= (others => '0');
-            fill_beat_2x   <= (others => '0');
+            fill_active_1x <= '0';
+            fill_line_1x   <= (others => '0');
+            fill_beat_1x   <= (others => '0');
          elsif (fill_grant = '1') then
-            fill_active_2x <= '1';
-            fill_line_2x   <= fill_addrTag_sav(13 downto 5);
-            fill_beat_2x   <= (others => '0');
+            fill_active_1x <= '1';
+            fill_line_1x   <= fill_addrTag_sav(13 downto 5);
+            fill_beat_1x   <= (others => '0');
             if (ddr3_DOUT_READY = '1') then
-               fill_beat_2x <= 2x"1";
+               fill_beat_1x <= 2x"1";
             end if;
          elsif (ram_active = '0') then
-            -- The transaction this window belongs to is over. See the note on
-            -- cache_wr_a below.
-            fill_active_2x <= '0';
-         elsif (fill_active_2x = '1' and ddr3_DOUT_READY = '1') then
-            if (fill_beat_2x = 2x"3") then
-               fill_active_2x <= '0';
+            -- The transaction this window belongs to is over. ddr3_DOUT_READY
+            -- pulses for every 64-bit return the bridge delivers, so a window
+            -- left open would write another transaction's data into the line.
+            fill_active_1x <= '0';
+         elsif (fill_active_1x = '1' and ddr3_DOUT_READY = '1') then
+            if (fill_beat_1x = 2x"3") then
+               fill_active_1x <= '0';
             else
-               fill_beat_2x <= fill_beat_2x + 1;
+               fill_beat_1x <= fill_beat_1x + 1;
             end if;
          end if;
       end if;
@@ -179,8 +177,8 @@ begin
 
    cache_ram_addr_a <= std_logic_vector(fill_addrTag_sav(13 downto 5) & "00")
                        when (fill_grant = '1') else
-                       std_logic_vector(fill_line_2x & fill_beat_2x);
-   cache_wr_a       <= (fill_active_2x or fill_grant) and ddr3_DOUT_READY and ram_active;
+                       std_logic_vector(fill_line_1x & fill_beat_1x);
+   cache_wr_a       <= (fill_active_1x or fill_grant) and ddr3_DOUT_READY and ram_active;
 
    icache: entity work.dpram_dif
    generic map 
@@ -197,8 +195,8 @@ begin
       data_a      => ddr3_DOUT,
       wren_a      => cache_wr_a,
       
-      clock_b     => clk93,
-      clken_b     => ce_93,
+      clock_b     => clk2x,
+      clken_b     => '1',
       address_b   => cache_address_b,
       data_b      => x"00000000",
       wren_b      => '0',
@@ -211,9 +209,9 @@ begin
    
    read_data       <= cache_q_b when LITTLE_ENDIAN else byteswap32(cache_q_b);
    
-   process (clk93)
+   process (clk2x)
    begin
-      if rising_edge(clk93) then
+      if rising_edge(clk2x) then
 
          tag_wren_a  <= '0';
          fill_done   <= '0';
@@ -223,7 +221,7 @@ begin
             fill_latched <= '1';
          end if;
 
-         if (SS_reset = '1') then
+         if (reset_2x = '1') then
             state          <= CLEARCACHE;
             tag_data_a     <= (others => '0');
             tag_address_a  <= (others => '0');
@@ -236,8 +234,11 @@ begin
                when IDLE =>
                   fill_addrTag_sav <= fill_addrTag(13 downto 0);
                   if (CacheCommandEna = '1' and (CacheCommand = 5x"00" or CacheCommand = 5x"10")) then
-                     -- HACK!
-                     -- todo: should only clear if tag matches
+                     -- Hit Invalidate (0x10) clears the indexed line without
+                     -- a tag compare, as Index Invalidate (0x00) does. The
+                     -- R4600 clears only on a tag match; clearing a line
+                     -- that holds another address costs a refetch, not
+                     -- correctness.
                      tag_wren_a     <= '1';
                      tag_data_a     <= (others => '0');
                      tag_address_a  <= std_logic_vector(CacheCommandAddr(13 downto 5));

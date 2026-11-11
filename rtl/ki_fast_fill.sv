@@ -12,7 +12,8 @@
 // mapped here to its SDRAM storage address with the bridge's own map,
 // ki_board_pkg::ki_storage_address, and goes to the controller with the
 // toggle. Both hold until the next request, which cannot come before this
-// one's done.
+// one's done. req_stream holds beside them and goes to the controller as
+// they do: a line read that is a stream's (ki_sdram_burst, design choice 4).
 //
 // The controller returns the line's sixteen words on its clock, one a clock.
 // Four make a qword, which goes on clk - into the cache's fill port, or a
@@ -21,8 +22,23 @@
 // qword completes, and first marks the line's first. A qword completes every
 // four controller clocks, two clk cycles, so clk always keeps up, and the
 // qword register holds for both. window is high from the request until the
-// fourth beat - the first, for a qword - and done_tog changes on that beat;
-// the CPU's clock takes it as the read's completion.
+// fourth beat, and done_tog changes on that beat; the CPU's clock takes it as
+// the read's completion.
+//
+// A qword read goes back another way: its qword is unc_qword for the one
+// controller clock its fourth word is in the controller's register, while
+// unc_valid is high, and the CPU's clock takes it from there. That clock is
+// the controller's frequency, on the same PLL, so it samples the pulse
+// exactly once. Such a read opens no window and moves neither qtog nor
+// done_tog, so the beats of the line after it are that line's.
+//
+// A line read with bit 1 of its address set goes back the same way, a qword
+// at a time: each of its four qwords is unc_qword for the one controller
+// clock its fourth word is in the controller's register, while ra_valid is
+// high, and the CPU's clock takes each and counts them (cpu.vhd's direct
+// read-ahead). No line address has bit 1 set, as none has bit 0, so the
+// bit only marks the read. It opens no window and moves neither qtog nor
+// done_tog either.
 //
 // A second request may come while a window is open: a demand fill queued
 // behind the one in flight (cpu.vhd, fast_go_q), asked for only once that
@@ -35,9 +51,11 @@ module ki_fast_fill (
   // From the CPU's clock.
   input  wire         req_tog,
   input  wire  [31:0] req_line,
+  input  wire         req_stream,
   // To and from the controller, on clk_ctl.
   output wire         ctl_tog,
   output wire  [24:0] ctl_addr,
+  output wire         ctl_stream,
   input  wire  [15:0] word,
   input  wire         word_valid,
   // The cache's fill port, on clk.
@@ -45,26 +63,42 @@ module ki_fast_fill (
   output wire         beat,
   output wire         first,
   output wire  [63:0] qword,
-  output logic        done_tog = 1'b0
+  output logic        done_tog = 1'b0,
+  // An uncached qword read's qword, on clk_ctl; and a marked line read's
+  // qwords, on ra_valid, on the same bus.
+  output wire         unc_valid,
+  output wire  [63:0] unc_qword,
+  output wire         ra_valid
 );
   import ki_board_pkg::*;
 
-  // Bit 0 marks a qword read, to the controller as here.
-  wire [27:0] storage = ki_storage_address({req_line[31:1], 1'b0});
+  // Bit 0 marks a qword read, to the controller as here; bit 1 a line read
+  // whose qwords go back on ra_valid.
+  wire [27:0] storage = ki_storage_address({req_line[31:2], 2'b00});
   assign ctl_tog  = req_tog;
   assign ctl_addr = {storage[24:1], req_line[0]};
+  assign ctl_stream = req_stream;
 
-  // Four words to a qword, low word first.
+  // Four words to a qword, low word first. ctl_qword: this read's qword goes
+  // back on unc_valid rather than as a beat; ctl_line: this line's qwords go
+  // back on ra_valid.
   logic  [1:0] widx = 2'd0;
   logic [47:0] acc  = 48'd0;
   logic [63:0] q    = 64'd0;
   logic        qtog = 1'b0;
+  wire         ctl_qword = req_line[0];
+  wire         ctl_line  = !req_line[0] && req_line[1];
+  assign unc_valid = word_valid && (widx == 2'd3) && ctl_qword;
+  assign ra_valid  = word_valid && (widx == 2'd3) && ctl_line;
+  assign unc_qword = {word, acc};
   always_ff @(posedge clk_ctl) begin
     if (word_valid) begin
       widx <= widx + 2'd1;
       if (widx == 2'd3) begin
-        q    <= {word, acc};
-        qtog <= ~qtog;
+        if (!ctl_qword && !ctl_line) begin
+          q    <= {word, acc};
+          qtog <= ~qtog;
+        end
       end else begin
         acc[widx * 16 +: 16] <= word;
       end
@@ -74,23 +108,20 @@ module ki_fast_fill (
   // One beat a qword on clk.
   logic       qseen = 1'b0;
   logic       rseen = 1'b0;
-  logic       req_tog_d = 1'b0;
   logic [1:0] bcnt  = 2'd0;
-  logic       qword_read = 1'b0;
   assign beat  = window && (qtog != qseen);
   assign first = beat && (bcnt == 2'd0);
   assign qword = q;
   always_ff @(posedge clk) begin
     if (req_tog != rseen && !window) begin
       rseen      <= req_tog;
-      window     <= 1'b1;
+      window     <= !ctl_qword && !ctl_line;
       bcnt       <= 2'd0;
-      qword_read <= req_line[0];
     end
     if (beat) begin
       qseen <= qtog;
       bcnt  <= bcnt + 2'd1;
-      if (bcnt == 2'd3 || qword_read) begin
+      if (bcnt == 2'd3) begin
         window   <= 1'b0;
         done_tog <= ~done_tog;
       end
@@ -98,9 +129,10 @@ module ki_fast_fill (
   end
 
 `ifndef SYNTHESIS
+  logic req_tog_d = 1'b0;
   // The CPU's eligibility test and ki_board_pkg's map describe the same
   // memory: a direct read is a line, or a qword, of low or main RAM outside
-  // the framebuffer pages.
+  // the framebuffer pages. Bit 1 of a line's address only marks it.
   wire [31:0] req_at = {req_line[31:5], 5'd0};
   wire line_is_ram =
       ((req_at <= KI_LOW_RAM_LAST) &&
@@ -109,8 +141,13 @@ module ki_fast_fill (
       ((req_at >= KI_MAIN_RAM_BASE) && (req_at <= KI_MAIN_RAM_ALIAS_LAST));
   always @(posedge clk) begin
     if ((req_tog != rseen) &&
-        (!line_is_ram || (req_line[0] ? (req_line[2:1] != 2'd0) : (req_line[4:0] != 5'd0)))) begin
+        (!line_is_ram || (req_line[0] ? (req_line[2:1] != 2'd0) : (req_line[4:2] != 3'd0)))) begin
       $error("ki_fast_fill: a direct read of %08h, which is not a line or a qword of SDRAM RAM", req_line);
+      $fatal(1);
+    end
+    // Only a line read is a stream's.
+    if ((req_tog != rseen) && req_stream && req_line[0]) begin
+      $error("ki_fast_fill: a direct qword read of %08h marked as a stream's", req_line);
       $fatal(1);
     end
     // One request waits at most: a second may come during a window, not a

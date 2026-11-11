@@ -15,7 +15,7 @@ end entity;
 
 architecture arch of cpu_mul is
 begin
-   -- The R4300 pipeline expects one registered cycle of multiplier latency.
+   -- The CPU pipeline expects one registered cycle of multiplier latency.
    process(clk)
    begin
       if rising_edge(clk) then

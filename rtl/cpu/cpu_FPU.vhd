@@ -4,9 +4,24 @@ use IEEE.numeric_std.all;
 use STD.textio.all;
 
 entity cpu_FPU is
-   port 
+   generic
    (
-      clk93             : in  std_logic;
+      -- cvt.s.l and cvt.d.l convert through the shared 57-bit path only, and
+      -- a value outside +-2^55 takes an Unimplemented Operation trap. Without
+      -- it, a 64-bit value is first shifted right into that path with its
+      -- lost bits kept as sticky, and every value converts, as on the R4600.
+      CVT_L_NARROW   : boolean := false;
+      -- No trap: the FPU obeys none of FCSR's exception enables (FCSR still
+      -- reads back what was written), so an IEEE exception sets its cause and
+      -- flag as a disabled one does, a ctc1 that sets an enabled cause only
+      -- writes FCSR, and exceptionFPU is never raised. An operation that would
+      -- take an Unimplemented Operation trap completes and writes a result
+      -- that is not defined. Without it every trap is taken, as on the R4600.
+      NO_EXCEPTION   : boolean := false
+   );
+   port
+   (
+      clk2x             : in  std_logic;
       reset             : in  std_logic;
       error_FPU         : out std_logic := '0';
       
@@ -37,9 +52,14 @@ entity cpu_FPU is
       FPUWriteData      : out unsigned(63 downto 0) := (others => '0');
       FPUWriteEnable    : out std_logic := '0';
       FPUWriteMask      : out std_logic_vector(1 downto 0) := (others => '0');
-      
-      SS_FPU_CF         : in  std_logic;
-      SS_CSR            : in  unsigned(24 downto 0)
+
+      -- The result rounded or converted this cycle, exactly as FPUWriteData
+      -- holds it next cycle, valid with result_fwd_valid: the done cycle of
+      -- an ADD, SUB, CVT, ROUND, TRUNC, CEIL or FLOOR. If it traps, the
+      -- register is not written, and the exception discards whatever took
+      -- the value. MUL, DIV and SQRT do not forward.
+      result_fwd        : out unsigned(63 downto 0);
+      result_fwd_valid  : out std_logic
    );
 end entity;
 
@@ -92,11 +112,14 @@ architecture arch of cpu_FPU is
    alias csr_flag_overflow          is csr(4);
    alias csr_flag_divisionByZero    is csr(5);
    alias csr_flag_invalidOperation  is csr(6);
-   alias csr_ena_inexact            is csr(7);
-   alias csr_ena_underflow          is csr(8);
-   alias csr_ena_overflow           is csr(9);
-   alias csr_ena_divisionByZero     is csr(10);
-   alias csr_ena_invalidOperation   is csr(11);
+   -- The exception enables the FPU obeys: FCSR's, or none under NO_EXCEPTION.
+   -- FCSR itself still holds and reads back what software wrote.
+   signal csr_ena                   : unsigned(4 downto 0);
+   alias csr_ena_inexact            is csr_ena(0);
+   alias csr_ena_underflow          is csr_ena(1);
+   alias csr_ena_overflow           is csr_ena(2);
+   alias csr_ena_divisionByZero     is csr_ena(3);
+   alias csr_ena_invalidOperation   is csr_ena(4);
    alias csr_cause_inexact          is csr(12);
    alias csr_cause_underflow        is csr(13);
    alias csr_cause_overflow         is csr(14);
@@ -165,6 +188,12 @@ architecture arch of cpu_FPU is
    
    signal clz_value                       : unsigned(56 downto 0) := (others => '0');
    signal clz_result                      : integer range 0 to 56 := 0;
+   -- Without CVT_L_NARROW: the 64-bit magnitude of a long to convert, and
+   -- its leading zero count.
+   signal cvtl_wide                       : std_logic := '0';
+   signal cvtl_mag                        : unsigned(63 downto 0) := (others => '0');
+   signal cvtl_clz                        : integer range 0 to 64 := 0;
+   signal cvtl_pre                        : unsigned(56 downto 0);
    signal exception_checkInputConvert2F   : std_logic := '0';
    signal exception_inputInvalid          : std_logic := '0';
    
@@ -201,6 +230,11 @@ architecture arch of cpu_FPU is
    signal ADD_start           : std_logic := '0';
    signal SUB_start           : std_logic := '0';
    signal ADD_stage1          : std_logic := '0';
+   signal ADD_fast            : std_logic;
+   signal ADD_fast_carry      : std_logic;
+   signal round_result        : unsigned(63 downto 0);
+   signal fwd_class           : std_logic := '0';
+   signal ADD_zeroSign        : std_logic := '0';
    signal ADD_stage2          : std_logic := '0';
    signal ADD_useADD          : std_logic := '0';
    signal ADD_swapped         : std_logic := '0';
@@ -284,6 +318,8 @@ begin
    -- synthesis translate_on
    
    FPU_CF <= csr_compare;
+
+   csr_ena <= (others => '0') when NO_EXCEPTION else csr(11 downto 7);
    
 
    bit64   <= command_code(21);
@@ -317,15 +353,12 @@ begin
 --------------- Combinatorial ---------------------------------------
 ---------------------------------------------------------------------
 
-   cmp_inputInvalid_a <= '1' when (nanA = '1' and OP(3) = '1') else
-                         '1' when (nanA = '1' and OP(3) = '0' and bit64 = '1' and command_op1(51) = '1') else
-                         '1' when (nanA = '1' and OP(3) = '0' and bit64 = '0' and command_op1(22) = '1') else 
-                         '0';
-                         
-   cmp_inputInvalid_b <= '1' when (nanB = '1' and OP(3) = '1') else
-                         '1' when (nanB = '1' and OP(3) = '0' and bit64 = '1' and command_op2(51) = '1') else
-                         '1' when (nanB = '1' and OP(3) = '0' and bit64 = '0' and command_op2(22) = '1') else 
-                         '0';
+   -- A compare raises Invalid on a NaN operand only for the signalling
+   -- predicates (cond bit 3 set), whichever NaN encoding it is: the R4600 rule,
+   -- measured on the KI board.
+   cmp_inputInvalid_a <= '1' when (nanA = '1' and OP(3) = '1') else '0';
+
+   cmp_inputInvalid_b <= '1' when (nanB = '1' and OP(3) = '1') else '0';
    
    cmp_equal <= '1' when (zeroA = '1' and zeroB = '1') else
                 '1' when (signA = signB and expA = expB and mantA = mantB) else
@@ -471,7 +504,7 @@ begin
          when x"2" => -- cfc1
             transfer_data <= (others => '0');
             if (transfer_RD = 0) then
-               transfer_data(11 downto 8) <= x"A";  -- revision
+               transfer_data(15 downto 0) <= x"2020";
             end if;
             if (transfer_RD = 31) then
                transfer_data(24 downto 0) <= csr; 
@@ -575,9 +608,15 @@ begin
          if ((round_overflow = '1' or flag_overflow = '1') and csr_ena_overflow = '1') then
             exceptionFPU <= '1';
          end if;
-         
+
       end if;
-  
+
+      -- See NO_EXCEPTION. The last assignment wins, so none of the trap
+      -- conditions above reaches the pipeline or the write port.
+      if (NO_EXCEPTION) then
+         exceptionFPU <= '0';
+      end if;
+
    end process;
    
 ---------------------------------------------------------------------
@@ -585,9 +624,9 @@ begin
 ---------------------------------------------------------------------
    
 
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
          bit64_1         <= bit64;
          signA_1         <= signA;
@@ -617,8 +656,8 @@ begin
       
          if (reset = '1') then
          
-            csr         <= SS_CSR; -- (others => '0');
-            csr_compare <= SS_FPU_CF;  -- '0';
+            csr         <= (others => '0');
+            csr_compare <= '0';
            
          else 
          
@@ -637,6 +676,10 @@ begin
                FPUWriteMask   <= "11";
                bit64Out       <= bit64;
                roundmode_save <= csr_roundmode;
+               fwd_class      <= '1';
+               if (op = OP_MUL or op = OP_DIV or op = OP_SQRT) then
+                  fwd_class <= '0';
+               end if;
             
                if (OPgroup = 16 or OPgroup = 17) then
                   case (op) is
@@ -768,7 +811,7 @@ begin
                
                if (OPgroup = 20 or OPgroup = 21) then
                
-                  if (signed(command_op1) >= INT64_MAX or signed(command_op1) < INT64_MIN) then
+                  if (CVT_L_NARROW and (signed(command_op1) >= INT64_MAX or signed(command_op1) < INT64_MIN)) then
                      exception_checkInputConvert2F <= bit64;
                   end if;
                
@@ -925,53 +968,20 @@ begin
          if (round_store = '1') then
             FPUWriteEnable <= '1';
             
-            -- result data
-            if (bit64Out = '1') then
-               FPUWriteData <= signOut & round_out64_exp & round_out64_mant;
-            else
-               FPUWriteData <= 32x"0" & signOut & round_out32_exp & round_out32_mant;
-            end if;
-            
-            if (round_overflow = '1' or flag_overflow = '1') then
-               if (overflow_overwrite = '1' ) then
-                  if (bit64Out = '1') then
-                     FPUWriteData <= signOut & 11x"7FE" & x"FFFFFFFFFFFFF";
-                  else
-                     FPUWriteData <= 32x"0" & signOut & x"FE" & 23x"7FFFFF";
-                  end if;
-               else
-                  if (bit64Out = '1') then
-                     FPUWriteData <= signOut & 11x"7FF" & 52x"0";
-                  else
-                     FPUWriteData <= 32x"0" & signOut & x"FF" & 23x"0";
-                  end if;
-               end if;
-            end if;            
-            
-            if (flag_underflow = '1') then
-               if (underflow_overwrite = '1') then
-                  if (bit64Out = '1') then
-                     FPUWriteData <= signOut & 11x"001" & 52x"0";
-                  else
-                     FPUWriteData <= 32x"0" & signOut & x"01" & 23x"0";
-                  end if;
-               else
-                  if (bit64Out = '1') then
-                     FPUWriteData <= signOut & 11x"000" & 52x"0";
-                  else
-                     FPUWriteData <= 32x"0" & signOut & x"00" & 23x"0";
-                  end if;
-               end if;
-            end if;
+            FPUWriteData <= round_result;
 
          end if;
             
          if (toInt_store = '1' or round_store = '1') then
             -- update flags
             if (flag_underflow = '1' and (csr_flushSubnormals = '0' or csr_ena_underflow = '1' or csr_ena_inexact = '1')) then
-            
+
                csr_cause_unimplemented    <= '1';
-               FPUWriteEnable             <= '0';
+               -- An Unimplemented Operation: no write, as the trap takes
+               -- the instruction. Without the trap (NO_EXCEPTION) it writes.
+               if (not NO_EXCEPTION) then
+                  FPUWriteEnable          <= '0';
+               end if;
             
             else
             
@@ -1009,14 +1019,64 @@ begin
       end if;
    end process;
    
+   -- the rounded result, with the overflow and underflow overwrites
+   process (all)
+   begin
+
+      if (bit64Out = '1') then
+         round_result <= signOut & round_out64_exp & round_out64_mant;
+      else
+         round_result <= 32x"0" & signOut & round_out32_exp & round_out32_mant;
+      end if;
+
+      if (round_overflow = '1' or flag_overflow = '1') then
+         if (overflow_overwrite = '1' ) then
+            if (bit64Out = '1') then
+               round_result <= signOut & 11x"7FE" & x"FFFFFFFFFFFFF";
+            else
+               round_result <= 32x"0" & signOut & x"FE" & 23x"7FFFFF";
+            end if;
+         else
+            if (bit64Out = '1') then
+               round_result <= signOut & 11x"7FF" & 52x"0";
+            else
+               round_result <= 32x"0" & signOut & x"FF" & 23x"0";
+            end if;
+         end if;
+      end if;
+
+      if (flag_underflow = '1') then
+         if (underflow_overwrite = '1') then
+            if (bit64Out = '1') then
+               round_result <= signOut & 11x"001" & 52x"0";
+            else
+               round_result <= 32x"0" & signOut & x"01" & 23x"0";
+            end if;
+         else
+            if (bit64Out = '1') then
+               round_result <= signOut & 11x"000" & 52x"0";
+            else
+               round_result <= 32x"0" & signOut & x"00" & 23x"0";
+            end if;
+         end if;
+      end if;
+
+   end process;
+
+   -- result_fwd carries a result in the cycle it is rounded or converted.
+   result_fwd       <= round_result when (toInt_store = '0') else
+                       toInt_Result when (bit64Out = '1') else
+                       32x"0" & toInt_Result(31 downto 0);
+   result_fwd_valid <= '1' when ((round_store = '1' and fwd_class = '1') or toInt_store = '1') else '0';
+
 ---------------------------------------------------------------------
 --------------- shared processing  ----------------------------------
 ---------------------------------------------------------------------
    
    -- leading zero count for int
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
       clz_result <= 56;
       for i in 0 to 55 loop
@@ -1025,17 +1085,55 @@ begin
          end if;
       end loop;
 
+      cvtl_clz <= 64;
+      if (not CVT_L_NARROW) then
+         for i in 0 to 63 loop
+            if (cvtl_mag(i) = '1') then
+               cvtl_clz <= 63 - i;
+            end if;
+         end loop;
+      end if;
+
       end if;
    end process;
    
-   -- shifter
-   process (clk93)
+   -- A long's magnitude, shifted right until its top bit is at most bit 55,
+   -- with every bit shifted out ORed into bit 0. Bit 0 is only ever a sticky
+   -- bit for a value this wide, so the shared path rounds it exactly.
+   process (all)
+      variable shift : integer range 0 to 8;
    begin
-      if (rising_edge(clk93)) then
+      shift := 0;
+      for i in 56 to 63 loop
+         if (cvtl_mag(i) = '1') then
+            shift := i - 55;
+         end if;
+      end loop;
+      cvtl_pre <= resize(shift_right(cvtl_mag, shift), 57);
+      for i in 0 to 7 loop
+         if (i < shift and cvtl_mag(i) = '1') then
+            cvtl_pre(0) <= '1';
+         end if;
+      end loop;
+   end process;
+
+   -- shifter
+   process (clk2x)
+   begin
+      if (rising_edge(clk2x)) then
       
          shifter_lostbits <= shifter_lostbits_in;
-      
-         if (shifter_right = '1') then
+
+         if (ADD_fast = '1') then
+            if (ADD_fast_carry = '1') then
+               shifter_output <= 7x"0" & ('0' & ADD_result(56 downto 1));
+               if (ADD_result(0) = '1') then
+                  shifter_lostbits <= '1';
+               end if;
+            else
+               shifter_output <= 7x"0" & ADD_result(56 downto 0);
+            end if;
+         elsif (shifter_right = '1') then
             shifter_output <= 7x"0" & shift_right(shifter_input, shifter_amount);  
             for i in 0 to 56 loop
                if (i < shifter_amount and shifter_input(i) = '1') then
@@ -1100,10 +1198,13 @@ begin
       if (bit64Out = '0' and round_Mant(27) = '1' and round_Mant(3) = '1') then round_inexact <= '1'; end if;
       if (bit64Out = '1' and round_Mant(56) = '1' and round_Mant(3) = '1') then round_inexact <= '1'; end if;
       
-      -- overflow
-      if ((bit64Out = '0' and round_out32_exp = x"FF") or (bit64Out = '1' and round_out64_exp = 11x"7FF")) then 
-         round_overflow <= '1'; 
-         round_inexact  <= '1'; 
+      -- overflow: the rounded exponent is all ones. That is the exponent
+      -- in already all ones, or one below with the rounding's carry, so it
+      -- is decided beside the carry rather than after the exponent mux.
+      if ((bit64Out = '0' and (round_in_exp(7 downto 0) = x"FF" or (round_in_exp(7 downto 0) = x"FE" and round_Mant(27) = '1'))) or
+          (bit64Out = '1' and (round_in_exp = 11x"7FF" or (round_in_exp = 11x"7FE" and round_Mant(56) = '1')))) then
+         round_overflow <= '1';
+         round_inexact  <= '1';
       end if;
       
       if (round_store = '0') then
@@ -1122,6 +1223,19 @@ begin
    
    ADD_shift_result_or <= ADD_shift_result(ADD_shift_result'left downto 1) & (ADD_shift_result(0) or ADD_shift_lostbits);
    
+   -- The sum's carry or hidden bit is set: no cancellation, so the normalize
+   -- is a right shift by one (carry) or nothing. Its exponent is not zero -
+   -- that needs two zero or denormal operands, and a denormal one never
+   -- reaches stage 1 - so it cannot underflow either. Such a sum rounds the
+   -- cycle after the add, from the sum itself, instead of passing through
+   -- the shared shifter's registered input first. Any other sum
+   -- (cancellation, zero) takes the shifter.
+   ADD_fast_carry <= ADD_result(56) when (bit64Out = '1') else ADD_result(27);
+   ADD_fast       <= '1' when (ADD_stage1 = '1' and
+                               (ADD_fast_carry = '1' or
+                                (bit64Out = '1' and ADD_result(55) = '1') or
+                                (bit64Out = '0' and ADD_result(26) = '1'))) else '0';
+
    ADD_useADD <= '1' when (signA_1  = signB_1 and SUB_start = '0') else
                  '1' when (signA_1 /= signB_1 and SUB_start = '1') else
                  '0';
@@ -1161,10 +1275,10 @@ begin
    end process;
    
    -- DIV
-   process (clk93)
+   process (clk2x)
       variable dividend_next : unsigned(55 downto 0);
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
          if (command_ena = '1' and op = 3) then
             dividend     <= 4x"0" & mantA;
@@ -1208,7 +1322,7 @@ begin
    icpu_FPU_sqrt : entity work.cpu_FPU_sqrt
    port map
    (
-      clk               => clk93,
+      clk               => clk2x,
       reset             => reset,
                         
       start             => SQRT_startcalc,
@@ -1224,9 +1338,9 @@ begin
 --------------- clocked calculations --------------------------------
 ---------------------------------------------------------------------
 
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
          round_store     <= '0';
          toInt_store     <= '0';
@@ -1254,7 +1368,7 @@ begin
          --------------- ADD/SUB ---------
          ---------------------------------
          ADD_stage1 <= (ADD_start or SUB_start) and (not exception_inputInvalid) and (not outputInvalid_1);
-         ADD_stage2 <= ADD_stage1;
+         ADD_stage2 <= ADD_stage1 and (not ADD_fast);
          
          -- stage 0
          if (expA > expB) then
@@ -1304,6 +1418,16 @@ begin
             flag_inexact <= ADD_shift_lostbits;
             ADD_exp      <= ADD_exp_initial;
             
+            -- An exact zero sum is the operands' zero when they agree, else
+            -- +0, or -0 rounding toward minus infinity.
+            if (ADD_useADD = '1') then
+               ADD_zeroSign <= signA_1;
+            elsif (roundmode_save = 3) then
+               ADD_zeroSign <= '1';
+            else
+               ADD_zeroSign <= '0';
+            end if;
+            
             if (ADD_useADD = '1') then
                ADD_result   <= resize(ADD_value1, 57) + resize(ADD_shift_result_or, 57);
             elsif (ADD_AGrB /= ADD_swapped) then
@@ -1326,7 +1450,7 @@ begin
               
             if (ADD_result = 0) then
                ADD_exp <= (others => '0'); 
-               signout <= '0';
+               signout <= ADD_zeroSign;
             elsif (ADD_leadingZeros >= ADD_exp) then
                ADD_exp        <= (others => '0'); 
                flag_underflow <= '1';
@@ -1344,6 +1468,17 @@ begin
                shifter_right    <= '0';
             end if;
             
+         end if;
+
+         -- stage 2 on the fast path rounds next cycle. An infinity takes the
+         -- shortcut, so ADD_exp is below the format's maximum here and a
+         -- carry's increment needs no clamp.
+         if (ADD_fast = '1') then
+            round_store  <= '1';
+            round_in_exp <= ADD_exp;
+            if (ADD_fast_carry = '1') then
+               round_in_exp <= ADD_exp + 1;
+            end if;
          end if;
 
          -- stage 3
@@ -1464,7 +1599,9 @@ begin
                if (infA_1 = '1' or zeroB_1 = '1') then
                   shortcut_exp <= (others => '1');
                end if;
-               if (zeroB_1 = '1') then
+               -- Division by Zero only for a finite dividend: inf / 0 is
+               -- an exact infinity and signals nothing.
+               if (zeroB_1 = '1' and infA_1 = '0') then
                   flag_divbyzero <= '1';
                end if;
             end if;
@@ -1623,30 +1760,62 @@ begin
             else
                clz_value <= 24x"0" & unsigned(abs(resize(signed(command_op1(31 downto 0)), 33)));
             end if;
+            if (not CVT_L_NARROW) then
+               -- abs(-2^63) is -2^63 again, whose bits are 2^63 unsigned.
+               cvtl_wide <= bit64;
+               cvtl_mag  <= unsigned(abs(signed(command_op1)));
+            end if;
          end if;
-         
+
          -- stage 1
          if (CIS_start = '1' or CID_start = '1') then
             signOut       <= signA_1;
             shifter_input <= clz_value;
+            if (not CVT_L_NARROW and cvtl_wide = '1') then
+               shifter_input <= cvtl_pre;
+            end if;
          end if;
-         
+
          -- stage 2
          if (CIS_stage1 = '1') then
-            if (clz_result = 56) then 
+            if (clz_result = 56) then
                CID_exp <= 0;
             else
                CID_exp   <= 127 + (55 - clz_result);
                CID_shift <= 26 - (55 - clz_result);
             end if;
+            -- The top bit of the long is bit 63 - cvtl_clz; cvtl_pre has it at
+            -- that bit or at bit 55, whichever is lower.
+            if (not CVT_L_NARROW and cvtl_wide = '1') then
+               if (cvtl_clz = 64) then
+                  CID_exp <= 0;
+               elsif (cvtl_clz < 8) then
+                  CID_exp   <= 127 + (63 - cvtl_clz);
+                  CID_shift <= 26 - 55;
+               else
+                  CID_exp   <= 127 + (63 - cvtl_clz);
+                  CID_shift <= 26 - (63 - cvtl_clz);
+               end if;
+            end if;
          end if;
-         
+
          if (CID_stage1 = '1') then
-            if (clz_result = 56) then 
+            if (clz_result = 56) then
                CID_exp <= 0;
             else
                CID_exp   <= 1023 + (55 - clz_result);
                CID_shift <= 55 - (55 - clz_result);
+            end if;
+            if (not CVT_L_NARROW and cvtl_wide = '1') then
+               if (cvtl_clz = 64) then
+                  CID_exp <= 0;
+               elsif (cvtl_clz < 8) then
+                  CID_exp   <= 1023 + (63 - cvtl_clz);
+                  CID_shift <= 0;
+               else
+                  CID_exp   <= 1023 + (63 - cvtl_clz);
+                  CID_shift <= 55 - (63 - cvtl_clz);
+               end if;
             end if;
          end if;
          
@@ -1753,9 +1922,9 @@ begin
    end process;
 
    -- synthesis translate_off
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
 
          if (reset = '1') then
             debug_calc_count <= 0;
@@ -1796,7 +1965,7 @@ begin
          
          while (true) loop
             
-            wait until rising_edge(clk93);
+            wait until rising_edge(clk2x);
             
             if (FPUWriteEnable = '1') then
                export_rs   := FPUWriteData;

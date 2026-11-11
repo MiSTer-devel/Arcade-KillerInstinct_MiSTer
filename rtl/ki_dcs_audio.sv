@@ -45,10 +45,7 @@ module ki_dcs_audio #(
     output logic        dbg_valid,
     output logic        dbg_unimpl,
     output logic        dbg_pcm_push,
-    output logic [13:0] dbg_pc,
-    // Current audio timing and discontinuity metrics.
-    output logic [31:0] dbg_pcm_health,
-    output logic [31:0] dbg_pcm_level
+    output logic [13:0] dbg_pc
 );
     localparam integer DAC_DIV = CLK_HZ / 31250;
     localparam integer PCM_N = 1 << PCM_AW;
@@ -58,14 +55,6 @@ module ki_dcs_audio #(
     logic        dcs_unimpl;
     logic [15:0] dcs_sample;
     logic        dcs_sample_we;
-    logic [13:0] dcs_wrap_pc;
-    logic [7:0]  dcs_wrap_cnt;
-    logic [13:0] dcs_src_pc;
-    logic [13:0] dcs_src_addr;
-    logic [7:0]  dcs_src_cnt;
-    logic [7:0]  dcs_src_op;
-    logic [7:0]  dcs_rom_unstable;
-    logic [11:0] dcs_rom_bankdelta;
     logic [7:0]  dcs_cmd_lost;
     logic        dcs_cmd_read;
     logic [15:0] dcs_status;
@@ -75,22 +64,24 @@ module ki_dcs_audio #(
     // configured DCS_ENGINE_HZ cadence is what reproduces the DSP's
     // approximately 10 MIPS throughput from the core-wide 50 MHz clock.
     localparam integer DCS_PHASE_W = $clog2(CLK_HZ);
-    localparam logic [DCS_PHASE_W:0] DCS_PHASE_STEP = DCS_ENGINE_HZ;
-    localparam logic [DCS_PHASE_W:0] DCS_PHASE_MOD = CLK_HZ;
+    localparam logic [DCS_PHASE_W:0] DCS_PHASE_STEP = DCS_ENGINE_HZ[DCS_PHASE_W:0];
+    localparam logic [DCS_PHASE_W:0] DCS_PHASE_MOD = CLK_HZ[DCS_PHASE_W:0];
     logic [DCS_PHASE_W-1:0] dcs_phase;
     logic [DCS_PHASE_W:0] dcs_phase_sum;
+    logic [DCS_PHASE_W:0] dcs_phase_wrap;
     wire dcs_ce = !pause && (dcs_phase_sum >= DCS_PHASE_MOD);
 
     // Both cadences hold their phase through a pause, so the DSP and the DAC
     // pick up exactly where they stopped relative to each other.
     always_comb dcs_phase_sum = {1'b0, dcs_phase} + DCS_PHASE_STEP;
+    always_comb dcs_phase_wrap = dcs_phase_sum - DCS_PHASE_MOD;
     always_ff @(posedge clk) begin
         if (rst)
             dcs_phase <= '0;
         else if (pause)
             dcs_phase <= dcs_phase;
         else if (dcs_ce)
-            dcs_phase <= dcs_phase_sum - DCS_PHASE_MOD;
+            dcs_phase <= dcs_phase_wrap[DCS_PHASE_W-1:0];
         else
             dcs_phase <= dcs_phase_sum[DCS_PHASE_W-1:0];
     end
@@ -109,9 +100,7 @@ module ki_dcs_audio #(
             dac_div_ctr <= dac_div_ctr + 1'b1;
     end
 
-    // The ADSP samples dac_ce_in on every fabric clock, independently of
-    // core_ce. Each physical DAC slot must therefore be exactly one fabric
-    // clock wide; stretching it would advance the autobuffer once per cycle.
+    // Each physical DAC slot is exactly one fabric clock wide.
     wire dcs_dac_ce = dac_slot_ce;
 
     // The main board produces a one-clock command strobe. Retain it until one
@@ -134,39 +123,18 @@ module ki_dcs_audio #(
         end
     end
 
-    // Time to first nonzero audio, in groups of 1024 DAC slots. This is exposed
-    // through dbg_pcm_health and remains independent of CPU clock rate.
-    logic [21:0] boot_ticks;
-    wire  [11:0] boot_units = boot_ticks[21:10];
-    logic [11:0] first_audio_t;
-    logic        seen_audio, host_reset_d;
+    // Host command writes, and whether the DSP has read one from the mailbox.
     logic        seen_cmdread;
-    logic [7:0]  cmd_count, reset_count;
+    logic [7:0]  cmd_count;
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            boot_ticks    <= '0;
-            first_audio_t <= '0;
-            seen_audio    <= 1'b0;
-            seen_cmdread    <= 1'b0;
-            cmd_count     <= '0;
-            reset_count   <= '0;
-            // Preserve the asserted reset level so power-on is not counted as
-            // a subsequent host-reset edge.
-            host_reset_d  <= host_reset;
+            seen_cmdread <= 1'b0;
+            cmd_count    <= '0;
         end else begin
-            if (dac_slot_ce && !(&boot_ticks)) boot_ticks <= boot_ticks + 1'b1;
-            host_reset_d <= host_reset;
-            if (host_reset && !host_reset_d && (reset_count != 8'hFF))
-                reset_count <= reset_count + 8'd1;
             if (host_cmd_wr) begin
                 if (cmd_count != 8'hFF) cmd_count <= cmd_count + 8'd1;
             end
-            if (dcs_sample_we && (dcs_sample != 16'h0000) && !seen_audio) begin
-                seen_audio    <= 1'b1;
-                first_audio_t <= boot_units;
-            end
-            // Latch the first DSP command read for diagnostic status.
             if (dcs_cmd_read && !seen_cmdread) begin
                 seen_cmdread <= 1'b1;
             end
@@ -193,14 +161,6 @@ module ki_dcs_audio #(
         .o_unimpl(dcs_unimpl),
         .dac_sample(dcs_sample),
         .dac_ce(dcs_sample_we),
-        .dbg_wrap_pc(dcs_wrap_pc),
-        .dbg_wrap_cnt(dcs_wrap_cnt),
-        .dbg_src_pc(dcs_src_pc),
-        .dbg_src_addr(dcs_src_addr),
-        .dbg_src_cnt(dcs_src_cnt),
-        .dbg_src_op(dcs_src_op),
-        .dbg_rom_unstable_o(dcs_rom_unstable),
-        .dbg_rom_bankdelta_o(dcs_rom_bankdelta),
         .dbg_cmd_lost(dcs_cmd_lost),
         .dbg_cmd_read(dcs_cmd_read)
     );
@@ -247,26 +207,8 @@ module ki_dcs_audio #(
         end
     end
 
-    // Count source and output sample steps larger than half the signed PCM
-    // range. Matching counts show that a discontinuity entered through the DSP
-    // sample stream rather than being introduced by the FIFO.
-    logic signed [15:0] au_src_prev;
-    logic [15:0] au_src_discont;
-    wire signed [16:0] au_src_step = $signed({dcs_sample[15], dcs_sample}) -
-                                     $signed({au_src_prev[15], au_src_prev});
-    wire [16:0] au_src_abs = au_src_step[16] ? (~au_src_step + 17'd1) : au_src_step;
-
-    always_ff @(posedge clk) begin
-        if (rst || host_reset) begin
-            au_src_prev    <= '0;
-            au_src_discont <= '0;
-        end else if (dcs_sample_we) begin
-            au_src_prev <= dcs_sample;
-            if ((au_src_abs > 17'd32767) && (au_src_discont != 16'hFFFF))
-                au_src_discont <= au_src_discont + 1'b1;
-        end
-    end
-
+    // Count output sample steps larger than half the signed PCM range, and
+    // track the largest step.
     logic signed [15:0] au_prev_sample;
     logic [15:0] au_discont;
     logic [16:0] au_max_step;
@@ -290,16 +232,6 @@ module ki_dcs_audio #(
         end
     end
 
-    // Health packs first-audio time in bits 19:8 and the saturating output
-    // discontinuity count in bits 7:0. Bits 31:20 remain zero.
-    wire [7:0] disc8 = (au_discont > 16'd255) ? 8'hFF : au_discont[7:0];
-    assign dbg_pcm_health = {12'd0, first_audio_t, disc8};
-
-    // Level packs the maximum output step in bits 19:8 and the same saturating
-    // discontinuity count in bits 7:0. A full-range step saturates to 12'hFFF.
-    wire [11:0] step_disp = au_max_step[16] ? 12'hFFF : au_max_step[15:4];
-    assign dbg_pcm_level = {12'd0, step_disp, disc8};
-
     always_ff @(posedge clk) begin
         if (rst || host_reset) begin
             pcm_wp <= '0;
@@ -317,7 +249,7 @@ module ki_dcs_audio #(
                 if (startup_gain != STARTUP_GAIN_FULL) begin
                     // Ramp from silence without changing the full-scale
                     // steady-state PCM path.
-                    audio <= startup_product >>> STARTUP_RAMP_BITS;
+                    audio <= startup_product[STARTUP_RAMP_BITS+15:STARTUP_RAMP_BITS];
                     if (pcm_head != 16'sh0000)
                         startup_gain <= startup_gain + 1'b1;
                 end else begin

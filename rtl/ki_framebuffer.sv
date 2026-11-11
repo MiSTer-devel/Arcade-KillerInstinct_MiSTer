@@ -83,6 +83,7 @@ module ki_framebuffer (
   input  wire         clk,
   input  wire         reset,
   input  wire         ce_pixel,
+  input  wire         advance,
   input  wire   [9:0] h_count,
   input  wire   [9:0] v_count,
   input  wire  [18:0] framebuffer_base,
@@ -131,8 +132,15 @@ module ki_framebuffer (
   wire line_boundary = ce_pixel && (h_count == 10'd0);
   wire write_line = fetch_active && memory_data_valid;
   assign memory_words = WORDS_PER_REQUEST[2:0];
-  wire [8:0] line_read_address = (h_count < 319) ?
-                                 (h_count[8:0] + 1'b1) : 9'd0;
+  // The line buffer's read address is registered, so it has to lead the pixel
+  // by a clock. Hold column h_count for the whole pixel and step to the next
+  // one only in the advance clock: the RAM then shows pixel N for all eight
+  // clocks of column N. The analog output displays every one of those clocks,
+  // not just the CE_PIXEL clock the scaler samples. Past the last column the
+  // read parks on column 0, ready for the next line.
+  wire [9:0] read_column = advance ? (h_count + 10'd1) : h_count;
+  wire [8:0] line_read_address = (read_column < 10'd320) ?
+                                 read_column[8:0] : 9'd0;
   wire [15:0] bank0_pixel;
   wire [15:0] bank1_pixel;
   wire [15:0] pixel = v_count[0] ? bank1_pixel : bank0_pixel;

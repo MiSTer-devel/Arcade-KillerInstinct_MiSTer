@@ -5,11 +5,9 @@ use IEEE.numeric_std.all;
 entity cpu_TLB_instr is
    port 
    (
-      clk93                : in  std_logic;
-      ce                   : in  std_logic;
+      clk2x                : in  std_logic;
       reset                : in  std_logic;
       
-      RANDOMMISS           : in  unsigned(3 downto 0);
                            
       TLBInvalidate        : in  std_logic;
                            
@@ -26,7 +24,7 @@ entity cpu_TLB_instr is
       TLB_ExcMiss          : out std_logic := '0';
       
       TLB_ClearEna         : out std_logic := '0';
-      TLB_ClearIndex       : out unsigned(4 downto 0) := (others => '0');
+      TLB_ClearIndex       : out unsigned(5 downto 0) := (others => '0');
       
       TLB_fetchReq         : out std_logic := '0';
       TLB_fetchAddrIn      : out unsigned(63 downto 0) := (others => '0');
@@ -34,8 +32,7 @@ entity cpu_TLB_instr is
       TLB_fetchExcInvalid  : in  std_logic;
       TLB_fetchExcNotFound : in  std_logic;
       TLB_fetchCached      : in  std_logic;
-      TLB_fetchRandom      : in  std_logic;
-      TLB_fetchSource      : in  unsigned(4 downto 0);
+      TLB_fetchSource      : in  unsigned(5 downto 0);
       TLB_fetchAddrOut     : in  unsigned(31 downto 0)
    );
 end entity;
@@ -55,49 +52,30 @@ architecture arch of cpu_TLB_instr is
    signal mini_virtual  : unsigned(39 downto 0) := (others => '0'); 
    signal mini_physical : unsigned(31 downto 0) := (others => '0'); 
    signal mini_cached   : std_logic := '0';
-   signal mini_random   : std_logic := '0';
    
    signal mini_hit      : std_logic;
    
-   signal random_check     : std_logic;
-   signal random_counter   : unsigned(5 downto 0) := (others => '0'); 
-   signal random_checkCnt  : unsigned(5 downto 0) := (others => '0'); 
 
 begin 
 
    mini_hit <= '1' when (mini_valid = '1' and TLB_AddrIn(39 downto 12) = mini_virtual(39 downto 12) and TLB_AddrIn(63 downto 62) = mini_region) else '0';
 
-   TLB_Stall <= TLB_Req when (random_check = '1' or mini_hit = '0') else '0';
+   TLB_Stall <= TLB_Req when (mini_hit = '0') else '0';
    
    TLB_AddrOutFound <= mini_physical(31 downto 12) & TLB_AddrIn(11 downto 0);
    TLB_useCache     <= mini_cached;
 
-   random_check     <= '0'; --'1' when (mini_random = '1' and random_counter >= random_checkCnt) else '0';
 
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
+      if (rising_edge(clk2x)) then
       
-         --random_checkCnt <= RANDOMMISS & "00";
-         random_checkCnt <= "00" & RANDOMMISS;
-         --random_checkCnt <= to_unsigned(5, random_checkCnt'length);
-         
-         if (TLB_Req = '1') then
-            if (random_counter >= random_checkCnt) then
-               random_counter <= (others => '0');
-            else
-               random_counter <= random_counter + 1;
-            end if;
-         end if;
-         
          TLB_ClearEna  <= '0';
       
-         if (ce = '1') then
-            TLB_UnStall   <= '0';
-            TLB_fetchReq  <= '0';
-            TLB_ExcRead   <= '0';
-            TLB_ExcMiss   <= '0';
-         end if;
+         TLB_UnStall   <= '0';
+         TLB_fetchReq  <= '0';
+         TLB_ExcRead   <= '0';
+         TLB_ExcMiss   <= '0';
          
          if (reset = '1') then
          
@@ -119,15 +97,8 @@ begin
                      TLB_fetchAddrIn  <= TLB_AddrIn;
                   end if;
                   if (TLB_Stall = '1') then
-                     if (mini_hit = '1' and random_check = '1') then
-                        state            <= EXCEPTION;
-                        TLB_ExcRead      <= '1';
-                        TLB_ExcMiss      <= '1';
-                        TLB_ClearEna     <= '1';
-                     else
-                        state            <= REQUEST;
-                        TLB_fetchReq     <= '1';
-                     end if;
+                     state            <= REQUEST;
+                     TLB_fetchReq     <= '1';
                   end if;
                  
                when REQUEST =>
@@ -151,10 +122,6 @@ begin
                      mini_virtual      <= TLB_fetchAddrIn(39 downto 12) & x"000";
                      mini_physical     <= TLB_fetchAddrOut(31 downto 12) & x"000";
                      mini_cached       <= TLB_fetchCached;
-                     mini_random       <= TLB_fetchRandom;
-                     if (random_checkCnt = 0) then
-                        mini_random <= '0';
-                     end if;
                      
                      TLB_ClearIndex <= TLB_fetchSource;
                      
@@ -180,7 +147,7 @@ begin
    
       process
       begin
-         wait until rising_edge(clk93);
+         wait until rising_edge(clk2x);
          
          cycles <= cycles + 1;
          

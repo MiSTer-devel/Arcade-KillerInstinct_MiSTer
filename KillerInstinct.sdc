@@ -18,20 +18,17 @@ derive_clock_uncertainty
 # AT 2:1 THE PAIR IS RELATED AGAIN, ON PURPOSE. clk_cpu and clk_core are PLL
 # outputs 1 and 0, both at 0 ps: every clk_core edge falls on a clk_cpu edge,
 # and each direction has a 10 ns setup window. The CPU-to-bridge crossing
-# relies on that under SYNC_CROSSING (cpu.vhd, "THE CROSSING"; ki_cpu_core
-# defaults it on): its mailbox request and acknowledge, the write-back line
-# release and the response FIFO's pointers are read straight from the other
-# domain's register, with no synchroniser - 4.9% of KI2's renderer, measured
-# in tb_ki_renderbench. Those paths MUST be timed. A false path or an
+# relies on that (cpu.vhd, "THE CROSSING"): its mailbox request and
+# acknowledge, the write-back line release and the response FIFO's pointers
+# are read straight from the other domain's register, with no synchroniser -
+# 4.9% of KI2's renderer, measured in tb_ki_renderbench. Those paths MUST be timed. A false path or an
 # asynchronous group here would let the fitter route one of them in 12 ns,
 # and nothing else protects them.
 #
-# THE 2:1 RATIO IS THE CONTRACT. Before moving the CPU clock off twice
-# clk_core, build with SYNC_CROSSING=0 and make the CPU clock asynchronous to
-# everything again.
+# THE 2:1 RATIO IS THE CONTRACT. The crossing has no synchronisers, so the
+# CPU clock cannot move off twice clk_core without them.
 #
-# With SYNC_CROSSING=0 the crossing is asynchronous by construction, and
-# timing it as well costs nothing. Every crossing is one of:
+# Every crossing is one of:
 #   - the memory REQUEST mailbox in cpu.vhd, a two-phase req/ack handshake
 #     whose payload is held stable until the acknowledge returns;
 #   - the memory RESPONSE FIFO (cpu_cdc_fifo.vhd), whose gray-coded pointers
@@ -40,17 +37,16 @@ derive_clock_uncertainty
 #     bundled data on the same argument as the mailbox's payload register:
 #     an entry is complete no later than the pointer that exposes it;
 #   - the cache fill line address (cpu_instrcache fill_addrTag_sav,
-#     cpu_datacache fill_line_saved), written only in the clk93 state
+#     cpu_datacache fill_line_saved), written only in the clk2x state
 #     machine's IDLE state and frozen from the request until ram_done, which
 #     is itself produced by the response handshake;
 #   - the data cache read-ahead's fetched line (cpu.vhd line_fill_1x),
 #     written in clk1x only while its own fetch is outstanding and copied
-#     into clk93 only when that fetch's completion has crossed the response
+#     into clk2x only when that fetch's completion has crossed the response
 #     FIFO, so its last beat is in no later than the completion;
-#   - the first stage of a two-flop synchroniser (irq_meta, trace_trigger_meta,
-#     debug_vblank_cpu_meta, the debug counter mirrors below).
+#   - the first stage of a two-flop synchroniser (irq_meta, pause_meta).
 # Reset was the one exception: the caches' clk1x fill processes were reset by
-# reset_93. They now take reset_1x, which ki_cpu_core already synchronises
+# reset_2x. They now take reset_1x, which ki_cpu_core already synchronises
 # into that domain, so nothing crosses unsynchronised.
 #
 # This must stay in THIS file: sys.tcl loads sys_top.sdc first, and its
@@ -60,8 +56,27 @@ derive_clock_uncertainty
 set_clock_groups -asynchronous \
   -group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[1].gpll~PLL_OUTPUT_COUNTER|divclk}] \
   -group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[3].gpll~PLL_OUTPUT_COUNTER|divclk \
-                      emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk \
                       emu|pll|pll_inst|altera_pll_i|general[5].gpll~PLL_OUTPUT_COUNTER|divclk}]
+
+# THE CPU CLOCK AND clk_sdram_ctl ARE RELATED. The data cache's direct fill
+# path (cpu.vhd, fast_go) hands its request - a toggle, a line address mapped
+# in ki_fast_fill, and the stream flag (fast_req_stream: a read-ahead line
+# marked a stream's, written only with the toggle) - straight from the CPU's
+# clock to the controller's. Both are 100 MHz outputs of one PLL, the
+# controller's 500 ps later, which leaves 0.5 ns to the very next controller
+# edge. The whole request, address and flag alike, holds from its toggle until
+# the next request, which cannot come before this one's line is back, so it is
+# given TWO controller clocks, 10.5 ns. The hold check stays at
+# the edge 0.5 ns after the launch: the controller must see the old value
+# there, and the new one at the edge after.
+#
+# The other way, a demand fill's line goes back through clk_core, but an
+# uncached qword read's qword, and each qword of a direct read-ahead's line,
+# come straight back on this pair (ki_fast_fill, unc_valid and ra_valid): a
+# pulse one controller clock long, which the CPU's next edge, 9.5 ns after its
+# launch, takes exactly once. That needs the default single-cycle setup
+# relationship here, and the two clocks at one frequency.
+set_multicycle_path -setup -end -from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[1].gpll~PLL_OUTPUT_COUNTER|divclk}] -to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk}] 2
 
 # Physical SDRAM runs from clk_sdram_ctl (PLL output 4) at 100 MHz. The pin
 # clock is PLL output 3 at the same frequency with a 6.75 ns (243 deg) shift.
@@ -79,11 +94,9 @@ set_clock_groups -asynchronous \
 # is nearer than TCK - 3.25 implies. The sweep's top point is the 10.00 ns
 # period itself, so the true window may extend past it.
 #
-# This is recorded rather than acted on. The value works on hardware, and the
-# sweep's phase is not the PLL's: SDRAM_CLK takes 13.79 ns to reach the device
-# pin while a capture clock takes 8.21 ns to reach a register, and ignoring
-# that 5.58 ns is exactly what produced three broken builds. Moving the pin
-# phase is an A/B on hardware, not an edit.
+#
+# KI_SDRAM_CLK below is clk_sdram_pin followed through that DDR register to
+# the port: the register drives 1 while its clock is high.
 create_generated_clock -name KI_SDRAM_CLK \
   -source [get_pins -compatibility_mode {emu|pll|pll_inst|altera_pll_i|general[3].gpll~PLL_OUTPUT_COUNTER|divclk}] \
   [get_ports {SDRAM_CLK}]
@@ -109,12 +122,24 @@ set_output_delay -clock KI_SDRAM_CLK -min -0.8 \
 # wtbt and burst inputs - is registered on clk_core, so it holds its value for
 # a full clk_core period, which is two clk_sdram cycles.
 #
+# THE HOLD CHECK STAYS AT THE EDGE 0.5 ns AFTER THE LAUNCH, as it does for the
+# CPU's direct port above: nothing launched on a clk_core edge may arrive
+# before the controller edge that follows it by 0.5 ns, so every register
+# takes it at the edge after that one. The strobes are why. issue_read and
+# issue_write fan out to registers that each decide for themselves whether a
+# request has arrived - old_rd and old_we in ki_sdram_burst, the request
+# registers behind new_rd and new_we, rd_d and words_left in ki_sdram_x2 - and
+# they must all decide at the SAME controller edge. If an edge detector sees
+# a strobe one edge before the request registers do, the request is never
+# taken: the controller stays ready, the adapter reports it done, and a write
+# is lost or a read returns nothing. A hold multicycle on this crossing would
+# remove exactly that check, and nothing in the logic replaces it.
+#
 # The OPPOSITE direction gets no such relaxation. The pack's 32-bit beat is
 # held for two clk_sdram_ctl cycles, but which clk_core edge captures it depends
 # on when the burst started, so the honest budget there is one cycle - 9.5 ns at
 # this phase. See ki_sdram_x2's header.
 set_multicycle_path -setup -end   -from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}]   -to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk}] 2
-set_multicycle_path -hold -end   -from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}]   -to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk}] 1
 
 # The DQ capture path: SDRAM_CLK launches, clk_sdram_cap (general[5]) captures.
 #
@@ -137,17 +162,3 @@ set_multicycle_path -hold -end   -from [get_clocks {emu|pll|pll_inst|altera_pll_
 # assuming any of this still holds.
 set_multicycle_path -setup -end   -rise_from [get_clocks {KI_SDRAM_CLK}]   -rise_to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[5].gpll~PLL_OUTPUT_COUNTER|divclk}] 2
 set_multicycle_path -setup -end   -rise_from [get_clocks {KI_SDRAM_CLK}]   -rise_to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[4].gpll~PLL_OUTPUT_COUNTER|divclk}] 2
-
-# Passive CPU diagnostics cross from the 100 MHz CPU domain through explicit
-# two-stage synchronizers. Only the metastability-catching stages are async.
-set_false_path -to [get_keepers {*|debug_cpu_pc_meta[*]}]
-set_false_path -to [get_keepers {*|debug_cpu_retired_meta[*]}]
-
-# The frozen pre-event trace. debug_trace_frozen_meta is the ordinary
-# metastability-catching stage; debug_trace_shadow is a 736-bit single-shot
-# capture of a source that has already stopped changing, taken only after the
-# frozen flag has been synchronised and allowed to settle. Neither is a
-# functional path and neither may be allowed to set the clk_core critical
-# path - this is a diagnostic, and it must not cost the design a fit.
-set_false_path -to [get_keepers {*|debug_trace_frozen_meta}]
-set_false_path -to [get_keepers {*|debug_trace_shadow[*]}]

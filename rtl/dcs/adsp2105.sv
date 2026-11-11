@@ -72,20 +72,6 @@ module adsp2105 (
     output reg  [15:0] dac_sample,
     output reg         dac_ce,
 
-    // Wrapped-sample diagnostics watch stores to the live autobuffer and latch
-    // the PC when adjacent samples differ by more than half of full scale.
-    output reg  [13:0] dbg_wrap_pc,
-    output reg  [7:0]  dbg_wrap_cnt,
-
-    // Upstream diagnostics watch sequential writes outside the autobuffer and
-    // report adjacent full-scale discontinuities with their source PC/address.
-    output reg  [13:0] dbg_src_pc,
-    output reg  [13:0] dbg_src_addr,
-    output reg  [7:0]  dbg_src_cnt,
-    output reg  [7:0]  dbg_src_op,
-    // ROM fetch stability diagnostics; see the dcs_mem instantiation.
-    output wire [7:0]  dbg_rom_unstable_o,
-    output wire [11:0] dbg_rom_bankdelta_o,
     // Mailbox overwrite and boot-progress diagnostics.
     output reg  [7:0]  dbg_cmd_lost,
     // Pulses when the DSP reads a host command from the mailbox. Until the DSP
@@ -173,7 +159,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // combinational because S_MEM already stages its effective address before
     // S_EXEC commits a write; adding another address/data register changes the
     // ADSP program-memory contract. At most one access is issued per port per
-    // clock (see the ONE-READ-ONE-WRITE-PER-PORT AUDIT below).
+    // clock (see the one-read/one-write-per-port contract table at the main FSM).
     wire [13:0] pmb_addr;   wire [23:0] pmb_q;
     wire [13:0] dm_addr;    reg [15:0] dm_q;
     always @(posedge clk) begin
@@ -273,7 +259,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // Sound-ROM port (request/ready handshake, see dcs_mem): the requester
     // (bank-window S_MEM stall, or the S_BOOT stream) holds rom_req with
     // rom_addr stable and waits for rom_rdy; behind it, dcs_mem fetches from the
-    // HPS DDR3 read path (Partition C).
+    // HPS DDR3 read path.
     wire        rom_req;
     wire [22:0] rom_addr;
     wire        rom_rdy;
@@ -284,44 +270,6 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
          .rom_rdy(rom_rdy), .rom_q(rom_q),
          .ext_req(rom_ddr_req), .ext_addr(rom_ddr_addr),
          .ext_rdy(rom_ddr_rdy), .ext_q(rom_ddr_q));
-
-    // ROM request stability diagnostics latch the address at request start and
-    // flag any change before completion. Boot is excluded because its streamer
-    // legitimately advances the address between completed transfers.
-    reg [22:0] rom_addr_held;
-    reg        rom_inflight;
-    reg [7:0]  dbg_rom_unstable;
-    reg [11:0] dbg_rom_bankdelta;
-
-    always @(posedge clk) begin
-        if (rst) begin
-            rom_addr_held     <= 23'h0;
-            rom_inflight      <= 1'b0;
-            dbg_rom_unstable  <= 8'h0;
-            dbg_rom_bankdelta <= 12'h0;
-        end else if (boot_active) begin
-            rom_inflight <= 1'b0;
-        end else if (!rom_inflight) begin
-            if (rom_req) begin
-                rom_addr_held <= rom_addr;
-                rom_inflight  <= 1'b1;
-            end
-        end else begin
-            if (rom_addr != rom_addr_held) begin
-                // Record which bank bits moved on the first offender. A
-                // non-zero delta means the BANK changed under the fetch; zero
-                // with a non-zero count means only the offset moved.
-                if (dbg_rom_unstable == 8'h00)
-                    dbg_rom_bankdelta <= {1'b0, rom_addr[22:12] ^ rom_addr_held[22:12]};
-                if (dbg_rom_unstable != 8'hFF)
-                    dbg_rom_unstable <= dbg_rom_unstable + 8'd1;
-            end
-            if (rom_rdy || !rom_req) rom_inflight <= 1'b0;
-        end
-    end
-
-    assign dbg_rom_unstable_o  = dbg_rom_unstable;
-    assign dbg_rom_bankdelta_o = dbg_rom_bankdelta;
 
     // ---- explicit instruction sequencer ------------------------------------
     // One instruction follows S_FETCH -> S_DECODE -> optional drain/divide/ROM/
@@ -400,15 +348,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // Control regs (0x3FEF S1_AUTOBUF, 0x3FFF SYSCONTROL) already live in dm[].
     reg        ab_active;
     reg [2:0]  ab_ireg;                 // I register the buffer pointer lives in
-    reg [15:0] ab_base, ab_size, ab_incs;
-    reg [15:0] dbg_ab_prev;   // last sample stored into the autobuffer
-    reg        dbg_ab_seen;   // suppresses the first store, which has no predecessor
-    reg [15:0] dbg_w_prev_addr, dbg_w_prev_val;  // previous non-autobuffer store
-    reg        dbg_w_seen;
-    // Arm discontinuity diagnostics only after the autobuffer is active and
-    // roughly one second of samples has been emitted.
-    reg [15:0] dbg_arm_ctr;
-    wire       dbg_armed = (dbg_arm_ctr == 16'hFFFF);
+    reg [15:0] ab_size, ab_incs;
     // DAC-rate drain trigger. dac_slot_ctr counts down once per dac_ce_in
     // sample slot; on reaching the last slot of a buffer-half it reloads to
     // `count` (ab_drain_cnt) and sets dac_slot_go = "a drain is due". drain_pend
@@ -796,7 +736,6 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                                   iR[ab_ir]    <= iR[ab_ir] & 16'hFFF0;  // source &= ~0xf (first-sample guard)
                                   // the I write re-bases the DAG
                                   baseR[ab_ir] <= (iR[ab_ir][13:0] & 14'h3FF0) & lmask[ab_ir];
-                                  ab_base      <= iR[ab_ir] & 16'hFFF0;
                                   ab_size      <= lR[ab_lr];
                                   ab_incs      <= mR[ab_mr];
                                   ab_ireg      <= ab_ir[2:0];
@@ -875,11 +814,11 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
         begin
             c_nz = a;
             if ((r & 32'h0000ffff)==0) c_nz = c_nz | 16'h0001;
-            c_nz = c_nz | ((r >> 14) & 16'h0002);
+            c_nz = c_nz | (16'(r >> 14) & 16'h0002);
         end
     endfunction
     function [15:0] c_v(input [15:0] a, input [31:0] s, input [31:0] d, input [31:0] r);
-        c_v = a | (((s ^ d ^ r ^ (r>>1)) >> 13) & 16'h0004);   // V flag
+        c_v = a | (16'((s ^ d ^ r ^ (r>>1)) >> 13) & 16'h0004);   // V flag
     endfunction
 
     // Combinational ALU result generator. Returns
@@ -910,9 +849,9 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             astn = c_nz(astn, {15'h0, r});
             s32 = {16'h0, xv}; d32 = {16'h0, yv}; r32 = {15'h0, r};
             case (sub)
-              4'h2,4'h3: begin astn=c_v(astn,s32,d32,r32); astn=astn | ((r32>>13)&16'h0008); end
-              4'h6,4'h7: begin astn=c_v(astn,s32,d32,r32); astn=astn | (((~r32)>>13)&16'h0008); end
-              4'h9,4'ha: begin astn=c_v(astn,d32,s32,r32); astn=astn | (((~r32)>>13)&16'h0008); end
+              4'h2,4'h3: begin astn=c_v(astn,s32,d32,r32); astn=astn | (16'(r32>>13)&16'h0008); end
+              4'h6,4'h7: begin astn=c_v(astn,s32,d32,r32); astn=astn | (16'((~r32)>>13)&16'h0008); end
+              4'h9,4'ha: begin astn=c_v(astn,d32,s32,r32); astn=astn | (16'((~r32)>>13)&16'h0008); end
               4'h1: if(yv==16'h7fff) astn=astn|16'h0004; else if(yv==16'hffff) astn=astn|16'h0008;
               4'h5: begin if(yv==16'h8000) astn=astn|16'h0004; if(yv==16'h0000) astn=astn|16'h0008; end
               4'h8: if(yv==16'h8000) astn=astn|16'h0004; else if(yv==16'h0000) astn=astn|16'h0008;
@@ -1087,65 +1026,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // 0x3000: ROM bank select.
     // 0x3FFF write with bit9: SYSCONTROL soft reboot.
     task automatic dm_write(input [15:0] addr, input [15:0] val);
-        reg signed [16:0] ab_step;
-        reg signed [16:0] w_step;
-        reg               in_ab, adjacent;
         begin
-            in_ab = (ab_size != 16'h0) && (addr >= ab_base) &&
-                    ({1'b0, addr} < ({1'b0, ab_base} + {1'b0, ab_size}));
-            // Discontinuity diagnostics are filtered to the live autobuffer so ordinary
-            // scratch traffic cannot trip it, and armed only after a first
-            // store has established a predecessor. ab_size is zero until the
-            // autobuffer is armed, which disables this entirely before then.
-            // 17-bit end so base+size cannot wrap the comparison at 0x10000.
-            if (in_ab) begin
-                ab_step = $signed({val[15], val}) -
-                          $signed({dbg_ab_prev[15], dbg_ab_prev});
-                if (ab_step < 0) ab_step = -ab_step;
-                if (dbg_ab_seen && (ab_step > 17'sd32767)) begin
-                    // Keep the FIRST offender: later ones are likely the same
-                    // instruction, and a value that keeps moving is unreadable
-                    // on a debug screen.
-                    // pc is the executing instruction's address here (the
-                    // pc+1 in this same block is nonblocking), but treat the
-                    // reported value as +/-1 when disassembling rather than
-                    // assuming an exact anchor.
-                    if (dbg_wrap_cnt == 8'h00) dbg_wrap_pc <= pc;
-                    if (dbg_wrap_cnt != 8'hFF) dbg_wrap_cnt <= dbg_wrap_cnt + 8'd1;
-                end
-                dbg_ab_prev <= val;
-                dbg_ab_seen <= 1'b1;
-            end else begin
-                // Upstream watcher. Adjacency is what makes this meaningful:
-                // only a run of sequential stores is a buffer being filled, so
-                // an interleaved unrelated write simply breaks the run instead
-                // of producing a bogus comparison. Stride 2 is accepted because
-                // the copy loop reads its source with M2 = 2.
-                adjacent = (addr == (dbg_w_prev_addr + 16'd1)) ||
-                           (addr == (dbg_w_prev_addr + 16'd2));
-                w_step = $signed({val[15], val}) -
-                         $signed({dbg_w_prev_val[15], dbg_w_prev_val});
-                if (w_step < 0) w_step = -w_step;
-                if (dbg_armed && dbg_w_seen && adjacent && (w_step > 17'sd32767)) begin
-                    if (dbg_src_cnt == 8'h00) begin
-                        dbg_src_pc   <= pc;
-                        dbg_src_addr <= addr[13:0];
-                        // The opcode's high byte is latched with the PC so the
-                        // reading checks itself: a store is 0x60-0x7F, 0x80-0x9F
-                        // or 0xA0-0xBF. Anything else - a JUMP, say - means the
-                        // captured PC is not the storing instruction and the
-                        // address beside it should not be trusted.
-                        // op_r, not op: op is declared below this task and
-                        // is assigned from op_r at execute, so they carry the
-                        // same instruction word and only op_r is in scope here.
-                        dbg_src_op   <= op_r[23:16];
-                    end
-                    if (dbg_src_cnt != 8'hFF) dbg_src_cnt <= dbg_src_cnt + 8'd1;
-                end
-                dbg_w_prev_addr <= addr;
-                dbg_w_prev_val  <= val;
-                dbg_w_seen      <= 1'b1;
-            end
             if (addr >= 16'h0800 && addr <= 16'h1fff) begin
                 // PM-alias read-modify-write: the merge {val, old[7:0]} needs
                 // the existing low byte; the S_MEM
@@ -1275,6 +1156,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
         reg [15:0] xr; reg signed [31:0] xs; reg [31:0] xu, res;
         integer e; reg signed [15:0] sev;
         begin
+            xs = 32'sh0; xu = 32'h0; e = 0; sev = 16'sh0;
             o_res=32'h0; o_se=16'h0; o_ss=1'b0; o_sbr=16'h0;
             o_se_we=1'b0; o_ss_we=1'b0; o_sbr_we=1'b0;
             xr = shift_xreg(xi);
@@ -1282,36 +1164,36 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             case (mode)
               4'h0, 4'h1: begin // LSHIFT (HI[,OR])
                   xu = {xr, 16'h0};
-                  if (sc > 0) res = (sc < 32)   ? (xu << sc)    : 32'h0;
-                  else        res = (sc > -32)  ? (xu >> (-sc)) : 32'h0;
+                  if (sc > 0) res = (sc < 32)   ? (xu << $unsigned(sc))    : 32'h0;
+                  else        res = (sc > -32)  ? (xu >> $unsigned(-sc)) : 32'h0;
               end
               4'h2, 4'h3: begin // LSHIFT (LO[,OR])
                   xu = {16'h0, xr};
-                  if (sc > 0) res = (sc < 32)   ? (xu << sc)    : 32'h0;
-                  else        res = (sc > -32)  ? (xu >> (-sc)) : 32'h0;
+                  if (sc > 0) res = (sc < 32)   ? (xu << $unsigned(sc))    : 32'h0;
+                  else        res = (sc > -32)  ? (xu >> $unsigned(-sc)) : 32'h0;
               end
               4'h4, 4'h5: begin // ASHIFT (HI[,OR])
                   xs = $signed({xr, 16'h0});
-                  if (sc > 0) res = (sc < 32)   ? (xs <<  sc)   : 32'h0;
-                  else        res = (sc > -32)  ? (xs >>> (-sc)) : (xs >>> 31);
+                  if (sc > 0) res = (sc < 32)   ? (xs <<  $unsigned(sc))   : 32'h0;
+                  else        res = (sc > -32)  ? (xs >>> $unsigned(-sc)) : (xs >>> 31);
               end
               4'h6, 4'h7: begin // ASHIFT (LO[,OR])
                   xs = $signed({{16{xr[15]}}, xr});
-                  if (sc > 0) res = (sc < 32)   ? (xs <<  sc)   : 32'h0;
-                  else        res = (sc > -32)  ? (xs >>> (-sc)) : (xs >>> 31);
+                  if (sc > 0) res = (sc < 32)   ? (xs <<  $unsigned(sc))   : 32'h0;
+                  else        res = (sc > -32)  ? (xs >>> $unsigned(-sc)) : (xs >>> 31);
               end
               4'h8, 4'h9: begin // NORM (HI[,OR])
                   xs = $signed({xr, 16'h0});
                   if (sc > 0) begin
                       xu  = {astat[3], xs[31:1]};     // xop>>1, carry into bit31
-                      res = xu >> (sc - 1);
+                      res = xu >> $unsigned(sc - 1);
                   end else
-                      res = (sc > -32) ? (xs << (-sc)) : 32'h0;
+                      res = (sc > -32) ? (xs << $unsigned(-sc)) : 32'h0;
               end
               4'hA, 4'hB: begin // NORM (LO[,OR])
                   xu = {16'h0, xr};
-                  if (sc > 0) res = (sc < 32)  ? (xu >> sc)    : 32'h0;
-                  else        res = (sc > -32) ? (xu << (-sc)) : 32'h0;
+                  if (sc > 0) res = (sc < 32)  ? (xu >> $unsigned(sc))    : 32'h0;
+                  else        res = (sc > -32) ? (xu << $unsigned(-sc)) : 32'h0;
               end
               4'hC: begin       // EXP (HI)
                   xs = $signed({{16{xr[15]}}, xr});
@@ -1322,7 +1204,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                       o_ss = 1'b0; o_ss_we = 1'b1;     // clear SS
                       e = clz32(xs) - 16 - 1;
                   end
-                  sev = -e; o_se = sev; o_se_we = 1'b1; // SE = -res (int8 range)
+                  sev = 16'(-e); o_se = sev; o_se_we = 1'b1; // SE = -res (int8 range)
               end
               4'hD: begin       // EXP (HIX)
                   xs = $signed({{16{xr[15]}}, xr});
@@ -1335,20 +1217,20 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                       end else begin
                           o_ss = 1'b0; o_ss_we = 1'b1; e = clz32(xs) - 16 - 1;
                       end
-                      sev = -e; o_se = sev; o_se_we = 1'b1;
+                      sev = 16'(-e); o_se = sev; o_se_we = 1'b1;
                   end
               end
               4'hE: begin       // EXP (LO)
                   if ($signed(`G0(9)[7:0]) == -8'sd15) begin
                       xs = $signed({{16{xr[15]}}, xr});
                       e  = clz32((astat[7] ? ~xs : xs) & 32'h0000ffff) - 1;
-                      sev = -e; o_se = sev; o_se_we = 1'b1;
+                      sev = 16'(-e); o_se = sev; o_se_we = 1'b1;
                   end
               end
               4'hF: begin       // EXPADJ
                   xs = $signed({{16{xr[15]}}, xr});
                   e  = clz32((xs < 0) ? ~xs : xs) - 16 - 1;
-                  if (e < -$signed(`SBR)) begin sev = -e; o_sbr = sev; o_sbr_we = 1'b1; end
+                  if (e < -$signed(`SBR)) begin sev = 16'(-e); o_sbr = sev; o_sbr_we = 1'b1; end
               end
             endcase
             if (mode < 4'hC) begin                    // SR-result modes
@@ -1464,7 +1346,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // S_EXEC. Register-file operands remain combinational flop/LUTRAM reads.
     //
     // One-read/one-write-per-port contract by state:
-    //  state    | PM-A (fetch)   | PM-B (pmb/PM-writes)      | DM read | DM write | ROM port
+    //  state    | PM-B (fetch)   | PM-A (pmb/PM-writes)      | DM read | DM write | ROM port
     //  S_BOOT   | idle re-read   | <=1 WRITE (word commit)   | -       | -        | req (stream)
     //  S_FETCH  | READ pm[pc]    | -                         | -       | -        | idle
     //  S_DECODE | re-read (same) | -                         | -       | -        | req starts (bank rd)
@@ -1474,9 +1356,9 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     //  S_MEM    | re-read        | READ ea (alias/PM/RMW)    | READ ea | -        | req held
     //  S_EXEC   | re-read        | <=1 WRITE (PM-data write  | -       | <=1 WRITE| req held
     //           |                |  OR alias-RMW merge)      |         | (dm_write)| (consume)
-    //  * PM-A: the registered fetch port re-reads pm[pc] every clock (pc moves
+    //  * PM-B: the registered fetch port re-reads pm[pc] every clock (pc moves
     //    only at EXEC) -- exactly one read per clock on a read-only port.
-    //  * PM-B: reads are consumed only from S_MEM/S_DRAIN issues; writes land
+    //  * PM-A: reads are consumed only from S_MEM/S_DRAIN issues; writes land
     //    only in S_EXEC (one per instruction: the PM-data write variants and
     //    the alias RMW are mutually exclusive opcode classes) or S_BOOT (one
     //    word commit per completed byte-triplet). Reads and writes never share
@@ -1484,7 +1366,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     //  * DM: reads issued in S_MEM/S_DRAIN only; writes in S_EXEC only (one
     //    dm_write per instruction). The sim's always-reading registered port
     //    is 1 read/clock; the unconsumed reloads are don't-cares.
-    //  * S_DRAIN reads BOTH PM-B and DM at dr_cur each clock -- one read on
+    //  * S_DRAIN reads BOTH PM-A and DM at dr_cur each clock -- one read on
     //    EACH port (legal); only the region-selected value is consumed.
     //  * ROM port: one level-held request in flight at a time (S_BOOT stream
     //    xor one bank-window read; muxed by boot_active).
@@ -1495,12 +1377,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             dr_done <= 1'b0; dr_idx <= 0; div_done <= 1'b0; div_i <= 5'd0;   // clear stall progress
             pc <= 14'h0000; o_valid <= 1'b0; o_unimpl <= 1'b0; o_ppc <= 14'h0;
             dac_sample <= 16'h0;
-            dbg_wrap_pc <= 14'h0; dbg_wrap_cnt <= 8'h0;
-            dbg_ab_prev <= 16'h0; dbg_ab_seen <= 1'b0;
-            dbg_src_pc <= 14'h0; dbg_src_addr <= 14'h0; dbg_src_cnt <= 8'h0;
-            dbg_src_op <= 8'h0; dbg_arm_ctr <= 16'h0;
             dbg_cmd_lost <= 8'h0; dbg_cmd_read <= 1'b0;
-            dbg_w_prev_addr <= 16'h0; dbg_w_prev_val <= 16'h0; dbg_w_seen <= 1'b0;
             loop_sp <= 0; pc_sp <= 0; cntr_sp <= 0; cntr <= 14'h0;
             astat<=0; mstat<=0; sstat<=0; imask<=0; icntl<=0; px<=0;
             afb[0]<=0; afb[1]<=0; mfb[0]<=0; mfb[1]<=0; sbb[0]<=0; sbb[1]<=0;
@@ -1704,7 +1581,6 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                 // Every captured sample is strobed, not merely the final
                 // sample of a DCS half-buffer: one sample per drain cycle.
                 dac_ce <= 1'b1;
-                if (dbg_arm_ctr != 16'hFFFF) dbg_arm_ctr <= dbg_arm_ctr + 16'd1;
             end
             if (dr_idx < dr_cnt) begin
                 // issue read dr_idx this clock (port address = dr_cur via the muxes)
@@ -1738,7 +1614,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             end else begin
                 div_t = {div_rem, div_nd[15]};    // shift in next dividend bit
                 if (div_t >= {1'b0, div_v}) begin
-                    div_rem <= div_t - {1'b0, div_v};   // fits 17 bits: rem < divisor
+                    div_rem <= 17'(div_t - {1'b0, div_v});   // fits 17 bits: rem < divisor
                     div_q   <= {div_q[14:0], 1'b1};
                 end else begin
                     div_rem <= div_t[16:0];             // < divisor <= 0x1FFFE
@@ -1873,7 +1749,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                         ab_reg = {16'h0, baseR[ab_ireg]};  // reset to base
                         irq1_pulse <= 1'b1;         // pulse IRQ1 on wrap
                     end
-                    iR[ab_ireg]  <= ab_reg & 16'h3FFF;
+                    iR[ab_ireg]  <= ab_reg[15:0] & 16'h3FFF;
                     // write-back re-bases too
                     baseR[ab_ireg] <= ab_reg[13:0] & lmask[ab_ireg];
                     // Consume the drain-due flag. The DAC-slot
@@ -1992,10 +1868,10 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                   if (op[3])  mstat_tmp = (mstat_tmp & ~16'h0040) | (op[2]  ? 16'h0040 : 16'h0); // GOMODE
                   if (op[13]) mstat_tmp = (mstat_tmp & ~16'h0010) | (op[12] ? 16'h0010 : 16'h0); // INTEGER
                   if (op[15]) mstat_tmp = (mstat_tmp & ~16'h0020) | (op[14] ? 16'h0020 : 16'h0); // TIMER
-                  if (op[5])  mstat_tmp = (mstat_tmp & ~16'h0001) | ((op>>4) & 16'h0001); // BANK
-                  if (op[7])  mstat_tmp = (mstat_tmp & ~16'h0002) | ((op>>5) & 16'h0002); // REVERSE
-                  if (op[9])  mstat_tmp = (mstat_tmp & ~16'h0004) | ((op>>6) & 16'h0004); // STICKYV
-                  if (op[11]) mstat_tmp = (mstat_tmp & ~16'h0008) | ((op>>7) & 16'h0008); // SATURATE
+                  if (op[5])  mstat_tmp = (mstat_tmp & ~16'h0001) | (16'(op>>4) & 16'h0001); // BANK
+                  if (op[7])  mstat_tmp = (mstat_tmp & ~16'h0002) | (16'(op>>5) & 16'h0002); // REVERSE
+                  if (op[9])  mstat_tmp = (mstat_tmp & ~16'h0004) | (16'(op>>6) & 16'h0004); // STICKYV
+                  if (op[11]) mstat_tmp = (mstat_tmp & ~16'h0008) | (16'(op>>7) & 16'h0008); // SATURATE
                   set_mstat(mstat_tmp);
               end
 
@@ -2170,8 +2046,8 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
           end
         endcase
 
-        // ---- board reset line input register: sampled every
-        //      clock; the boundary-check states consume host_rst_r.
+        // ---- board reset line input register: sampled on every
+        //      core_ce clock; the boundary-check states consume host_rst_r.
         if (!rst) host_rst_r <= host_rst;
         // ---- DAC-rate slot accumulator: one dac_ce_in pulse equals
         //      one output sample slot consumed by the SPORT1 DAC frame. While the

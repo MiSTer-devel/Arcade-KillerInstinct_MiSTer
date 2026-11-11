@@ -26,10 +26,8 @@ entity cpu_TLB_data is
    );
    port 
    (
-      clk93                : in  std_logic;
+      clk2x                : in  std_logic;
       reset                : in  std_logic;
-                           
-      DISABLE_DTLBMINI     : in  std_logic;
                            
       TLBInvalidate        : in  std_logic;
                            
@@ -56,14 +54,13 @@ entity cpu_TLB_data is
       TLB_fetchExcNotFound : in  std_logic;
       TLB_fetchCached      : in  std_logic;
       TLB_fetchDirty       : in  std_logic;
-      TLB_fetchSource      : in  unsigned(4 downto 0);
+      TLB_fetchSource      : in  unsigned(5 downto 0);
       TLB_fetchAddrOut     : in  unsigned(31 downto 0)
    );
 end entity;
 
 architecture arch of cpu_TLB_data is
  
-   signal DISABLE_DTLBMINI_INTERN : std_logic := '0';
  
    type tstate is
    (
@@ -84,7 +81,7 @@ architecture arch of cpu_TLB_data is
       physical : unsigned(31 downto 0); 
       cached   : std_logic;
       dirty    : std_logic;
-      source   : unsigned(4 downto 0);
+      source   : unsigned(5 downto 0);
    end record; 
    
    type tminiEntries is array(0 to MINICOUNT - 1) of tminiEntry;
@@ -125,11 +122,9 @@ begin
 
    TLB_Stall <= TLB_Req when (mini_hit = '0') else '0';
 
-   process (clk93)
+   process (clk2x)
    begin
-      if (rising_edge(clk93)) then
-      
-         DISABLE_DTLBMINI_INTERN <= DISABLE_DTLBMINI;
+      if (rising_edge(clk2x)) then
       
          TLB_UnStall   <= '0';
          TLB_fetchReq  <= '0';
@@ -148,7 +143,7 @@ begin
            
          else
          
-            if (TLBInvalidate = '1' or DISABLE_DTLBMINI_INTERN = '1') then
+            if (TLBInvalidate = '1') then
                for i in 0 to MINICOUNT - 1 loop
                   miniEntries(i).valid <= '0';
                end loop;
@@ -228,7 +223,7 @@ begin
    
       process
       begin
-         wait until rising_edge(clk93);
+         wait until rising_edge(clk2x);
          
          cycles <= cycles + 1;
          
