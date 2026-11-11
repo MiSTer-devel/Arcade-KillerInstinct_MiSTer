@@ -31,7 +31,7 @@ implements:
 
 ## Accuracy
 
-See [Core vs Original Hardware](core-hardware-comparison.md)
+See [Core vs Original Hardware](docs/core-hardware-comparison.md)
 
 ## Media
 
