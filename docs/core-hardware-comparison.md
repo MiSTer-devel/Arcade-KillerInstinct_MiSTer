@@ -4,21 +4,20 @@ This report compares results from the Killer Instinct memory, CPU and IDE test R
 
 | Platform | Source | Test ROM build |
 |---|---|---|
-| **Original hardware** | Real KI board, A-19489, measured 2026-11-09 | Nov 7 2026 (current CPU tests) |
-| **MiSTer core** | This core, release build with all six CPU features disabled (section 10), measured 2026-11-08 | Nov 7 2026 |
+| **Original hardware** | Real KI board, A-19489 | Nov 7 2026 |
+| **MiSTer core** | This core, release build with all six CPU features disabled (section 10) | Nov 7 2026 |
 
 **Original hardware measurements courtesy of [MisterAddons](https://github.com/misteraddons).**
 
 Units: throughput is in MB/s (MB = 10^6 bytes). Timings are in CPU cycles, where 1 cycle = 2 × CP0 Count. Every value is the best of 3 runs unless the page says otherwise.
 
-The Nov 7 test ROM reorganizes the pages by what they test and adds caches, TLB, integer, floating-point, system and timing-spread measurements. The sections below follow its page order.
+The sections below follow the test ROM's page order.
 
 ---
 
 ## Summary
 
-- **The board passes all 252 CPU tests on the current ROM** (2,708 checks, 0 failed), including the corrected `umode/kernel_addr_badvaddr` (see section 10). PRId, FIR and Config match the board exactly.
-- **With every CPU feature enabled, the core passes all 252 tests on the current ROM.** The release build disables six features that KI does not use, and it fails only the 45 tests that exercise them.
+- **Both the board and the core with every CPU feature enabled pass all 252 CPU tests.** PRId, FIR and Config match exactly. The release build disables six CPU features that KI does not use, and it fails only the 45 tests that exercise them.
 - **The heavy frame (KI2 barrel explosion) is within 1.2% of the board** (3,615 vs 3,660 kcycles), and the rendered checksum is identical.
 - **Where the board uses its fastest memory (SRAM, VRAM), the core's reads are within 2% of the board.** Uncached SRAM reads are 98.0% of the board's speed. Cached reads are 99.5%.
 - **The core is faster than the board in many places:** board DRAM (the core puts DRAM and SRAM on the same SDRAM), cached writes, IDE, integer multiply and divide, `mul.s`/`mul.d`, FP compare-and-branch, uncached ROM reads, and several cache operations.
@@ -335,48 +334,20 @@ Both platforms are steady from run to run: no kernel varies by more than 0.04 cy
 
 ## 10. CPU tests (iris cpu-tests, R4600 expectations, little-endian)
 
-| | Original HW (current 252-test ROM) |
-|---|---|
-| CPU | R4600 |
-| PRId | `0x2020` |
-| FIR | `0x2020` |
-| Config | `0x000264B3` |
-| Checks | 2,708 passed, 0 failed |
-| Tests | 252 run, 0 failed |
+| | Original HW | MiSTer core, all features | MiSTer core, release build |
+|---|---|---|---|
+| CPU | R4600 | R4600 | R4600 |
+| PRId | `0x2020` | `0x2020` | `0x2020` |
+| FIR | `0x2020` | `0x2020` | `0x2020` |
+| Config | `0x000264B3` | `0x000264B3` | `0x000264B3` |
+| Checks | 2,708 passed, 0 failed | all passed | 2,211 passed, 139 failed |
+| Tests | 252 run, 0 failed | 252 run, 0 failed | 252 run, 45 failed |
 
-The board passes every test on the current ROM. On the earlier 264-test ROM it failed one, 2,764 checks passed and 2 failed: `umode/kernel_addr_badvaddr`. The test checks what the R4600 writes to the upper half of BadVAddr when 32-bit User or Supervisor code touches a Kernel address. It expected `0x3FFFFF00`, the value the board had reported for a User-mode load from KSEG0. The board reports that value for User-mode loads from KSEG1, KSEG2 and KSEG3 and a User-mode store to KSEG0. It reports the plain sign extension for the other two cases:
+With every CPU feature enabled, the core passes every test, like the board.
 
-| Case | Board's BadVAddr |
-|---|---|
-| User-mode jump to KSEG0 (instruction fetch) | `0xFFFFFFFF88058008` (sign extension) |
-| Supervisor-mode load from KSEG0 | `0xFFFFFFFF80000000` (sign extension) |
+### Failed tests in the release build
 
-So the R4600's `0x3FFFFF00` upper half applies only to User-mode loads and stores. The test now expects exactly that, and the board passes it.
-
-The current test ROM also adds `excep/user_fetch_via_tlb` and drops the 13 MIPS IV tests (the `mips4` and `mips4_fp` groups). The R4600 is a MIPS III part, so on it those tests only checked that each MIPS IV instruction is refused. That leaves 252 tests.
-
-### Core with every CPU feature enabled
-
-Measured 2026-11-09 on a build with all six generics below set to false, running the current 252-test ROM. **The core passes all 252 tests, like the board.** PRId, FIR and Config match the board exactly.
-
-| | MiSTer core (all features enabled) |
-|---|---|
-| Tests | 252 run, 0 failed |
-
-The first full-feature run of this ROM failed six User-mode tests. Four CPU accuracy fixes closed them:
-
-- **Exception vectors in 64-bit mode.** The vector's upper half was zero when the exception came from 32-bit code, so a fetch still decoding with UX set took a TLB miss on the vector. Vectors are now always sign-extended.
-- **64-bit User segment.** A User address above `xuseg` (`0xFF_FFFFFFFF`) was not flagged as unusable, so it raised no Address Error.
-- **Register jumps into Kernel segments.** A User or Supervisor `jr`/`jalr` to a region that mode may not execute from now raises an Address Error at the jump, with EPC and BadVAddr set to the target. Before, only misaligned targets did.
-- **BadVAddr `0x3FFFFF00` rule.** It now applies only to User-mode loads and stores, as measured on the board. It no longer applies to Supervisor mode or to instruction fetches.
-
-The jump check sits behind the existing generics: `INSTR_KSEG_ONLY` removes the region half, and `NO_ADDRESS_ERROR` removes all of it. The other three fixes only change 64-bit or User-mode behaviour, and KI never uses either.
-
-On the earlier 263-test ROM, the board passed every test (2,748 checks, 0 failed).
-
-### Failed tests with release features disabled
-
-Release builds disable the following unused CPU features to reduce slack.
+Release builds disable the following CPU features, which KI does not use, to improve timing.
 ```
 -- KI uses the 32-bit exception-address contract.
 ADDR32_ONLY          => true,
@@ -393,17 +364,7 @@ NO_ADDRESS_ERROR     => true,
 NO_FPU_EXCEPTION     => true
 ```
 
-Measured 2026-11-08 on a release build with all six features disabled, running
-the current 252-test ROM. That ROM adds `excep/user_fetch_via_tlb`, which checks
-that a User-mode fetch goes through the TLB, and `umode/kernel_addr_badvaddr`.
-It drops the 13 MIPS IV tests. With these features disabled, the core fails 45
-of the 252 tests (139 of 2,350 checks). The User-mode tests stop at the
-`user_fetch_via_tlb` probe without running their checks.
-
-| | MiSTer core (release features disabled) |
-|---|---|
-| Checks | 2,211 passed, 139 failed |
-| Tests | 252 run, 45 failed |
+With these features disabled, the core fails 45 of the 252 tests. The User-mode tests stop at the `excep/user_fetch_via_tlb` probe, which checks that a User-mode fetch goes through the TLB, without running their own checks.
 
 | Group | Failed tests | Count | Cause |
 |---|---|---:|---|

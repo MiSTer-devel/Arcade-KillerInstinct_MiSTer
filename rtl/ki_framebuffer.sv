@@ -118,7 +118,6 @@ module ki_framebuffer (
   logic  [6:0] fetch_word;
   logic  [6:0] fetch_issue_word;
   logic [27:0] fetch_line_address;
-  logic [18:0] fetch_page;
 
   logic        pending_valid;
   logic  [7:0] pending_line;
@@ -126,7 +125,6 @@ module ki_framebuffer (
   logic [18:0] framebuffer_base_d;
 
   logic  [7:0] line_tag [0:1];
-  logic [18:0] page_tag [0:1];
   logic  [1:0] line_ready;
 
   wire line_boundary = ce_pixel && (h_count == 10'd0);
@@ -179,8 +177,7 @@ module ki_framebuffer (
     memory_address = fetch_line_address + {18'd0, fetch_issue_word, 3'b000};
     pixel_valid = (h_count < 320) && (v_count < 240) &&
                   line_ready[v_count[0]] &&
-                  (line_tag[v_count[0]] == v_count[7:0]) &&
-                  (page_tag[v_count[0]] == framebuffer_base);
+                  (line_tag[v_count[0]] == v_count[7:0]);
     red   = 8'h00;
     green = 8'h00;
     blue  = 8'h00;
@@ -201,15 +198,12 @@ module ki_framebuffer (
       fetch_word        <= 7'd0;
       fetch_issue_word  <= 7'd0;
       fetch_line_address <= 28'd0;
-      fetch_page        <= KI_FB_PAGE0;
       pending_valid     <= 1'b1;
       pending_line      <= 8'd0;
       pending_page      <= KI_FB_PAGE0;
       framebuffer_base_d <= KI_FB_PAGE0;
       line_tag[0]       <= 8'd0;
       line_tag[1]       <= 8'd0;
-      page_tag[0]       <= KI_FB_PAGE0;
-      page_tag[1]       <= KI_FB_PAGE0;
       line_ready        <= 2'b00;
     end else begin
       framebuffer_base_d <= framebuffer_base;
@@ -244,7 +238,6 @@ module ki_framebuffer (
           fetch_active <= 1'b0;
           line_ready[fetch_bank] <= 1'b1;
           line_tag[fetch_bank] <= fetch_line;
-          page_tag[fetch_bank] <= fetch_page;
         end else begin
           fetch_issue_word <= fetch_issue_word + WORDS_PER_REQUEST[6:0];
           issue_next <= 1'b1;
@@ -258,7 +251,6 @@ module ki_framebuffer (
         fetch_bank <= pending_line[0];
         fetch_word <= 7'd0;
         fetch_issue_word <= 7'd0;
-        fetch_page <= pending_page;
         fetch_line_address <= first_word_address(pending_page, pending_line);
         memory_request <= 1'b1;
         pending_valid <= 1'b0;
