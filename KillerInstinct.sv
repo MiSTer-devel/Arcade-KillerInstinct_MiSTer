@@ -117,6 +117,7 @@ module emu
 	input         OSD_STATUS
 );
 
+`include "build_id.v"
 localparam CONF_STR = {
 	"KillerInstinct;;",
 	"H0S0,IMG,HDD Image;",
