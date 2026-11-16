@@ -26,26 +26,18 @@ module adsp2105 (
     // Host mailbox interface:
     //        host_cmd_w  : strobe -- host writes ONE 16-bit command word into the INPUT
     //                      latch (sets INPUT_FULL, asserts ADSP2105_IRQ2 and
-    //                      latches the input data). Board wrappers that use
-    //                      byte-wide host buses assemble their bytes before
-    //                      driving this interface; KI supplies a complete
+    //                      latches the input data). KI supplies a complete
     //                      16-bit word per strobe.
     //        host_cmd_data : the command word latched by host_cmd_w.
     //        host_status_r : the latch-control status word the host reads.
-    //                      Bit polarities EXACT: OUTPUT_EMPTY=0x400,
-    //                      INPUT_EMPTY=0x800 -- a bit SET means that latch is
-    //                      EMPTY. Power-on/reset sets BOTH empty so idle =
-    //                      0x0C00.
-    //        host_response_r : the OUTPUT latch (DCS->host data); the ADSP
-    //                      fills it by writing DM 0x3400-0x3403, which sets
-    //                      OUTPUT_FULL.
-    //        host_resp_rd  : strobe -- host reads host_response_r; with auto-ack
-    //                      that SETs OUTPUT_EMPTY.
+    //                      INPUT_EMPTY=0x800: a SET bit means the input latch
+    //                      is empty. KI's main board reads only this bit and
+    //                      never reads the DSP's reply latch, so the reply latch
+    //                      is not modelled and OUTPUT_EMPTY (0x400) reads set.
+    //                      Idle = 0x0C00.
     input  wire        host_cmd_w,
     input  wire [15:0] host_cmd_data,
     output wire [15:0] host_status_r,
-    output wire [15:0] host_response_r,
-    input  wire        host_resp_rd,
     // Packed 4 MB sound-ROM backing; rom_ddr_addr is a 64-bit beat offset and
     // rom_ddr_req is held until ready.
     output wire        rom_ddr_req,
@@ -63,7 +55,7 @@ module adsp2105 (
     input  wire        dac_ce_in,
     output reg  [13:0] o_ppc,     // address of instruction just executed
     output reg         o_valid,   // strobes once per retired instruction
-    output reg         o_unimpl,  // set when an opcode class isn't handled yet
+    output reg         o_unimpl,  // set when a retired opcode class is not implemented
     // ---- DAC output: the autobuffer drain emits each drained s16 sample
     //      here (mono, DCS1). dac_ce strobes for one clock per
     //      emitted sample; dac_sample holds the little-endian s16 value. In
@@ -95,15 +87,21 @@ module adsp2105 (
     // circular-addressing support: every I write re-bases base=i&lmask; every
     // L write recomputes lmask=mask_table[l] and re-bases. modify:
     // i=(i+m)&0x3fff; if (i<base) i+=l; else if (i>=base+l) i-=l.
-    reg [13:0] baseR [0:7];       // m_base
-    reg [13:0] lmask [0:7];       // m_lmask
-    reg [15:0] astat, mstat, sstat, imask, icntl, px;
+    reg [13:0] baseR [0:7];       // circular-buffer base of each I register
+    reg [13:0] lmask [0:7];       // base mask from each L register
+    // Status and control registers at their ADSP-2105 widths. Register reads
+    // zero-extend them; SSTAT is read-only and is computed from the stacks.
+    reg [7:0]  astat;             // SS MV Q AS AC AV AN AZ
+    reg [6:0]  mstat;             // GO_MODE TIMER M_MODE AR_SAT AV_LATCH BIT_REV SEC_REG
+    reg [5:0]  imask;             // IRQ2 - - SPORT1_TX/IRQ1 SPORT1_RX/IRQ0 TIMER
+    reg [4:0]  icntl;             // NEST - IRQ2/IRQ1/IRQ0 edge sensitivity; bits 4 and 2 act
+    reg [15:0] px;
     // The non-g0 banked core registers keep both banks as 2-entry files
     // indexed by the same active-bank pointer (the MSTAT bank switch swaps the
     // whole core register set, including AF/MF/SB and the MR top half).
     reg [15:0] afb  [0:1];        // ALU feedback register (not in g0), banked
     reg [15:0] mfb  [0:1];        // MAC feedback register, banked
-    reg [15:0] sbb  [0:1];        // SB, banked
+    reg [4:0]  sbb  [0:1];        // SB: 5-bit block exponent, read sign-extended; banked
     // ---- active-bank pointer + accessors ------------------------------------
     // Every read AND write of a banked register indexes by bnk; a MSTAT write
     // (set_mstat) just changes mstat[0]. Same-clock semantics are identical to
@@ -118,27 +116,59 @@ module adsp2105 (
     `define MF     mfb[bnk]
     `define SBR    sbb[bnk]
     reg [13:0] cntr;
-    // DCS memory system: the sound ROMs sit behind dcs_mem, and DM 0x2000-0x2FFF
-    // is a banked window onto them, paged linearly in 0x1000-word pages with
-    // bank select data&0x7ff. The 23-bit ROM address is {data_bank, offset[11:0]};
+    // ---- Killer Instinct DCS Audio 2K memory map ----------------------------
+    // The ADSP-2105 holds 1K x 24 of program RAM (PM 0x0000-0x03FF) and 512 x
+    // 16 of data RAM (DM 0x3800-0x39FF). The board adds one 2K x 24 SRAM, three
+    // 2K x 8 parts, which it decodes twice:
+    //   PM 0x0800-0x1FFF : the SRAM, all 24 bits; the 2K repeats three times
+    //   DM 0x0000-0x1FFF : the SRAM's bits 23:8; the 2K repeats four times
+    // so a DM write replaces bits 23:8 of the PM word at the same SRAM offset
+    // and keeps bits 7:0. The rest of the data space:
+    //   DM 0x2000-0x2FFF : banked window onto the sound ROMs (read only)
+    //   DM 0x3000-0x33FF : sound-ROM bank select (write only)
+    //   DM 0x3400-0x37FF : host input latch (read); the reply latch (write)
+    //   DM 0x3FE0-0x3FFF : memory-mapped control registers
+    // Every other address (PM 0x0400-0x07FF and 0x2000-0x3FFF, DM 0x3A00-0x3FDF,
+    // reads of DM 0x3000-0x33FF) has nothing behind it: reads return 0 and
+    // writes are ignored.
+    // The sound ROMs sit behind dcs_mem. The window pages linearly in
+    // 0x1000-word pages, so the 23-bit ROM address is {data_bank, offset[11:0]};
     // dcs_mem decodes the chip select and the sparse layout.
-    reg [10:0] data_bank;         // ROM data bank (set by DM($3000)); window=bank*0x1000
+    reg [10:0] data_bank;         // sound-ROM bank; window = bank * 0x1000
+
+    // PM storage rows: 0x000-0x3FF internal RAM, 0x400-0xBFF the board SRAM.
+    function automatic pm_mapped(input [13:0] a);
+        pm_mapped = (a[13:10] == 4'b0000) || (!a[13] && (a[12:11] != 2'b00));
+    endfunction
+    function automatic [11:0] sram_row(input [10:0] offset);
+        sram_row = {offset[10] ? 2'b10 : 2'b01, offset[9:0]};
+    endfunction
+    function automatic [11:0] pm_row(input [13:0] a);
+        pm_row = (a[13:10] == 4'b0000) ? {2'b00, a[9:0]} : sram_row(a[10:0]);
+    endfunction
+    // DM storage rows: 0x000-0x1FF internal RAM, 0x3E0-0x3FF control registers.
+    function automatic dm_mapped(input [13:0] a);
+        dm_mapped = (a[13:9] == 5'b11100) || (a[13:5] == 9'h1FF);
+    endfunction
+    function automatic [9:0] dm_row(input [13:0] a);
+        dm_row = {a[13:9] != 5'b11100, a[8:0]};
+    endfunction
 
     // ---- PM / DM internal BRAM ----------------------------------------------
-    // Program and data memory are local on-chip M10K-compatible memories with
+    // Program and data memory are local on-chip M10K memories with
     // synchronous write ports. dcs_mem owns the external sound-ROM port and
     // prefetch cache.
-    // PM is one true dual-port M10K bank. Port A is the immediate data-side
-    // read/write port. Port B is the registered-address instruction-fetch port.
-    // Quartus cannot reliably infer this 24-bit bidirectional dual-port
-    // topology from the ADSP state machine and otherwise expands it into almost
-    // 400k registers, so synthesis uses an explicit altsyncram below. Simulation
-    // retains the array model.
-    (* ramstyle = "no_rw_check, M10K" *) reg [15:0] dm  [0:16383]; // data memory, 16-bit (1W/1R)
+    // PM (the internal RAM and the board SRAM) is one true dual-port M10K bank.
+    // Port A is the immediate data-side read/write port. Port B is the
+    // registered-address instruction-fetch port. Quartus cannot reliably infer
+    // this 24-bit bidirectional dual-port topology from the ADSP state machine,
+    // so synthesis uses an explicit altsyncram below. Simulation retains the
+    // array model.
+    (* ramstyle = "no_rw_check, M10K" *) reg [15:0] dm [0:1023]; // internal DM + control registers (1W/1R)
     // Single PM data-port write command, decoded combinationally from the state
     // that commits the instruction. This makes address/data/wren stable before
     // the active clock edge required by the RAM primitive.
-reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
+reg        pm_we; reg [2:0] pm_be; reg [11:0] pm_wa; reg [23:0] pm_wd;
     `define DM  dm
     // Declare sequencer/boot state before the fetch and ROM helpers that use it.
     // Quartus accepts module-scope forward references, but the ModelSim version
@@ -150,18 +180,20 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     reg [10:0] boot_bank;        // ROM bank this boot streams from
     reg [1:0]  boot_phase;       // 0 = header byte, 1/2/3 = word byte 0/1/2
     reg [7:0]  boot_b0, boot_b1; // first two bytes of the word in flight
-    // Fetch read port (Port B): the address is PC itself, so the clocked read
-    // `fetch_r <= pm[pc]` samples the CURRENT pc at the FETCH-bubble edge and
-    // presents op on the EXEC edge (1-clock BRAM latency).
-    wire [13:0] fetch_addr = pc;
+    // Fetch read port (Port B): the address is PC's storage row, so the clocked
+    // read samples the CURRENT pc at the FETCH-bubble edge and presents the
+    // opcode on the DECODE edge (1-clock BRAM latency). pc moves only at EXEC,
+    // so testing the live pc for an unmapped address matches the row read.
+    wire [11:0] fetch_addr = pm_row(pc);
     wire [23:0] fetch_q;
+    wire [23:0] fetch_op = pm_mapped(pc) ? fetch_q : 24'h000000;
     // Data-side read ports (Port A on PM + the DM port). The PM alias path is
     // combinational because S_MEM already stages its effective address before
     // S_EXEC commits a write; adding another address/data register changes the
     // ADSP program-memory contract. At most one access is issued per port per
     // clock (see the one-read/one-write-per-port contract table at the main FSM).
-    wire [13:0] pmb_addr;   wire [23:0] pmb_q;
-    wire [13:0] dm_addr;    reg [15:0] dm_q;
+    wire [11:0] pmb_addr;   wire [23:0] pmb_q;
+    wire [9:0]  dm_addr;    reg [15:0] dm_q;
     always @(posedge clk) begin
         if (cpu_ce)
             dm_q <= dm[dm_addr];         // DM read port
@@ -170,9 +202,9 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
 `ifdef SYNTHESIS
     // The ADSP program store has one immediate data-side read/write port and a
     // registered-address instruction-fetch port. Describe it explicitly so
-    // Quartus cannot flatten 16K x 24 bits into registers. Both primitive clock
-    // groups use the ADSP clock and advance only on an ADSP cycle, matching the
-    // behavioral model below.
+    // Quartus cannot flatten it into registers. Both primitive clock groups use
+    // the ADSP clock and advance only on an ADSP cycle, matching the behavioral
+    // model below.
     altsyncram #(
         .address_reg_b("CLOCK1"),
         .byteena_reg_b("CLOCK1"),
@@ -183,8 +215,8 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
         .indata_reg_b("CLOCK1"),
         .intended_device_family("Cyclone V"),
         .lpm_type("altsyncram"),
-        .numwords_a(16384),
-        .numwords_b(16384),
+        .numwords_a(3072),
+        .numwords_b(3072),
         .operation_mode("BIDIR_DUAL_PORT"),
         .outdata_aclr_a("NONE"),
         .outdata_aclr_b("NONE"),
@@ -197,8 +229,8 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
         .read_during_write_mode_port_a("NEW_DATA_NO_NBE_READ"),
         .read_during_write_mode_port_b("NEW_DATA_NO_NBE_READ"),
         .wrcontrol_wraddress_reg_b("CLOCK1"),
-        .widthad_a(14),
-        .widthad_b(14),
+        .widthad_a(12),
+        .widthad_b(12),
         .width_a(24),
         .width_b(24),
         .width_byteena_a(3),
@@ -231,7 +263,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
 `else
     // Portable simulation model. The hardware build above deliberately avoids
     // an inferred array because this access pattern is tool-version sensitive.
-    (* ramstyle = "no_rw_check, M10K" *) reg [23:0] pm [0:16383];
+    (* ramstyle = "no_rw_check, M10K" *) reg [23:0] pm [0:3071];
     reg [23:0] fetch_r, pmb_r, pm_write_word;
     assign fetch_q = fetch_r;
     assign pmb_q = pmb_r;
@@ -277,7 +309,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // Reset, reboot, and interrupts branch from boundary-check states.
     localparam [2:0] S_BOOT   = 3'd0,  // boot DMA streaming (boot_active)
                      S_FETCH  = 3'd1,  // present PC to the PM fetch port
-                     S_DECODE = 3'd2,  // fetch_q valid: latch op + EA, dispatch
+                     S_DECODE = 3'd2,  // fetch_op valid: latch op + EA, dispatch
                      S_DRAIN  = 3'd3,  // autobuffer drain stream
                      S_DIV    = 3'd4,  // TX1-arm restoring divider
                      S_ROM    = 3'd5,  // bank-window DDR3 stall
@@ -310,11 +342,15 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // SYSCONTROL bit9 reboot, host/watchdog reset) launch it; the CPU is held
     // (no fetch/decode/exec) for the whole stream = the reset-stall a real chip
     // sees while its boot loader runs.
-    // interrupt status stack {MSTAT,IMASK,ASTAT}
-    reg [15:0] stat_mstat [0:15];
-    reg [15:0] stat_imask [0:15];
-    reg [15:0] stat_astat [0:15];
-    integer    stat_sp;
+    // Interrupt status stack {MSTAT, IMASK, ASTAT}: seven levels deep, as on
+    // the ADSP-2105. A push onto a full stack is dropped; a pop from an empty
+    // stack reads level 0 and leaves the pointer at 0.
+    localparam [2:0] STAT_DEPTH = 3'd7;
+    reg [6:0]  stat_mstat [0:6];
+    reg [5:0]  stat_imask [0:6];
+    reg [7:0]  stat_astat [0:6];
+    reg [2:0]  stat_sp;
+    wire [2:0] stat_top = (stat_sp == 3'd0) ? 3'd0 : stat_sp - 3'd1;
 
     // ---- on-chip timer ------------------------------------------------------
     // Control regs are memory-mapped at DM 0x3FE0-0x3FFF (TIMER_SCALE_REG=
@@ -328,8 +364,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // Enable = MSTAT bit5 (MSTAT_TIMER=0x20); the timer runs while mstat[5].
     // Cadence: first underflow after scale*(count+1) CPU cycles, then every
     // scale*(period+1). This instruction-atomic model proxies cycles with
-    // retired instructions. The timer is inert for UMK3, whose timer use is a
-    // DRAM-refresh stub.
+    // retired instructions.
     // Underflow -> EDGE pulse on the ADSP timer line (the IRQ line is edge
     // triggered) -> timer IRQ latch, consulted by the interrupt check with NO
     // level/ICNTL mux, lowest priority (indx 5); latch cleared ONLY when the
@@ -363,32 +398,26 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // DCS1 auto-acks, so the firmware's read of DM($3400) clears the line.
     // The CPU-side edge latch (set on CLEAR->ASSERT) is kept too; the
     // interrupt check muxes level/latch on ICNTL.
-    // UMK3 firmware writes ICNTL=0 (level mode) + IMASK=$20 (IRQ2-only) per the
-    // disassembly; both modes are implemented.
     reg [15:0] input_data;   // latched host command word
     reg        irq2_line;    // ADSP2105_IRQ2 level
     reg        irq2_latch;   // CPU edge latch (cleared on vector take)
-    // ---- host mailbox latch-control + output latch --------------------------
-    // Latch control: bit11 (0x800)=INPUT_EMPTY, bit10 (0x400)=OUTPUT_EMPTY -- a
-    // SET bit means the corresponding latch is EMPTY. Both set (0x0C00) at
-    // reset. The host polls it directly. This is pure host-visible mailbox
-    // status; the ADSP never reads it.
-    reg [15:0] latch_control; // latch-control status word
-    reg [15:0] output_data;   // DCS->host response latch
-    assign host_status_r   = latch_control;
-    assign host_response_r = output_data;
+    // ---- host mailbox status ------------------------------------------------
+    // INPUT_EMPTY (status bit 11) is set when the input latch is empty: at
+    // reset and by the DSP's read of the latch; a host write clears it. The
+    // host polls it directly; the ADSP never reads it. The reply latch is not
+    // modelled (see the port list), so OUTPUT_EMPTY (bit 10) reads set.
+    reg        input_empty;
+    assign host_status_r = {4'b0000, input_empty, 1'b1, 10'h000};
     // On autobuffer wrap an IRQ1 pulse is raised (minimum-quantum width).
     // Modeled as a single-boundary-check pulse: taken at the next instruction
-    // boundary if unmasked (IMASK bit2 = 0x20>>3 with indx=3), lost otherwise
-    // (level mode, ICNTL=0 -> the transient line is gone and the unused
-    // edge-latch is never consulted).
+    // boundary if unmasked (IMASK bit2 = 0x20>>3 with indx=3), lost otherwise.
+    // The pulse is always level-sensitive: ICNTL bit 1 is stored but not
+    // applied to it.
     reg        irq1_pulse;
 
     // PCM emission: each drain reads the count samples from DM BEFORE advancing
     // I<ireg> (buffer[i] = DM[reg]; reg += incs) and emits them little-endian
     // s16 (the DAC stream).
-    integer    ab_i;                    // drain read-loop index
-    reg [15:0] ab_smp;                  // drained sample
     localparam [13:0] NO_LOOP = 14'h3FFF; // sentinel: no active loop end
 
     // ---- clocked-BRAM data side --------------------------------------------
@@ -405,83 +434,95 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     reg [15:0] ctl_syscontrol;   // shadow of DM($3FFF)
 
     // ---- DM-space region decode (data map) ----------------------------------
-    localparam [1:0] RG_DM = 2'd0, RG_ALIAS = 2'd1, RG_BANK = 2'd2, RG_LATCH = 2'd3;
-    function [1:0] dm_region(input [15:0] a);
+    // DM addresses are 14 bits; bits 15:14 of the 16-bit address are zero.
+    localparam [2:0] RG_SRAM  = 3'd0,  // 0x0000-0x1FFF board SRAM, bits 23:8
+                     RG_BANK  = 3'd1,  // 0x2000-0x2FFF sound-ROM window
+                     RG_BSEL  = 3'd2,  // 0x3000-0x33FF bank select (write only)
+                     RG_LATCH = 3'd3,  // 0x3400-0x37FF host input / reply latch
+                     RG_DM    = 3'd4,  // 0x3800-0x39FF internal RAM, 0x3FE0-0x3FFF control
+                     RG_NONE  = 3'd5;  // nothing at this address
+    function [2:0] dm_region(input [15:0] a);
         begin
-            if      (a >= 16'h0800 && a <= 16'h1fff) dm_region = RG_ALIAS; // PM[23:8] alias
-            else if (a >= 16'h2000 && a <= 16'h2fff) dm_region = RG_BANK;  // banked ROM window
-            else if (a >= 16'h3400 && a <= 16'h3403) dm_region = RG_LATCH; // host input latch
-            else                                     dm_region = RG_DM;
+            if      (!a[13])                  dm_region = RG_SRAM;
+            else if (!a[12])                  dm_region = RG_BANK;
+            else if (a[11:10] == 2'b00)       dm_region = RG_BSEL;
+            else if (a[11:10] == 2'b01)       dm_region = RG_LATCH;
+            else if (dm_mapped(a[13:0]))      dm_region = RG_DM;
+            else                              dm_region = RG_NONE;
         end
     endfunction
 
     // ---- pre-decode of THIS instruction's data-memory access -----------------
-    // Combinational over fetch_q + the DAG registers (all stable from the last
+    // Combinational over fetch_op + the DAG registers (all stable from the last
     // EXEC commit until the next). Mirrors, opcode-class by opcode-class, the
     // address/direction each EXEC-body site computes; a simulation-only
-    // cross-check at the EXEC consumption sites aborts on any mismatch.
-    reg         pre_dm_rd, pre_dm_wr, pre_pm_rd;
+    // cross-check at the EXEC consumption sites aborts on any mismatch. Writes
+    // need only the address: no write owes a wait state.
+    reg         pre_dm_rd, pre_pm_rd;
     reg  [15:0] pre_addr;      // DM-space address (dm_read/dm_write sites)
     reg  [13:0] pre_pm_addr;   // PM-space word address (0x11/0x50-5F data reads)
     always @* begin
-        pre_dm_rd = 1'b0; pre_dm_wr = 1'b0; pre_pm_rd = 1'b0;
+        pre_dm_rd = 1'b0; pre_pm_rd = 1'b0;
         pre_addr = 16'h0; pre_pm_addr = 14'h0;
-        casez (fetch_q[23:16])
+        casez (fetch_op[23:16])
           8'h11:                                       // shift + PM(I,M) DAG2
-              if (!fetch_q[15]) begin                  //   read variant only
+              if (!fetch_op[15]) begin                 //   read variant only
                   pre_pm_rd   = 1'b1;
-                  pre_pm_addr = iR[{1'b1, fetch_q[3:2]}][13:0];
+                  pre_pm_addr = iR[{1'b1, fetch_op[3:2]}][13:0];
               end
           8'h12, 8'h13: begin                          // shift + DM(I,M) DAG1/2
-              pre_addr = dag_addr({fetch_q[16], fetch_q[3:2]});
-              if (fetch_q[15]) pre_dm_wr = 1'b1; else pre_dm_rd = 1'b1;
+              pre_addr = dag_addr({fetch_op[16], fetch_op[3:2]});
+              pre_dm_rd = !fetch_op[15];
           end
           8'b0101_????:                                // 0x50-5F ALU/MAC + PM(I,M)
-              if (!fetch_q[19]) begin                  //   read variant only
+              if (!fetch_op[19]) begin                 //   read variant only
                   pre_pm_rd   = 1'b1;
-                  pre_pm_addr = iR[{1'b1, fetch_q[3:2]}][13:0];
+                  pre_pm_addr = iR[{1'b1, fetch_op[3:2]}][13:0];
               end
           8'b011?_????: begin                          // 0x60-7F ALU/MAC + DM(I,M)
-              pre_addr = dag_addr({fetch_q[20], fetch_q[3:2]});
-              if (fetch_q[19]) pre_dm_wr = 1'b1; else pre_dm_rd = 1'b1;
+              pre_addr = dag_addr({fetch_op[20], fetch_op[3:2]});
+              pre_dm_rd = !fetch_op[19];
           end
           8'b100?_????: begin                          // 0x80-9F DM(imm) r/w
-              pre_addr = {2'b0, fetch_q[17:4]};
-              if (fetch_q[20]) pre_dm_wr = 1'b1; else pre_dm_rd = 1'b1;
+              pre_addr = {2'b0, fetch_op[17:4]};
+              pre_dm_rd = !fetch_op[20];
           end
-          8'b101?_????: begin                          // 0xA0-BF DM(I,M)=imm
-              pre_addr  = dag_addr({fetch_q[20], fetch_q[3:2]});
-              pre_dm_wr = 1'b1;
-          end
+          8'b101?_????:                                // 0xA0-BF DM(I,M)=imm (write)
+              pre_addr  = dag_addr({fetch_op[20], fetch_op[3:2]});
           default: ;                                   // no data-memory access
         endcase
     end
-    wire [1:0] pre_region = dm_region(pre_addr);
+    wire [2:0] pre_region = dm_region(pre_addr);
     wire       pre_bank_rd = pre_dm_rd && (pre_region == RG_BANK);
     // MEM wait states this instruction owes before EXEC:
-    //   0 = none (reg/control ops, input-latch reads, plain DM/PM writes)
-    //   1 = one clocked BRAM read (DM read, alias read, PM-data read, or the
-    //       PM-alias write's RMW pre-read)
+    //   0 = none (reg/control ops, input-latch reads, reads of an address with
+    //       nothing behind it, every DM/PM write)
+    //   1 = one clocked BRAM read (internal-RAM/control-register read, SRAM
+    //       read through the PM port, PM-data read)
+    // A write to the SRAM through the DM space needs no read first: the PM
+    // port's byte enables keep bits 7:0 of the word.
     // Banked-ROM window reads are not counted here: they stall on
     // the rom_rdy handshake instead -- a VARIABLE-latency DDR3 round trip
     // through the prefetch cache (see the rom-stall branch in the main FSM).
     wire [1:0] mem_need =
-        ((pre_dm_rd && pre_region != RG_LATCH && pre_region != RG_BANK) ||
-         (pre_dm_wr && pre_region == RG_ALIAS) || pre_pm_rd)   ? 2'd1 : 2'd0;
+        ((pre_dm_rd && (pre_region == RG_SRAM || pre_region == RG_DM)) ||
+         pre_pm_rd) ? 2'd1 : 2'd0;
 
     // ---- S_DECODE latches ---------------------------------------------------
-    // The pre-decode above is combinational over fetch_q (stable for the whole
+    // The pre-decode above is combinational over fetch_op (stable for the whole
     // instruction: the fetch port keeps re-reading pm[pc] and pc only moves at
     // EXEC). S_DECODE registers the opcode + the memory pre-decode so every
     // post-DECODE state (the address muxes, the stall dispatch, S_EXEC's body
-    // and its cross-checks) runs from registered values rather than fetch_q fan-out.
+    // and its cross-checks) runs from registered values rather than fetch_op fan-out.
     // Latched values equal the combinational pre-decode by construction
     // (nothing they depend on changes between DECODE and EXEC); the S_EXEC
     // op-latch cross-check aborts loudly on any violation.
-    reg [23:0] op_r;        // latched instruction word (== fetch_q)
+    reg [23:0] op_r;        // latched instruction word (== fetch_op)
     reg [15:0] ea_addr_r;   // latched DM-space effective address
     reg [13:0] pm_addr_r;   // latched PM-data word address (0x11/0x50-5F reads)
-    reg        pm_rd_r;     // PM-data read (port B) this instruction
+    reg        pm_rd_r;     // PM-data read (port A) this instruction
+    // A PM-data read of an address with nothing behind it returns 0.
+    wire [23:0] pm_data_q = pm_mapped(pm_addr_r) ? pmb_q : 24'h000000;
     reg        bank_rd_r;   // banked-ROM window read this instruction
     reg        tx1_r;       // TX1 write (divider owed) this instruction
     reg [1:0]  mem_need_r;  // latched S_MEM requirement
@@ -498,12 +539,12 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // construction and S_DRAIN just reuses it.
     // wr_reg(grp3, idx 0xB) is reachable from exactly three opcode classes:
     wire pre_tx1_wr =
-        (fetch_q[23:16] == 8'h0D &&
-         fetch_q[11:10] == 2'd3  && fetch_q[7:4] == 4'hB) ||  // 0x0D reg-to-reg move
-        (fetch_q[23:20] == 4'h3  &&
-         fetch_q[19:18] == 2'd3  && fetch_q[3:0] == 4'hB) ||  // 0x30-3F load reg imm
-        (fetch_q[23:21] == 3'b100 && !fetch_q[20] &&
-         fetch_q[19:18] == 2'd3  && fetch_q[3:0] == 4'hB);    // 0x80-8F reg = DM(imm)
+        (fetch_op[23:16] == 8'h0D &&
+         fetch_op[11:10] == 2'd3  && fetch_op[7:4] == 4'hB) ||  // 0x0D reg-to-reg move
+        (fetch_op[23:20] == 4'h3  &&
+         fetch_op[19:18] == 2'd3  && fetch_op[3:0] == 4'hB) ||  // 0x30-3F load reg imm
+        (fetch_op[23:21] == 3'b100 && !fetch_op[20] &&
+         fetch_op[19:18] == 2'd3  && fetch_op[3:0] == 4'hB);    // 0x80-8F reg = DM(imm)
     // divider operands, decoded from the live S1_AUTOBUF shadow exactly as the
     // arm does (ireg = cfg[11:9]; mreg = {cfg[11], cfg[8:7]}; lreg = ireg) --
     // stable across the stall clocks (nothing executes, nothing writes ctl/DAG)
@@ -527,7 +568,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     integer    dr_idx;         // cycle j: capture sample j-1, issue read j
     integer    dr_acc;         // address accumulator using ab_reg semantics
     integer    dr_cnt;         // sample count latched at stream start
-    reg [1:0]  dr_region;      // region of the in-flight read
+    reg [2:0]  dr_region;      // region of the in-flight read
     reg [15:0] dr_smp;         // captured sample
     wire        drain_pend  = ab_active && dac_slot_go;
     // S_DRAIN reuses the arm-time quotient ab_drain_cnt.
@@ -539,10 +580,10 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     // the S_MEM issue clock -- latched at DECODE, stable through MEM). Garbage
     // addresses on non-issue clocks are harmless (the registered q is only
     // consumed on the clock after a real issue).
-    assign pmb_addr = (state == S_DRAIN) ? dr_cur[13:0]
-                    : pm_rd_r            ? pm_addr_r
-                    :                      ea_addr_r[13:0]; // alias read / alias-write RMW
-    assign dm_addr  = (state == S_DRAIN) ? dr_cur[13:0] : ea_addr_r[13:0];
+    assign pmb_addr = (state == S_DRAIN) ? sram_row(dr_cur[10:0])
+                    : pm_rd_r            ? pm_row(pm_addr_r)
+                    :                      sram_row(ea_addr_r[10:0]); // SRAM read via DM
+    assign dm_addr  = (state == S_DRAIN) ? dm_row(dr_cur[13:0]) : dm_row(ea_addr_r[13:0]);
     // ---- DDR3-shaped ROM port request muxes ---------------------------------
     // S_BOOT owns the port while a boot page streams (header byte, then the 3
     // bytes of each PM word); otherwise a pending bank-window read holds it
@@ -693,11 +734,11 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                     endcase
               // grp1/grp2: I = val&0x3fff (+ re-base),
               // M = sext(val,14), L = val&0x3fff (+ new mask, re-base)
-              2'd1: case (idx) // I0-3,M0-3,L0-3,-,-,PMOVLAY,DMOVLAY
+              2'd1: case (idx) // I0-3,M0-3,L0-3
                       4'd0,4'd1,4'd2,4'd3: wr_ireg(idx[2:0], {2'b0, val[13:0]});
                       4'd4,4'd5,4'd6,4'd7: mR[idx-4]      <= {{2{val[13]}}, val[13:0]};
                       4'd8,4'd9,4'd10,4'd11: wr_lreg(idx[2:0], {2'b0, val[13:0]}); // L0..L3
-                      default: ; // PMOVLAY/DMOVLAY: overlay regs (later increment)
+                      default: ;
                     endcase
               2'd2: case (idx) // I4-7,M4-7,L4-7
                       4'd0,4'd1,4'd2,4'd3: wr_ireg(idx[2:0]+3'd4, {2'b0, val[13:0]});
@@ -706,20 +747,18 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                       default: ;
                     endcase
               2'd3: case (idx) // ASTAT MSTAT SSTAT IMASK ICNTL CNTR SB PX ...
-                      4'd0: astat <= val;
-                      4'd1: set_mstat(val);   // may swap register bank
-                      4'd2: sstat <= val;
-                      4'd3: imask <= val;
-                      4'd4: icntl <= val;
+                      4'd0: astat <= val[7:0];
+                      4'd1: set_mstat(val[6:0]);   // may swap register bank
+                                                   // (SSTAT, idx 2, is read-only)
+                      4'd3: imask <= val[5:0];
+                      4'd4: icntl <= val[4:0];
                       4'd5: begin // CNTR write: push cntr stack, then load (wr_cntr)
                               cntr_stack[cntr_sp] <= cntr; cntr_sp <= cntr_sp + 1;
                               cntr <= val[13:0];
                             end
-                      4'd6: `SBR <= val;
+                      4'd6: `SBR <= val[4:0];
                       4'd7: px <= val;
                       4'hD: cntr <= val[13:0];  // OWRCNTR: overwrite CNTR, NO stack push
-                                                // (the decoder's run-length path uses it:
-                                                // 099C-099E AY0=CNTR / AR=AY0-1 / OWRCNTR=AR)
                       4'hF: begin               // TOPPCSTACK write
                               pc_stack[pc_sp] <= val[13:0]; pc_sp <= pc_sp + 1;
                             end
@@ -748,7 +787,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
 `ifndef SYNTHESIS
                                   if (!div_done ||
                                       div_q != (lR[ab_lr] / (2 * ((mR[ab_mr]==16'h0)?1:mR[ab_mr])))) begin
-                                      $display("FATAL: N20 arm divider mismatch pc=%04x done=%b q=%04x expect=%0d",
+                                      $display("FATAL: autobuffer arm divider mismatch pc=%04x done=%b q=%04x expect=%0d",
                                                pc, div_done, div_q,
                                                lR[ab_lr] / (2 * ((mR[ab_mr]==16'h0)?1:mR[ab_mr])));
                                       $finish;
@@ -785,10 +824,18 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                       default: rd_reg = 16'h0;
                     endcase
               2'd3: case (idx)
-                      4'd0: rd_reg = astat; 4'd1: rd_reg = mstat;
-                      4'd2: rd_reg = sstat; 4'd3: rd_reg = imask;
-                      4'd4: rd_reg = icntl; 4'd5: rd_reg = {2'b0,cntr};
-                      4'd6: rd_reg = `SBR;    4'd7: rd_reg = px;
+                      4'd0: rd_reg = {8'h00, astat};
+                      4'd1: rd_reg = {9'h000, mstat};
+                      // SSTAT: bit 6 loop, bit 4 status, bit 2 count and bit 0
+                      // PC stack empty. The overflow bits (7/5/3/1) read 0:
+                      // pushing past a stack's depth is not modelled.
+                      4'd2: rd_reg = {9'h000, loop_sp == 0, 1'b0, stat_sp == 3'd0,
+                                      1'b0, cntr_sp == 0, 1'b0, pc_sp == 0};
+                      4'd3: rd_reg = {10'h000, imask};
+                      4'd4: rd_reg = {11'h000, icntl};
+                      4'd5: rd_reg = {2'b0, cntr};
+                      4'd6: rd_reg = {{11{`SBR[4]}}, `SBR};
+                      4'd7: rd_reg = px;
                       default: rd_reg = 16'h0;
                     endcase
             endcase
@@ -827,7 +874,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
         reg [16:0] r; reg [15:0] astn; reg cin; reg [31:0] s32,d32,r32;
         begin
             cin  = astat[3];                  // C flag as 0/1
-            astn = astat & ~(mstat[2] ? 16'h000B : 16'h000F);
+            astn = {8'h00, astat} & ~(mstat[2] ? 16'h000B : 16'h000F);
             case (sub)
               4'h0: r = {1'b0, yv};                                 // PASS Y
               4'h1: r = {1'b0, yv} + 17'd1;                         // Y+1
@@ -856,7 +903,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
               4'h5: begin if(yv==16'h8000) astn=astn|16'h0004; if(yv==16'h0000) astn=astn|16'h0008; end
               4'h8: if(yv==16'h8000) astn=astn|16'h0004; else if(yv==16'h0000) astn=astn|16'h0008;
               // ABS clears AS as well, and takes the same AV_LATCH exemption.
-              4'hf: begin astn = astat & ~(mstat[2] ? 16'h001B : 16'h001F);
+              4'hf: begin astn = {8'h00, astat} & ~(mstat[2] ? 16'h001B : 16'h001F);
                           if(xv==16'h0) astn=astn|16'h0001;
                           if(xv==16'h8000) astn=astn|16'h0006; if(xv[15]) astn=astn|16'h0010; end
               default: ; // logical ops: N,Z only
@@ -940,14 +987,14 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             end
             if (shift_ss_we)  astat[7] <= shift_ss_v; // SS flag (EXP modes)
             if (shift_se_we)  `G0(9)   <= shift_se_v; // SE   (EXP modes)
-            if (shift_sbr_we) `SBR     <= shift_sbr_v; // SB  (EXPADJ)
+            if (shift_sbr_we) `SBR     <= shift_sbr_v[4:0]; // SB (EXPADJ)
         end
     endtask
 
     // ALU writeback consumes the shared alu_res value.
     task automatic alu_wb(input dst_af);
         begin
-            astat <= alu_res[31:16];
+            astat <= alu_res[23:16];
             if (dst_af) begin
                 `AF <= alu_res[15:0];
             end else if (mstat[3] && alu_res[18]) begin
@@ -967,8 +1014,8 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                 if (dst_mf) begin
                     `MF <= mac_r[31:16];        // MF destination; no MV
                 end else begin                  // overflow: res[39:31] not uniform
-                    if (mac_r[39:31] != 9'h000 && mac_r[39:31] != 9'h1ff) astat <= astat | 16'h0040; // set MV
-                    else                                                   astat <= astat & ~16'h0040; // clear MV
+                    if (mac_r[39:31] != 9'h000 && mac_r[39:31] != 9'h1ff) astat <= astat | 8'h40;  // set MV
+                    else                                                   astat <= astat & ~8'h40; // clear MV
                     `G0(11) <= mac_r[15:0]; `G0(12) <= mac_r[31:16];
                     `G0(13) <= mac_r[47:32];
                 end
@@ -993,7 +1040,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
 
     // ---- DM read with input-latch auto-ack side effect ----------------------
     // Instruction-path DM loads go through here so a read of the input latch
-    // (DM $3400-$3403) performs the auto-ack: clear the IRQ2 line. (The CPU
+    // (DM $3400-$37FF) performs the auto-ack: clear the IRQ2 line. (The CPU
     // edge latch is NOT cleared by the ack; only taking the interrupt vector
     // clears it.)
     task automatic dm_load(input [15:0] addr, output [15:0] val);
@@ -1005,57 +1052,45 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             // stale). Compared against the S_DECODE latch (what was issued).
             // Abort on any stale or mismatched captured address.
             if (dm_region(addr) != RG_LATCH && addr != ea_addr_r) begin
-                $display("FATAL: Phase-6 pre-read addr mismatch (load) pc=%04x op=%06x pre=%04x used=%04x",
+                $display("FATAL: pre-read address mismatch (load) pc=%04x op=%06x pre=%04x used=%04x",
                          pc, op, ea_addr_r, addr);
                 $finish;
             end
 `endif
-            if (addr >= 16'h3400 && addr <= 16'h3403) begin
+            if (dm_region(addr) == RG_LATCH) begin
                 irq2_line <= 1'b0;
                 // Input latch auto-ack: set INPUT_EMPTY -- the host now sees the
                 // input latch drained. Host-visible only; never read by the ADSP.
-                latch_control <= latch_control | 16'h0800;
-                dbg_cmd_read  <= 1'b1;
+                input_empty  <= 1'b1;
+                dbg_cmd_read <= 1'b1;
             end
         end
     endtask
 
-    // ---- DM write with the full 8k data-map semantics ------------------------
-    // 0x0800-0x1FFF: shared external program RAM -- stores the 16-bit value
-    //   into the PM word's high 16 bits, low byte kept.
-    // 0x3000: ROM bank select.
-    // 0x3FFF write with bit9: SYSCONTROL soft reboot.
+    // ---- DM write ------------------------------------------------------------
+    // Follows the data map: an SRAM write replaces bits 23:8 of the SRAM word
+    // and keeps bits 7:0; 0x3000-0x33FF selects the sound-ROM bank; the
+    // internal RAM and control registers store the word. A SYSCONTROL (0x3FFF)
+    // write with bit 9 set is the soft reboot. Writes to the ROM window, to the
+    // reply latch and to addresses with nothing behind them change nothing.
     task automatic dm_write(input [15:0] addr, input [15:0] val);
         begin
-            if (addr >= 16'h0800 && addr <= 16'h1fff) begin
-                // PM-alias read-modify-write: the merge {val, old[7:0]} needs
-                // the existing low byte; the S_MEM
-                // stage pre-read PM[addr] one clock ago (pmb_q holds it), the
-                // merged word commits here. This reuses the existing pre-read
-                // path without separate low-byte storage. The CPU
-                // is stalled between the pre-read and this commit, and no
-                // other agent writes PM.
-                // The consolidated PM write decoder commits this alias RMW.
+            case (dm_region(addr))
+              RG_SRAM: begin
+                // The consolidated PM write decoder commits this write through
+                // the PM port's byte enables.
 `ifndef SYNTHESIS
                 if (addr != ea_addr_r) begin
-                    $display("FATAL: Phase-6 pre-read addr mismatch (RMW) pc=%04x op=%06x pre=%04x used=%04x",
+                    $display("FATAL: SRAM write address mismatch pc=%04x op=%06x pre=%04x used=%04x",
                              pc, op, ea_addr_r, addr);
                     $finish;
                 end
 `endif
-            end else if (addr == 16'h3000)
+              end
+              RG_BSEL:
                 data_bank <= val[10:0];
-            else if (addr >= 16'h3400 && addr <= 16'h3403) begin
-                // ---- output latch (DCS->host): the ADSP writing DM 0x3400-0x3403
-                //      latches the response word and sets OUTPUT_FULL. This
-                //      address maps to the latch, NOT to RAM, so we do NOT touch
-                //      the DM array here (a DM read of 0x3400 returns input_data
-                //      via RG_LATCH, never this word). This is host-visible only.
-                output_data   <= val;
-                latch_control <= latch_control & ~16'h0400;  // SET_OUTPUT_FULL
-            end
-            else begin
-                `DM[addr[13:0]] <= val;
+              RG_DM: begin
+                `DM[{addr[13:9] != 5'b11100, addr[8:0]}] <= val;   // dm_row(addr)
                 if (addr == 16'h3FEF) ctl_s1_autobuf <= val;  // live control-reg shadow
                 // ---- timer control writes (the DM array above keeps the raw
                 //      control-register mirror). A write
@@ -1078,14 +1113,16 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                         reboot_pending <= 1'b1; reboot_bank <= data_bank;
                     end
                 end
-            end
+              end
+              default: ;   // ROM window, reply latch, nothing mapped
+            endcase
         end
     endtask
 
     // ---- MSTAT write: bank select is an index -------------------------------
     // MSTAT bit0 = secondary-register-bank select; this implementation
     // retargets the index rather than swapping storage.
-    task automatic set_mstat(input [15:0] nm);
+    task automatic set_mstat(input [6:0] nm);
         begin
             mstat <= nm;
         end
@@ -1102,9 +1139,8 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     function [15:0] dm_read(input [15:0] addr);
         begin
             case (dm_region(addr))
-              RG_ALIAS:
-                // DM 0x0800-0x1FFF is SHARED with external program RAM: a read
-                // returns the PM word's high 16 bits (>>8)
+              RG_SRAM:
+                // the board SRAM through the PM port: bits 23:8 of the word
                 dm_read = pmb_q[23:8];
               RG_BANK:
                 // banked ROM window: rom_q = byte at (data_bank<<12)+addr[11:0]
@@ -1117,18 +1153,20 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                 // auto-ack side effect (clear the IRQ2 line) is applied by the
                 // dm_load task wrapper.
                 dm_read = input_data;
-              default:
-                // A TIMER_COUNT read returns the live count (updated from
-                // elapsed cycles before returning); every other control reg
-                // reads back its raw mirror = the DM array.
+              RG_DM:
+                // A TIMER_COUNT read returns the live count; the internal RAM
+                // and every other control register read back from the DM array.
                 dm_read = (addr == 16'h3FFC) ? tim_count : dm_q;
+              default:
+                // bank select (write only) and addresses with nothing behind them
+                dm_read = 16'h0000;
             endcase
         end
     endfunction
 
     // ---- shifter: FULL 16-mode shift operation ------------------------------
     // SR = {`G0(15)=SR1, `G0(14)=SR0}; SE = `G0(9) (int8, read as signed [7:0]);
-    // SB = `SBR (int16); SS flag = astat bit7 (SSFLAG=0x80);
+    // SB = `SBR (5-bit, signed); SS flag = astat bit7 (SSFLAG=0x80);
     // carry CFLAG = astat bit3. X-register select table (idx 1 = SI).
     function [15:0] shift_xreg(input [2:0] xi);
         case (xi)
@@ -1230,7 +1268,9 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
               4'hF: begin       // EXPADJ
                   xs = $signed({{16{xr[15]}}, xr});
                   e  = clz32((xs < 0) ? ~xs : xs) - 16 - 1;
-                  if (e < -$signed(`SBR)) begin sev = 16'(-e); o_sbr = sev; o_sbr_we = 1'b1; end
+                  if (e < -$signed({{11{`SBR[4]}}, `SBR})) begin
+                      sev = 16'(-e); o_sbr = sev; o_sbr_we = 1'b1;
+                  end
               end
             endcase
             if (mode < 4'hC) begin                    // SR-result modes
@@ -1246,15 +1286,15 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     integer k;
 `ifndef SYNTHESIS
     initial begin
-        for (k=0;k<16384;k=k+1) begin pm[k]=24'h0; dm[k]=16'h0; end
+        for (k=0;k<3072;k=k+1) pm[k]=24'h0;
+        for (k=0;k<1024;k=k+1) dm[k]=16'h0;
     end
 `endif
     initial begin
         // External stimulus arrives through host_rst and host_wr pins.
         data_bank = 11'h0;
         input_data = 16'h0;
-        latch_control = 16'h0C00;   // INPUT_EMPTY|OUTPUT_EMPTY; host idle read
-        output_data = 16'h0;
+        input_empty = 1'b1;         // host idle read 0x0C00
         host_rst_r = 1'b0;
         // Timer power-up: scale=1, control-reg mirrors zeroed, no pending
         // latch (a reset clears irq state).
@@ -1267,7 +1307,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
         // FSM state, drain-stream progress, and control shadows.
         state = S_FETCH; dr_done = 1'b0; dr_idx = 0; dr_acc = 0; dr_cnt = 0;
         div_done = 1'b0; div_i = 5'd0; div_q = 16'h0; ab_drain_cnt = 16'h0;
-        dr_region = RG_DM; dr_smp = 16'h0;
+        dr_region = RG_NONE; dr_smp = 16'h0;
         ctl_s1_autobuf = 16'h0; ctl_syscontrol = 16'h0;  // == cleared DM array
     end
 
@@ -1280,58 +1320,57 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     reg        do_loop_back, do_loop_exit;
     reg [15:0] mstat_tmp, dmv, mvtmp;
     reg        cflag;
-    // Shared datapath results: each unit is evaluated once per instruction and
-    // committed at the call sites below.
-    integer    li;
 
     // One owner for PM Port A writes. All operands here are the same values the
     // instruction body consumes in S_EXEC; the RAM samples this command on that
-    // edge. Boot DMA is mutually exclusive with instruction execution.
+    // edge. Boot DMA is mutually exclusive with instruction execution. A write
+    // to a PM address with nothing behind it is dropped. A DM write to the SRAM
+    // (DM 0x0000-0x1FFF) enables only bytes 2:1, so bits 7:0 keep their value.
+    wire [13:0] boot_pm_addr = {2'b00, boot_idx};
+    wire [13:0] dag2_pm_addr = iR[{1'b1, op_r[3:2]}][13:0];
+    wire        ea_sram      = (ea_addr_r[15:13] == 3'b000);
     always @* begin
         pm_we = 1'b0;
         pm_be = 3'b000;
-        pm_wa = 14'h0000;
+        pm_wa = 12'h000;
         pm_wd = 24'h000000;
 
         if (boot_active && rom_rdy && boot_phase == 2'd3) begin
-            pm_we = 1'b1;
+            pm_we = pm_mapped(boot_pm_addr);
             pm_be = 3'b111;
-            pm_wa = {2'b0, boot_idx};
+            pm_wa = pm_row(boot_pm_addr);
             pm_wd = {boot_b0, boot_b1, rom_q};
         end else if (state == S_EXEC) begin
             if (op_r[23:16] == 8'h11 && op_r[15]) begin
-                pm_we = 1'b1;
+                pm_we = pm_mapped(dag2_pm_addr);
                 pm_be = 3'b111;
-                pm_wa = iR[{1'b1, op_r[3:2]}][13:0];
+                pm_wa = pm_row(dag2_pm_addr);
                 pm_wd = {rd_reg(2'd0, op_r[7:4]), px[7:0]};
             end else if (op_r[23:20] == 4'h5 && op_r[19]) begin
-                pm_we = 1'b1;
+                pm_we = pm_mapped(dag2_pm_addr);
                 pm_be = 3'b111;
-                pm_wa = iR[{1'b1, op_r[3:2]}][13:0];
+                pm_wa = pm_row(dag2_pm_addr);
                 pm_wd = {rd_reg(2'd0, op_r[7:4]), px[7:0]};
             end else if ((op_r[23:16] == 8'h12 || op_r[23:16] == 8'h13) &&
-                         op_r[15] && ea_addr_r >= 16'h0800 && ea_addr_r <= 16'h1fff) begin
+                         op_r[15] && ea_sram) begin
                 pm_we = 1'b1;
                 pm_be = 3'b110;
-                pm_wa = ea_addr_r[13:0];
+                pm_wa = sram_row(ea_addr_r[10:0]);
                 pm_wd = {rd_reg(2'd0, op_r[7:4]), 8'h00};
-            end else if (op_r[23:21] == 3'b011 && op_r[19] &&
-                         ea_addr_r >= 16'h0800 && ea_addr_r <= 16'h1fff) begin
+            end else if (op_r[23:21] == 3'b011 && op_r[19] && ea_sram) begin
                 pm_we = 1'b1;
                 pm_be = 3'b110;
-                pm_wa = ea_addr_r[13:0];
+                pm_wa = sram_row(ea_addr_r[10:0]);
                 pm_wd = {rd_reg(2'd0, op_r[7:4]), 8'h00};
-            end else if (op_r[23:21] == 3'b100 && op_r[20] &&
-                         ea_addr_r >= 16'h0800 && ea_addr_r <= 16'h1fff) begin
+            end else if (op_r[23:21] == 3'b100 && op_r[20] && ea_sram) begin
                 pm_we = 1'b1;
                 pm_be = 3'b110;
-                pm_wa = ea_addr_r[13:0];
+                pm_wa = sram_row(ea_addr_r[10:0]);
                 pm_wd = {rd_reg(op_r[19:18], op_r[3:0]), 8'h00};
-            end else if (op_r[23:21] == 3'b101 &&
-                         ea_addr_r >= 16'h0800 && ea_addr_r <= 16'h1fff) begin
+            end else if (op_r[23:21] == 3'b101 && ea_sram) begin
                 pm_we = 1'b1;
                 pm_be = 3'b110;
-                pm_wa = ea_addr_r[13:0];
+                pm_wa = sram_row(ea_addr_r[10:0]);
                 pm_wd = {op_r[19:4], 8'h00};
             end
         end
@@ -1350,19 +1389,19 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
     //  S_BOOT   | idle re-read   | <=1 WRITE (word commit)   | -       | -        | req (stream)
     //  S_FETCH  | READ pm[pc]    | -                         | -       | -        | idle
     //  S_DECODE | re-read (same) | -                         | -       | -        | req starts (bank rd)
-    //  S_DRAIN  | re-read        | READ dr_cur (alias rgn)   | READ dr_cur | -    | req held
+    //  S_DRAIN  | re-read        | READ dr_cur (SRAM rgn)    | READ dr_cur | -    | req held
     //  S_DIV    | re-read        | -                         | -       | -        | req held
     //  S_ROM    | re-read        | -                         | -       | -        | req held (stall)
-    //  S_MEM    | re-read        | READ ea (alias/PM/RMW)    | READ ea | -        | req held
+    //  S_MEM    | re-read        | READ ea (SRAM / PM data)  | READ ea | -        | req held
     //  S_EXEC   | re-read        | <=1 WRITE (PM-data write  | -       | <=1 WRITE| req held
-    //           |                |  OR alias-RMW merge)      |         | (dm_write)| (consume)
+    //           |                |  OR SRAM write via DM)    |         | (dm_write)| (consume)
     //  * PM-B: the registered fetch port re-reads pm[pc] every clock (pc moves
     //    only at EXEC) -- exactly one read per clock on a read-only port.
     //  * PM-A: reads are consumed only from S_MEM/S_DRAIN issues; writes land
     //    only in S_EXEC (one per instruction: the PM-data write variants and
-    //    the alias RMW are mutually exclusive opcode classes) or S_BOOT (one
-    //    word commit per completed byte-triplet). Reads and writes never share
-    //    a clock on this port.
+    //    the SRAM writes through DM are mutually exclusive opcode classes) or
+    //    S_BOOT (one word commit per completed byte-triplet). Reads and writes
+    //    never share a clock on this port.
     //  * DM: reads issued in S_MEM/S_DRAIN only; writes in S_EXEC only (one
     //    dm_write per instruction). The sim's always-reading registered port
     //    is 1 read/clock; the unconsumed reloads are don't-cares.
@@ -1379,14 +1418,14 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             dac_sample <= 16'h0;
             dbg_cmd_lost <= 8'h0; dbg_cmd_read <= 1'b0;
             loop_sp <= 0; pc_sp <= 0; cntr_sp <= 0; cntr <= 14'h0;
-            astat<=0; mstat<=0; sstat<=0; imask<=0; icntl<=0; px<=0;
+            astat<=0; mstat<=0; imask<=0; icntl<=0; px<=0;
             afb[0]<=0; afb[1]<=0; mfb[0]<=0; mfb[1]<=0; sbb[0]<=0; sbb[1]<=0;
             for (k=0;k<8;k=k+1) begin iR[k]<=0; mR[k]<=0; lR[k]<=0; baseR[k]<=0; lmask[k]<=14'h3fff; end
             for (k=0;k<32;k=k+1) gr[k]<=0;   // both banks
             for (k=0;k<4;k=k+1)  loop_end[k]<=NO_LOOP;
-            stat_sp <= 0;
+            stat_sp <= 3'd0;
             data_bank <= 11'h0; reboot_pending <= 1'b0; launch_boot(11'h0); // power-on boot, bank 0
-            latch_control <= 16'h0C00; output_data <= 16'h0; // reset: both latches EMPTY
+            input_empty <= 1'b1;             // reset: the input latch reads EMPTY
             ab_active <= 1'b0; dac_slot_ctr <= 16'h0; dac_slot_go <= 1'b0; // SPORT1 autobuffer idle
             irq2_line <= 1'b0; irq2_latch <= 1'b0; irq1_pulse <= 1'b0;     // reset clears IRQ2
                                                     // and the CPU irq state
@@ -1430,7 +1469,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
 
           S_FETCH: begin
             // ---- S_FETCH: PC (=fetch_addr) is presented to the clocked PM
-            //      fetch port this edge; op (fetch_q) valid next clk. No
+            //      fetch port this edge; op (fetch_op) valid next clk. No
             //      retire, no architectural change.
             o_valid <= 1'b0;
             state   <= S_DECODE;
@@ -1447,8 +1486,8 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             dr_done <= 1'b0; dr_idx <= 0; div_done <= 1'b0; div_i <= 5'd0;   // discard in-flight progress
             // ---- SYSCONTROL soft-reboot: reset CPU, reload PM from CURRENT bank ----
             pc <= 14'h0000; o_valid <= 1'b0; o_unimpl <= 1'b0;
-            loop_sp <= 0; pc_sp <= 0; cntr_sp <= 0; cntr <= 14'h0; stat_sp <= 0;
-            astat<=0; mstat<=0; sstat<=0; imask<=0; icntl<=0; px<=0;
+            loop_sp <= 0; pc_sp <= 0; cntr_sp <= 0; cntr <= 14'h0; stat_sp <= 3'd0;
+            astat<=0; mstat<=0; imask<=0; icntl<=0; px<=0;
             afb[0]<=0; afb[1]<=0; mfb[0]<=0; mfb[1]<=0; sbb[0]<=0; sbb[1]<=0;
             for (k=0;k<8;k=k+1) begin iR[k]<=0; mR[k]<=0; lR[k]<=0; baseR[k]<=0; lmask[k]<=14'h3fff; end
             for (k=0;k<32;k=k+1) gr[k]<=0;   // both banks
@@ -1465,15 +1504,14 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             dr_done <= 1'b0; dr_idx <= 0; div_done <= 1'b0; div_i <= 5'd0;   // discard in-flight progress
             ab_active <= 1'b0; dac_slot_ctr <= 16'h0; dac_slot_go <= 1'b0;
             pc <= 14'h0000; o_valid <= 1'b0; o_unimpl <= 1'b0;
-            loop_sp <= 0; pc_sp <= 0; cntr_sp <= 0; cntr <= 14'h0; stat_sp <= 0;
-            astat<=0; mstat<=0; sstat<=0; imask<=0; icntl<=0; px<=0;
+            loop_sp <= 0; pc_sp <= 0; cntr_sp <= 0; cntr <= 14'h0; stat_sp <= 3'd0;
+            astat<=0; mstat<=0; imask<=0; icntl<=0; px<=0;
             afb[0]<=0; afb[1]<=0; mfb[0]<=0; mfb[1]<=0; sbb[0]<=0; sbb[1]<=0;
             for (k=0;k<8;k=k+1) begin iR[k]<=0; mR[k]<=0; lR[k]<=0; baseR[k]<=0; lmask[k]<=14'h3fff; end
             for (k=0;k<32;k=k+1) gr[k]<=0;   // both banks
             for (k=0;k<4;k=k+1)  loop_end[k]<=NO_LOOP;
             data_bank <= 11'h0; launch_boot(11'h0);
-            latch_control <= 16'h0C00; // board reset SETs both latches EMPTY;
-                // output_data persists (the reset does not clear it)
+            input_empty <= 1'b1;           // board reset: the input latch reads EMPTY
             irq2_line <= 1'b0; irq2_latch <= 1'b0; irq1_pulse <= 1'b0; // the reset clears IRQ2
                 // + CPU reset clears irq state; input_data persists
             // At board reset the timer scale returns to 1; pending
@@ -1499,22 +1537,24 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             // bit2, TIMER indx=5 = bit0; push PC + status; vector = 0x04 +
             // indx*4; IMASK &= nesting? ~(0x3f>>indx) : ~0x3f (ICNTL bit4).
             pc_stack[pc_sp]     <= pc;      pc_sp   <= pc_sp + 1;
-            stat_mstat[stat_sp] <= mstat;
-            stat_imask[stat_sp] <= imask;
-            stat_astat[stat_sp] <= astat;   stat_sp <= stat_sp + 1;
+            if (stat_sp != STAT_DEPTH) begin
+                stat_mstat[stat_sp] <= mstat;
+                stat_imask[stat_sp] <= imask;
+                stat_astat[stat_sp] <= astat;
+                stat_sp <= stat_sp + 3'd1;
+            end
             if ((icntl[2] ? irq2_latch : irq2_line) && imask[5]) begin
-                imask <= icntl[4] ? (imask & ~(16'h003F >> 0)) : (imask & ~16'h003F);
+                imask <= icntl[4] ? (imask & ~(6'h3F >> 0)) : (imask & ~6'h3F);
                 pc <= 14'h0004;                 // 0x04 + 0*4
                 irq2_latch <= 1'b0;             // taking the vector clears the latch
             end else if (irq1_pulse && imask[2]) begin
-                imask <= icntl[4] ? (imask & ~(16'h003F >> 3)) : (imask & ~16'h003F);
+                imask <= icntl[4] ? (imask & ~(6'h3F >> 3)) : (imask & ~6'h3F);
                 pc <= 14'h0010;                 // 0x04 + 3*4
                 irq1_pulse <= 1'b0;
             end else begin
                 // TIMER: vector 0x18 = 0x04 + 5*4; nesting mask
-                // ~(0x3f>>5) = ~0x01; latch cleared only here. It remains
-                // masked for UMK3.
-                imask <= icntl[4] ? (imask & ~(16'h003F >> 5)) : (imask & ~16'h003F);
+                // ~(0x3f>>5) = ~0x01; latch cleared only here.
+                imask <= icntl[4] ? (imask & ~(6'h3F >> 5)) : (imask & ~6'h3F);
                 pc <= 14'h0018;                 // 0x04 + 5*4
                 tim_irq_latch <= 1'b0;
             end
@@ -1523,12 +1563,12 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
               case (state)
 
                 S_DECODE: begin
-                    // ---- S_DECODE: fetch_q valid. Latch the opcode + the
+                    // ---- S_DECODE: fetch_op valid. Latch the opcode + the
                     //      pre-decoded memory access (combinational over
-                    //      fetch_q + DAG state, both stable until EXEC) and
+                    //      fetch_op + DAG state, both stable until EXEC) and
                     //      dispatch in priority order: drain > divider > ROM >
                     //      MEM > EXEC.
-                    op_r       <= fetch_q;
+                    op_r       <= fetch_op;
                     ea_addr_r  <= pre_addr;
                     pm_addr_r  <= pre_pm_addr;
                     pm_rd_r    <= pre_pm_rd;
@@ -1562,7 +1602,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                 dr_cnt = ab_drain_cnt;
 `ifndef SYNTHESIS
                 if (dr_cnt != (ab_size / (2 * ((ab_incs==16'h0) ? 16'd1 : ab_incs)))) begin
-                    $display("FATAL: N20 drain-count mismatch cnt=%0d expect=%0d",
+                    $display("FATAL: drain-count mismatch cnt=%0d expect=%0d",
                              dr_cnt, ab_size / (2 * ((ab_incs==16'h0) ? 16'd1 : ab_incs)));
                     $finish;
                 end
@@ -1571,11 +1611,12 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
             if (dr_idx > 0 && dr_idx <= dr_cnt) begin
                 // capture sample (dr_idx-1), issued last clock
                 case (dr_region)
-                  RG_ALIAS: dr_smp = pmb_q[23:8];              // output buffer lives here
+                  RG_SRAM : dr_smp = pmb_q[23:8];              // SRAM bits 23:8
+                  RG_DM   : dr_smp = dm_q;                     // internal RAM
                   RG_BANK : dr_smp = 16'hFFFF;                 // unreachable (the buffer is RAM,
                                     // not the ROM window); reads as 0xFF
                   RG_LATCH: dr_smp = input_data;               // unreachable likewise
-                  default : dr_smp = dm_q;
+                  default : dr_smp = 16'h0000;                 // nothing at this address
                 endcase
                 dac_sample <= dr_smp;
                 // Every captured sample is strobed, not merely the final
@@ -1717,8 +1758,8 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                 end else
                     tim_scale_cnt <= tim_scale_cnt - 9'd1;
             end
-            // IRQ1 pulse decay: the wrap pulse is transient;
-            // in level mode (ICNTL bit1=0) a masked pulse is lost, not held. One
+            // IRQ1 pulse decay: the wrap pulse is transient and level-
+            // sensitive, so a masked pulse is lost, not held. One
             // boundary check then gone (a same-cycle wrap re-set below wins).
             if (irq1_pulse) irq1_pulse <= 1'b0;
             // ---- SPORT1 autobuffer drain: advance I<ireg> so the
@@ -1759,13 +1800,13 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                     dac_slot_go <= 1'b0;
                 end
             end
-            op = op_r;      // opcode latched at S_DECODE (== fetch_q)
+            op = op_r;      // opcode latched at S_DECODE (== fetch_op)
 `ifndef SYNTHESIS
-            // fetch_q re-reads pm[pc] every clock and pc/PM only move at EXEC,
-            // so the S_DECODE latch must still equal the live fetch port here.
-            if (op_r !== fetch_q) begin
-                $display("FATAL: Phase-6 op-latch mismatch pc=%04x op_r=%06x fetch_q=%06x",
-                         pc, op_r, fetch_q);
+            // The fetch port re-reads pm[pc] every clock and pc/PM only move at
+            // EXEC, so the S_DECODE latch must still equal the live fetch here.
+            if (op_r !== fetch_op) begin
+                $display("FATAL: op-latch mismatch pc=%04x op_r=%06x fetch_op=%06x",
+                         pc, op_r, fetch_op);
                 $finish;
             end
 `endif
@@ -1815,7 +1856,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
               8'h06: begin // DIVS
                   dmv   = alu_yread(op[12:11]);                       // yop
                   mvtmp = alu_xread(op[10:8]) ^ dmv;                  // temp = xop^yop
-                  astat <= (astat & ~16'h0020) | (mvtmp[15] ? 16'h0020 : 16'h0000); // Q flag
+                  astat <= (astat & ~8'h20) | (mvtmp[15] ? 8'h20 : 8'h00); // Q flag
                   `AF    <= {dmv[14:0], `G0(4)[15]};                    // AF = (y<<1)|(AY0>>15)
                   `G0(4) <= {`G0(4)[14:0], mvtmp[15]};                  // AY0 = (AY0<<1)|(temp>>15)
               end
@@ -1824,7 +1865,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                   if (astat[5]) dmv = `AF + alu_xread(op[10:8]);       // Q ? AF+x
                   else          dmv = `AF - alu_xread(op[10:8]);       //       : AF-x
                   mvtmp = dmv ^ alu_xread(op[10:8]);                  // temp = res^xop
-                  astat <= (astat & ~16'h0020) | (mvtmp[15] ? 16'h0020 : 16'h0000);
+                  astat <= (astat & ~8'h20) | (mvtmp[15] ? 8'h20 : 8'h00);
                   `AF    <= {dmv[14:0], `G0(4)[15]};                    // AF = (res<<1)|(AY0>>15)
                   `G0(4) <= {`G0(4)[14:0], ~mvtmp[15]};                 // AY0 = (AY0<<1)|(~temp>>15)
               end
@@ -1849,10 +1890,10 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                   if (cflag) begin
                       pc <= pc_stack[pc_sp-1]; pc_sp <= pc_sp - 1;   // pop return PC
                       if (op[4]) begin                               // RTI: restore status
-                          set_mstat(stat_mstat[stat_sp-1]);          // may swap bank back
-                          imask <= stat_imask[stat_sp-1];
-                          astat <= stat_astat[stat_sp-1];
-                          stat_sp <= stat_sp - 1;
+                          set_mstat(stat_mstat[stat_top]);           // may swap bank back
+                          imask <= stat_imask[stat_top];
+                          astat <= stat_astat[stat_top];
+                          if (stat_sp != 3'd0) stat_sp <= stat_sp - 3'd1;
                       end
                   end
               end
@@ -1864,7 +1905,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                   // TIMER op[15]/op[14] (timer enable, MSTAT bit5),
                   // BANK op[5]/op[4], REVERSE op[7]/op[6], STICKYV op[9]/op[8],
                   // SATURATE op[11]/op[10].
-                  mstat_tmp = mstat;
+                  mstat_tmp = {9'h000, mstat};
                   if (op[3])  mstat_tmp = (mstat_tmp & ~16'h0040) | (op[2]  ? 16'h0040 : 16'h0); // GOMODE
                   if (op[13]) mstat_tmp = (mstat_tmp & ~16'h0010) | (op[12] ? 16'h0010 : 16'h0); // INTEGER
                   if (op[15]) mstat_tmp = (mstat_tmp & ~16'h0020) | (op[14] ? 16'h0020 : 16'h0); // TIMER
@@ -1872,7 +1913,7 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                   if (op[7])  mstat_tmp = (mstat_tmp & ~16'h0002) | (16'(op>>5) & 16'h0002); // REVERSE
                   if (op[9])  mstat_tmp = (mstat_tmp & ~16'h0004) | (16'(op>>6) & 16'h0004); // STICKYV
                   if (op[11]) mstat_tmp = (mstat_tmp & ~16'h0008) | (16'(op>>7) & 16'h0008); // SATURATE
-                  set_mstat(mstat_tmp);
+                  set_mstat(mstat_tmp[6:0]);
               end
 
               8'h0D: // internal data register move: reg_grp[a][b] = reg_grp[c][d]
@@ -1898,12 +1939,12 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                       shift_wb(op[14:11]);
                   end else begin    // shift FIRST, then reg <= PM (mem value wins on clash)
                       shift_wb(op[14:11]);
-                      // PM word pre-read by S_MEM at iR[iidx][13:0] (pmb_q)
-                      wr_reg(2'd0, op[7:4], pmb_q[23:8]);
-                      px <= {8'h0, pmb_q[7:0]};
+                      // PM word pre-read by S_MEM at iR[iidx][13:0] (pm_data_q)
+                      wr_reg(2'd0, op[7:4], pm_data_q[23:8]);
+                      px <= {8'h0, pm_data_q[7:0]};
 `ifndef SYNTHESIS
                       if (iR[iidx] != {2'b0, pm_addr_r}) begin
-                          $display("FATAL: Phase-6 pre-read addr mismatch (0x11 PM) pc=%04x op=%06x pre=%04x used=%04x",
+                          $display("FATAL: pre-read address mismatch (0x11 PM) pc=%04x op=%06x pre=%04x used=%04x",
                                    pc, op, pm_addr_r, iR[iidx]);
                           $finish;
                       end
@@ -1991,12 +2032,12 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
                   if (op[19]) begin
                       // Port-A write is issued by the consolidated decoder above.
                   end else begin
-                      // PM word pre-read by S_MEM at iR[iidx] (pmb_q)
-                      wr_reg(2'd0, op[7:4], pmb_q[23:8]);                       // reg=PM[23:8]
-                      px <= {8'h0, pmb_q[7:0]};                                 // px=PM[7:0]
+                      // PM word pre-read by S_MEM at iR[iidx] (pm_data_q)
+                      wr_reg(2'd0, op[7:4], pm_data_q[23:8]);                   // reg=PM[23:8]
+                      px <= {8'h0, pm_data_q[7:0]};                             // px=PM[7:0]
 `ifndef SYNTHESIS
                       if (iR[iidx] != {2'b0, pm_addr_r}) begin
-                          $display("FATAL: Phase-6 pre-read addr mismatch (0x50 PM) pc=%04x op=%06x pre=%04x used=%04x",
+                          $display("FATAL: pre-read address mismatch (0x50 PM) pc=%04x op=%06x pre=%04x used=%04x",
                                    pc, op, pm_addr_r, iR[iidx]);
                           $finish;
                       end
@@ -2074,23 +2115,14 @@ reg        pm_we; reg [2:0] pm_be; reg [13:0] pm_wa; reg [23:0] pm_wd;
         //      coincident host write re-fills).
         if (host_cmd_w && !rst) begin
             // Count writes that replace an unread command. The hardware mailbox
-            // is one word deep, and latch_control bit 11 denotes INPUT_EMPTY.
-            if (!latch_control[11] && (dbg_cmd_lost != 8'hFF))
+            // is one word deep.
+            if (!input_empty && (dbg_cmd_lost != 8'hFF))
                 dbg_cmd_lost <= dbg_cmd_lost + 8'd1;
             input_data <= host_cmd_data;
             if (!irq2_line) irq2_latch <= 1'b1;
-            irq2_line  <= 1'b1;
-            latch_control <= latch_control & ~16'h0800; // set INPUT_FULL
+            irq2_line   <= 1'b1;
+            input_empty <= 1'b0;   // INPUT_FULL
         end
-        // ---- host response read (auto-ack): the host reading host_response_r
-        //      sets OUTPUT_EMPTY. Level-strobe from the board; harmless when
-        //      idle. Placed after the ADSP output-latch write in the FSM case,
-        //      so a same-cycle ADSP write (sets OUTPUT_FULL) that races a host
-        //      read is resolved OUTPUT_EMPTY here -- but the two never coincide
-        //      in practice (different clock domains on silicon; the mailbox is
-        //      half-duplex per direction).
-        if (host_resp_rd && !rst)
-            latch_control <= latch_control | 16'h0400;  // set OUTPUT_EMPTY
         end
     end
 endmodule
