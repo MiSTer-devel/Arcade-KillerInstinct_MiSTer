@@ -149,8 +149,6 @@ module ki_dcs_audio #(
         .host_cmd_w(cmd_pending && dcs_ce),
         .host_cmd_data(cmd_pending_data),
         .host_status_r(dcs_status),
-        .host_response_r(),
-        .host_resp_rd(1'b0),
         .rom_ddr_req(rom_req),
         .rom_ddr_addr(rom_addr),
         .rom_ddr_rdy(rom_rdy),
