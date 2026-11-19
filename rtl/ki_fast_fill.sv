@@ -5,7 +5,7 @@
 // second port.
 //
 // The data cache asks for a clean line, or its read-ahead's next line, and
-// an uncached 64-bit load for its qword, straight from the CPU's clock when
+// an uncached load for its qword, straight from the CPU's clock when
 // nothing of the CPU's is in the bridge's path (cpu.vhd, fast_go, fast_ra_go
 // and fast_unc_go): a toggle, with the physical address in a register beside
 // it - a line's, or a qword's with bit 0 set to say so. The address is

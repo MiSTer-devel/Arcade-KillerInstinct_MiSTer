@@ -1206,8 +1206,8 @@ architecture arch of cpu is
    -- The read-ahead outstanding is a stream's (datacache_ra_stream).
    signal fast_stream_r                : std_logic := '0';
    signal fast_window_dc               : std_logic;
-   -- An uncached 64-bit load takes it (fast_unc_go), and fast_is_unc_r
-   -- marks the one outstanding as such.
+   -- An uncached load takes it (fast_unc_go), and fast_is_unc_r marks the
+   -- one outstanding as such.
    signal fast_unc_go                  : std_logic;
    signal fast_unc_ok                  : std_logic;
    signal fast_is_unc_r                : std_logic := '0';
@@ -1217,6 +1217,14 @@ architecture arch of cpu is
    -- fast_ret: a direct read is back, either way.
    signal fast_unc_ret                 : std_logic;
    signal fast_ret                     : std_logic;
+   -- Where the word of the load in stage 4 sits in its qword, for the
+   -- direct port's answer: its half (unc4_hi) and its rotation (unc4_rot),
+   -- set as the load enters stage 4. fast_unc_data is the answer.
+   signal unc4_hi                      : std_logic := '0';
+   signal unc4_rot                     : unsigned(1 downto 0) := (others => '0');
+   signal fast_unc_word                : unsigned(31 downto 0);
+   signal fast_unc_low                 : unsigned(31 downto 0);
+   signal fast_unc_data                : std_logic_vector(63 downto 0);
    -- A qword of the direct read-ahead outstanding is on
    -- fast_ra_valid (fast_ra_take), fast_ra_q of its four have come, and this
    -- is the fourth (fast_ra_ret).
@@ -1999,13 +2007,13 @@ begin
             end if;
             -- A direct uncached load's, on fast_unc_valid. It is the only
             -- memory operation of the CPU's outstanding, so nothing above is
-            -- using the rotation (asserted), and it skips it: a qword-aligned
-            -- load's rotation is none (read4_uncachedRot "00" for every load
-            -- type at a qword address), so it completes on this edge. Its
-            -- qword goes only where its completion reads it: an uncached
-            -- opcode taken beside it is in mem_finished_dataRead.
+            -- using the rotation (asserted), and it completes on this edge: a
+            -- narrower load's word is taken out of its qword on the way in
+            -- (fast_unc_data), as read4_uncachedData rotates the word the
+            -- bridge returns. It goes only where its completion reads it: an
+            -- uncached opcode taken beside it is in mem_finished_dataRead.
             if (fast_unc_ret = '1') then
-               mem_finished_dataRot <= fast_unc_qword;
+               mem_finished_dataRot <= fast_unc_data;
                mem_finished_read    <= '1';
             end if;
 
@@ -4740,10 +4748,10 @@ begin
    -- (ra_store), whichever way the line came; one that entered the write
    -- path before the request is ahead of it, which the rule keeps true.
    --
-   -- So does an uncached 64-bit load of SDRAM RAM, qword-aligned, as a qword
-   -- read (fast_unc_go), when no demand miss is asking; it waits for every
-   -- store ahead of it like the rest. Narrower loads, I/O, the boot ROM and
-   -- the framebuffer keep the bridge.
+   -- So does an uncached load of SDRAM RAM of any width, a 64-bit one
+   -- qword-aligned, as a read of its qword (fast_unc_go), when no demand miss
+   -- is asking; it waits for every store ahead of it like the rest. I/O, the
+   -- boot ROM and the framebuffer keep the bridge.
    --
    -- A load miss is answered before its line has
    -- landed, and the CPU may miss again while it lands. That demand fill
@@ -4813,12 +4821,23 @@ begin
                                 datacache_ra_chain_ok = '1' and fast_s3_go = '0' and
                                 datacache_ra_done = '1' and fast_path_clear = '1') else '0';
    fast_chain_go   <= fast_ra_go and fast_chain_term;
-   fast_unc_ok     <= '1' when (mem4_req64 = '1' and mem4_address(2 downto 0) = "000" and
+   fast_unc_ok     <= '1' when ((mem4_req64 = '0' or mem4_address(2 downto 0) = "000") and
                                 is_sdram_line(mem4_address(31 downto 5) & "00000") = '1') else '0';
    fast_unc_go     <= '1' when (mem4_request = '1' and mem4_rnw = '1' and
                                 writefifo_mem4_ready = '1' and fast_unc_ok = '1' and
                                 datacache_request_raw = '0' and fast_path_clear = '1') else '0';
    fast_unc_ret    <= '1' when (fast_unc_valid = '1' and fast_is_unc_r = '1') else '0';
+   -- The answer: a narrower load's word is its half of the qword, rotated as
+   -- read4_uncachedData rotates the word the bridge returns, so the two
+   -- paths leave the same value. A 64-bit load's qword passes as it is
+   -- (unc4_hi clear, unc4_rot "00").
+   fast_unc_word   <= unsigned(fast_unc_qword(63 downto 32)) when (unc4_hi = '1') else
+                      unsigned(fast_unc_qword(31 downto 0));
+   fast_unc_low    <= (x"000000" & fast_unc_word(31 downto 24)) when (unc4_rot = "11") else
+                      (x"0000"   & fast_unc_word(31 downto 16)) when (unc4_rot = "10") else
+                      (x"00"     & fast_unc_word(31 downto  8)) when (unc4_rot = "01") else
+                      fast_unc_word;
+   fast_unc_data   <= fast_unc_qword(63 downto 32) & std_logic_vector(fast_unc_low);
    -- A direct read-ahead's qwords on fast_ra_valid, the fourth its
    -- completion.
    fast_ra_take    <= '1' when (fast_ra_valid = '1' and
@@ -4828,8 +4847,9 @@ begin
                                 fast_ra_ret = '1') else '0';
 
    -- LAUNCHING FROM STAGE 3. An uncached load in stage 4 completes in a
-   -- cycle with mem_finished_read. If the instruction waiting in stage 3 is an uncached
-   -- 64-bit load of SDRAM RAM, qword-aligned, it goes to the direct port on
+   -- cycle with mem_finished_read. If the instruction waiting in stage 3 is an
+   -- uncached load of SDRAM RAM - a 64-bit one qword-aligned, and not a merge
+   -- (lwl, lwr), which leaves from stage 4 - it goes to the direct port on
    -- that edge, under fast_unc_go's rule: nothing of the CPU's in the
    -- bridge's path, so every store ahead of it has been written. The edge
    -- releases stage 4 and nothing else stalls, so stage 4 presents the load
@@ -4839,9 +4859,11 @@ begin
    fast_s3_go      <= '1' when (mem_finished_read = '1' and stall4 = '1' and
                                 writeback_UseCache = '0' and
                                 executeNew = '1' and executeMemReadEnable = '1' and
-                                executeMemUseCache = '0' and executeMem64Bit = '1' and
-                                executeLoadType = LOADTYPE_QWORD and
-                                executeMemAddress(2 downto 0) = "000" and
+                                executeMemUseCache = '0' and
+                                ((executeMem64Bit = '1' and executeLoadType = LOADTYPE_QWORD and
+                                  executeMemAddress(2 downto 0) = "000") or
+                                 (executeMem64Bit = '0' and executeLoadType /= LOADTYPE_LEFT and
+                                  executeLoadType /= LOADTYPE_RIGHT)) and
                                 is_sdram_line(executeMemAddress(31 downto 5) & "00000") = '1' and
                                 stall1 = '0' and stall2 = '0' and stall3 = '0' and
                                 fast_out = 0 and fast_ok = '1' and fast_path_quiet = '1' and
@@ -4909,6 +4931,13 @@ begin
                       response_cdc_pending_2x = '1' or response_cdc_deliver_2x = '1' or
                       (resp_fifo_empty = '0' and resp_fifo_dout(105) = '0')))
             report "a direct uncached qword came back beside another completion"
+            severity failure;
+         -- A direct uncached load comes back with itself waiting in stage
+         -- 4, so its word's place is unc4_hi's and unc4_rot's.
+         assert not (fast_unc_ret = '1' and reset_2x = '0' and
+                     (stall4 = '0' or
+                      writebackReadAddress(31 downto 3) /= fast_line_r(31 downto 3)))
+            report "a direct uncached load came back without itself waiting in stage 4"
             severity failure;
          -- A load launched from stage 3 is the one stage 4 presents next.
          assert not (fast_s3_launched = '1' and reset_2x = '0' and
@@ -5320,6 +5349,20 @@ begin
                   
                      writebackLoadType       <= executeLoadType;
                      writebackReadAddress    <= executeMemAddress;
+                     -- Its word's place in its qword (fast_unc_data): the high
+                     -- half at address bit 2 for a load narrower than 64
+                     -- bits, and read4_uncachedRot's rotation.
+                     unc4_hi  <= '0';
+                     unc4_rot <= executeMemAddress(1 downto 0);
+                     if (executeLoadType /= LOADTYPE_QWORD and executeLoadType /= LOADTYPE_LEFT64 and
+                         executeLoadType /= LOADTYPE_RIGHT64) then
+                        unc4_hi <= executeMemAddress(2);
+                     end if;
+                     if (executeLoadType = LOADTYPE_LEFT   or executeLoadType = LOADTYPE_RIGHT   or
+                         executeLoadType = LOADTYPE_LEFT64 or executeLoadType = LOADTYPE_RIGHT64 or
+                         executeLoadType = LOADTYPE_QWORD) then
+                        unc4_rot <= "00";
+                     end if;
 
                   else
 
