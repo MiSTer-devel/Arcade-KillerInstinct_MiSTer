@@ -5,7 +5,7 @@ This report compares results from the Killer Instinct memory, CPU and IDE test R
 | Platform | Source | Test ROM build |
 |---|---|---|
 | **Original hardware** | Real KI board, A-19489 | Nov 7 2026 |
-| **MiSTer core** | This core, release build with all six CPU features disabled (section 10) | Nov 18 2026 |
+| **MiSTer core** | This core, release build with all six CPU features disabled (section 10) | Nov 19 2026 |
 
 Sections 1-9 were measured on that test build. Section 10's CPU tests were measured on the release build, which disables the same six CPU features.
 
@@ -23,11 +23,12 @@ The sections below follow the test ROM's page order.
 - **The heavy frame (KI2 barrel explosion) is within 1.2% of the board** (3,615 vs 3,660 kcycles), and the rendered checksum is identical.
 - **Where the board uses its fastest memory (SRAM, VRAM), the core's reads are within 2% of the board.** Uncached SRAM reads are 98.0% of the board's speed. Cached reads are 99.5%.
 - **Uncached stores take the board's time at every size:** 7.95-7.99 cycles to SRAM for `sb`, `sh`, `sw` and `sd`, against the board's 7.99.
-- **Uncached loads take the same time at every size, as on the board:** the SRAM word (`lw`) 12.18 cycles and `ld` 12.18, against the board's 12.03 and 12.06.
+- **Uncached loads take the same time at every size, as on the board:** the SRAM word (`lw`) 12.17 cycles and `ld` 12.17-12.18, against the board's 12.03 and 12.06-12.07.
+- **Both I-caches are 16 KiB, 2-way, with 8 KiB ways:** code that alternates between two blocks 16 KiB apart runs at 1.00 cycles per instruction on both.
 - **The core is faster than the board in many places:** board DRAM (the core puts DRAM and SRAM on the same SDRAM), cached writes, IDE, integer multiply and divide, `mul.s`/`mul.d`, FP compare-and-branch, uncached ROM reads, and several cache operations.
 - **The core is clearly slower in these places:**
   - Dependent-miss latency: 26.10 cycles per load against 24.21 (+1.89, +7.8%).
-  - Code that alternates between two blocks 16 KiB apart: 6.08 cycles per instruction against 1.00. The core's I-cache is direct-mapped; the board's is 2-way.
+  - Code that misses the I-cache on every line: 6.05 cycles per instruction against 4.31 (three blocks in one set) and 6.00 against 4.26 (a 32 KiB stream). Both restart after the whole line is in; the core refills a line in about 40 cycles, the board in about 26.
   - Loads that touch 8 or 16 mapped pages: 12.03 / 9.03 cycles per load against 2.03.
   - `lwc1` into `add.s`: 8.06 cycles against 4.03.
   - `mfc0 Count`: 3.03 cycles against 1.03.
@@ -45,7 +46,7 @@ The sections below follow the test ROM's page order.
 | SRAM `00000-2FFFF` | Uncached read | 63.97 | 62.72 | 98.0% |
 | | Uncached write | 100.03 | 99.86 | 99.8% |
 | | Cached read | 133.32 | 132.66 | 99.5% |
-| | Cached write | 112.27 | 140.31 | 125.0% |
+| | Cached write | 112.27 | 140.32 | 125.0% |
 | VRAM0 `30000-57FFF` | Uncached read | 63.97 | 63.99 | 100.0% |
 | | Uncached write | 100.03 | 133.38 | 133.3% |
 | | Cached read | 133.32 | 133.28 | 100.0% |
@@ -54,10 +55,10 @@ The sections below follow the test ROM's page order.
 | | Uncached write | 100.03 | 133.38 | 133.3% |
 | | Cached read | 133.32 | 133.28 | 100.0% |
 | | Cached write | 112.27 | 261.16 | 232.6% |
-| DRAM `8000000-87FFFFF` | Uncached read | 54.68 | 62.71 | 114.7% |
-| | Uncached write | 56.79 | 99.87 | 175.9% |
+| DRAM `8000000-87FFFFF` | Uncached read | 54.68 | 62.72 | 114.7% |
+| | Uncached write | 56.79 | 99.86 | 175.8% |
 | | Cached read | 113.46 | 132.66 | 116.9% |
-| | Cached write | 69.02 | 140.32 | 203.3% |
+| | Cached write | 69.02 | 140.31 | 203.3% |
 
 On the board, SRAM and VRAM give identical results, and DRAM is slower than both. In the core, SRAM and DRAM give identical results because both live in the same SDRAM. As a result, the core's DRAM runs at SRAM speed, faster than the board's DRAM. Cached writes are faster than the board in every region.
 
@@ -80,16 +81,16 @@ Both platforms take the same time for every store size. The board stores to SRAM
 
 | When | Region | Original HW | MiSTer core |
 |---|---|---:|---:|
-| In vblank | SRAM | 12.06 | 12.18 |
+| In vblank | SRAM | 12.06 | 12.17 |
 | | VRAM front buffer | 12.08 | 12.03 |
 | | VRAM back buffer | 12.07 | 12.03 |
-| | DRAM | 14.18 | 12.18 |
+| | DRAM | 14.18 | 12.17 |
 | Mid frame | SRAM | 12.07 | 12.18 |
 | | VRAM front buffer | 12.08 | 12.03 |
 | | VRAM back buffer | 12.07 | 12.03 |
 | | DRAM | 14.17 | 12.17 |
 
-Neither platform slows down when video scanout is reading VRAM: the vblank and mid-frame rows match. The core's SRAM loads are 0.11-0.12 cycles slower than the board's, and its DRAM loads are 2 cycles faster.
+Neither platform slows down when video scanout is reading VRAM: the vblank and mid-frame rows match. The core's SRAM loads are 0.11 cycles slower than the board's, and its DRAM loads are 2 cycles faster.
 
 ---
 
@@ -114,14 +115,14 @@ On the board, every bar is the same height across SRAM, VRAM0 and VRAM1. On the 
 |---|---:|---:|---:|
 | Chase, 128 KiB shuffled, 4096 nodes | 24.21 | 26.10 | +1.89 |
 | Stride 32 | 24.20 | 26.07 | +1.87 |
-| Stride 64 | 24.20 | 26.07 | +1.87 |
-| Stride 128 | 24.21 | 26.07 | +1.86 |
-| Stride 256 | 24.20 | 26.10 | +1.90 |
+| Stride 64 | 24.20 | 26.17 | +1.97 |
+| Stride 128 | 24.21 | 26.06 | +1.85 |
+| Stride 256 | 24.20 | 26.17 | +1.97 |
 | Stride 512 | 24.20 | 26.07 | +1.87 |
 | Stride 1 Ki | 24.21 | 26.17 | +1.96 |
 | Stride 2 Ki | 24.20 | 26.07 | +1.87 |
 | Stride 4 Ki | 24.21 | 26.07 | +1.86 |
-| Stride 8 Ki | 24.21 | 26.17 | +1.96 |
+| Stride 8 Ki | 24.21 | 26.15 | +1.94 |
 | Bank pair, 1 KiB | 24.21 | 26.12 | +1.91 |
 | Bank pair, bank01 | 24.21 | 26.12 | +1.91 |
 | Bank ratio | 1.00 | 1.00 | |
@@ -152,9 +153,9 @@ Cycles, best of 3, each loop warmed once first.
 | `lw`, 8 destinations | cyc/load | 1.03 | 1.03 | match |
 | `lw` chain | cyc/load | 2.01 | 2.01 | match |
 | 2 lines per set | cyc/access | 1.03 | 3.03 | +2.00 |
-| 3 lines per set | cyc/access | 24.21 | 13.04 | −11.17 |
+| 3 lines per set | cyc/access | 24.21 | 13.05 | −11.16 |
 | A B A C | cyc/access | 18.15 | 19.57 | +1.42 |
-| Dirty victim | cyc/access | 33.57 | 21.38 | −12.19 |
+| Dirty victim | cyc/access | 33.57 | 21.37 | −12.20 |
 | Index Writeback Invalidate | cyc/op | 12.01 | 4.03 | −7.98 |
 | `sw` + Hit Writeback Invalidate | cyc/op | 68.26 | 74.14 | +5.88 |
 | `lw` + Hit Invalidate | cyc/op | 36.12 | 27.30 | −8.82 |
@@ -167,12 +168,12 @@ Both caches keep two lines in a set without a miss, but the core pays 2 cycles m
 |---|---:|---:|---:|
 | 1 block | 1.00 | 1.00 | match |
 | 2 blocks, 8 KiB apart | 1.00 | 1.00 | match |
-| 2 blocks, 16 KiB apart | 1.00 | 6.08 | +5.08 |
-| 3 blocks at 0 / 8 / 16 KiB | 4.31 | 4.37 | +0.06 |
+| 2 blocks, 16 KiB apart | 1.00 | 1.00 | match |
+| 3 blocks at 0 / 8 / 16 KiB | 4.31 | 6.05 | +1.74 |
 | 32 KiB stream | 4.26 | 6.00 | +1.74 |
 | ROM, uncached | 149.78 | 82.28 | −67.50 |
 
-The board's 16 KiB I-cache is 2-way with 8 KiB ways, so two blocks 16 KiB apart share a set and both stay cached. The core's I-cache is direct-mapped, so they evict each other on every pass. Uncached code from the boot ROM runs almost twice as fast on the core.
+Both I-caches are 16 KiB, 2-way, with 8 KiB ways and least-recently-used replacement, so two blocks 16 KiB apart share a set and both stay cached. Three blocks in one set, and a 32 KiB stream, miss on every line on both. Both restart only once the whole line is in the cache; the board refills a line in about 26 cycles and the core in about 40, so those two tests take 1.74 cycles per instruction more on the core. Uncached code from the boot ROM runs almost twice as fast on the core.
 
 ### TLB (cycles per load)
 
@@ -255,7 +256,7 @@ Add, divide and square root match the board to within 0.05 cycles. Multiply is 1
 | Test | Original HW | MiSTer core | Core − HW |
 |---|---:|---:|---:|
 | Vsync (Hz) | 58.96 | 58.98 | +0.02 |
-| Frame (µs) | 16,959.98 | 16,954.54 | −5.44 |
+| Frame (µs) | 16,959.98 | 16,954.58 | −5.40 |
 | Vblank (µs) | 1,600.06 | 1,365.54 | −234.52 |
 
 ### Interrupts (cycles)
@@ -264,7 +265,7 @@ Add, divide and square root match the board to within 0.05 cycles. Multiply is 1
 |---|---:|---:|
 | Compare interrupt, min | 10.00 | 12.00 |
 | Compare interrupt, max | 54.00 | 88.00 |
-| Vblank interrupt, min | 12.00 | 14.00 |
+| Vblank interrupt, min | 12.00 | 12.00 |
 | Vblank interrupt, max | 20.00 | 24.00 |
 | `syscall` + `eret` | 39.03 | 42.04 |
 
@@ -277,7 +278,7 @@ Add, divide and square root match the board to within 0.05 cycles. Multiply is 1
 | IDE status | 48.03 | 14.03 | −34.00 |
 | Sound status | 14.03 | 14.03 | match |
 | ROM word | 142.03 | 80.03 | −62.00 |
-| SRAM word | 12.03 | 12.18 | +0.15 |
+| SRAM word | 12.03 | 12.17 | +0.14 |
 
 ### IDE and sound
 
@@ -288,7 +289,7 @@ Add, divide and square root match the board to within 0.05 cycles. Multiply is 1
 | DCS acknowledge, max (µs) | 78.94 | 58.14 | |
 | DCS boot (ms) | 0.05 | 0.05 | |
 
-The core's frame period matches the board to 0.03%, but its vblank is 234 µs shorter. Its worst-case interrupt latencies are longer than the board's: 88 cycles against 54 for Compare, and 24 against 20 for vblank. The vblank minimum is the smallest of 8 samples, and on the core it reads 12 or 14 from run to run. The IDE status register and the boot ROM read faster on the core. The SRAM word, an uncached `lw` from the core's SDRAM, reads 0.15 cycles slower than on the board, about as much as the core's uncached `ld` from SRAM on page 1 (0.11-0.12). The DCS boot time is 0.05 ms on both, which is too short for a DSP boot, so the test probably times the first byte's handshake.
+The core's frame period matches the board to 0.03%, but its vblank is 234 µs shorter. Its worst-case interrupt latencies are longer than the board's: 88 cycles against 54 for Compare, and 24 against 20 for vblank. The vblank minimum is the smallest of 8 samples, and on the core it reads 12 to 16 from run to run. The IDE status register and the boot ROM read faster on the core. The SRAM word, an uncached `lw` from the core's SDRAM, reads 0.14 cycles slower than on the board, about as much as the core's uncached `ld` from SRAM on page 1 (0.11). The DCS boot time is 0.05 ms on both, which is too short for a DSP boot, so the test probably times the first byte's handshake.
 
 ---
 
@@ -302,12 +303,12 @@ This page replays the sprite blend of KI2's heaviest frame: 10 sprites, cold D-c
 | 34×36 | left | 1,060 | 39.98 | 39.12 | 42 | 41 | −2.2% |
 | 146×112 | left | 7,151 | 29.51 | 28.98 | 211 | 207 | −1.8% |
 | 312×240 | left | 69,787 | 18.10 | 18.03 | 1,263 | 1,258 | −0.4% |
-| 63×43 | right | 1,025 | 61.99 | 59.66 | 63 | 61 | −3.8% |
+| 63×43 | right | 1,025 | 61.99 | 59.67 | 63 | 61 | −3.7% |
 | 56×52 | right | 1,732 | 42.41 | 41.29 | 73 | 71 | −2.6% |
 | 81×90 | left | 4,705 | 30.61 | 29.91 | 144 | 140 | −2.3% |
 | 184×137 | left | 15,808 | 21.05 | 20.88 | 332 | 330 | −0.8% |
 | 20×24 | right | 266 | 62.21 | 60.27 | 16 | 16 | −3.1% |
-| 19×25 | right | 286 | 59.50 | 57.49 | 17 | 16 | −3.4% |
+| 19×25 | right | 286 | 59.50 | 57.48 | 17 | 16 | −3.4% |
 | **Frame** | | **175,445** | **20.86** | **20.60** | **3,660** | **3,615** | **−1.2%** |
 
 | | Original HW | MiSTer core |
@@ -315,7 +316,7 @@ This page replays the sprite blend of KI2's heaviest frame: 10 sprites, cold D-c
 | vblanks | 2.15 | 2.13 |
 | Checksum | `0x727B3D0B` | `0x727B3D0B` |
 
-The core finishes the frame 1.2% faster than the board, and every sprite is within 0.4-3.8% of the board. Both platforms produce the same checksum, so the rendered output is identical.
+The core finishes the frame 1.2% faster than the board, and every sprite is within 0.4-3.7% of the board. Both platforms produce the same checksum, so the rendered output is identical.
 
 ---
 
@@ -385,7 +386,7 @@ All 45 failures exercise features that KI does not use. None of them affect the 
 
 | Area | Core vs board | Note |
 |---|---|---|
-| I-cache, blocks 16 KiB apart | **6.08 vs 1.00 cycles per instruction** | The core's I-cache is direct-mapped; the board's is 2-way |
+| I-cache refill, every line missing | **6.05 vs 4.31 and 6.00 vs 4.26 cycles per instruction** | The core refills a line in ~40 cycles, the board in ~26 |
 | Mapped loads across 8 / 16 pages | **+10.0 / +7.0 cycles** | KI does not use mapped pages |
 | `lwc1` → `add.s` | **+4.03 cycles** | |
 | Dependent-miss latency | **~1.9 cycles slower** (+7.8%) | |
@@ -394,7 +395,7 @@ All 45 failures exercise features that KI does not use. None of them affect the 
 | `mfc0 Count` | +2.00 cycles | |
 | D-cache, 2 lines per set | +2.00 cycles | |
 | `mov.s` / `neg.s` / `cvt.w` | ~+1 cycle | |
-| SRAM word I/O read (uncached `lw`) | +0.15 cycles | As page 1's uncached SRAM `ld` (+0.11-0.12) |
+| SRAM word I/O read (uncached `lw`) | +0.14 cycles | As page 1's uncached SRAM `ld` (+0.11) |
 | Uncached SRAM read | 1.25 MB/s slower (−2.0%) | VRAM matches exactly |
 | Cached SRAM read | 0.66 MB/s slower (−0.5%) | VRAM matches exactly |
 | DRAM | Throughput 15-76% faster; stores 6.1 and `ld` 2.0 cycles faster | Core's DRAM shares the SRAM's SDRAM |
