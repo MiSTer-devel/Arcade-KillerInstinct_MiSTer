@@ -108,9 +108,8 @@ module ki_memory_bridge (
   // TWO 16-bit words per beat, low word first. ki_sdram_x2 packs them so the
   // bridge still sees one beat per clk_core cycle when the controller runs at
   // twice this clock. Every
-  // burst this bridge issues is an even number of words (2, 4, 8, 12 or 16),
-  // so sdram_read_be is always 2'b11 here; that is checked below rather than
-  // assumed.
+  // burst this bridge issues is an even number of words, so sdram_read_be is
+  // always 2'b11 here; that is checked below rather than assumed.
   input  wire  [31:0] sdram_read_data,
   input  wire   [1:0] sdram_read_be,
   // One pulse per returned beat of a burst read, in address order. The final
@@ -173,19 +172,17 @@ module ki_memory_bridge (
   // data itself comes from the boot M10K, the line buffer, or SDRAM.
   localparam integer BOOT_ROM_WAIT_SHIFT = 4;
 
-  // 22 states, so five bits.
+  // 20 states, so five bits.
   typedef enum logic [4:0] {
     IDLE,
     BOOT_CACHE_READ_WAIT,
     BOOT_CACHE_READ_RETURN,
     SDRAM_READ_ISSUE,
     SDRAM_READ_WAIT,
-    SDRAM_WRITE_ISSUE,
-    SDRAM_WRITE_WAIT,
-    SDRAM_WRITE_RMW_WAIT,
-    SDRAM_WRITE_RMW_ISSUE,
     SDRAM_WB_FLUSH_ISSUE,
     SDRAM_WB_FLUSH_WAIT,
+    SDRAM_WB_RMW_WAIT,
+    SDRAM_WB_RMW_ISSUE,
     IO_WAIT,
     FB_READ_ISSUE,
     FB_READ_WAIT,
@@ -223,7 +220,6 @@ module ki_memory_bridge (
   logic [63:0] operation_write_data = 64'd0;
 
   logic [24:0] memory_word_address = 25'd0;
-  logic [2:0] memory_word_count = 3'd0;
   logic [2:0] read_beats_remaining = 3'd0;
   logic [63:0] read_buffer = 64'd0;
   logic [63:0] read_buffer_next;
@@ -231,25 +227,6 @@ module ki_memory_bridge (
   // edge each is handed over, so it reads the NEXT beat's index; the fourth
   // wraps it to 0. Only simulation reads it, so synthesis prunes it.
   logic [1:0] fill_beat = 2'd0;
-
-  // ---- narrow stores, without DQM ----------------------------------------
-  // A store that does not write every byte of every word in its burst cannot
-  // go out with the missing bytes masked off by DQM. The board ignores DQM (a
-  // fully masked word is written anyway), so those bytes would land on live
-  // memory carrying whatever the store's data register holds in their lanes.
-  // `sw` and `sd` fill every byte and take the direct path; `sh`, `sb` and a
-  // partial `sdl`/`sdr` become read-modify-write here: read the burst's words,
-  // merge the enabled bytes, write them all back with every enable set.
-  wire wr_mask_full = operation_req64 ? (operation_write_mask == 8'hff)
-                                      : (operation_write_mask[3:0] == 4'hf);
-  logic [63:0] rmw_read = 64'd0;
-  logic  [1:0] rmw_index = 2'd0;
-  logic [63:0] rmw_merged;
-  always_comb begin
-    for (int b = 0; b < 8; b++)
-      rmw_merged[b*8 +: 8] = operation_write_mask[b] ?
-          operation_write_data[b*8 +: 8] : rmw_read[b*8 +: 8];
-  end
 
   // Burst read bookkeeping. `read_word_index` is the position inside the
   // 64-bit word being assembled; `read_words_remaining` is how much of the
@@ -448,34 +425,56 @@ module ki_memory_bridge (
   wire [27:0] active_storage_address =
       storage_address(active_address);
 
-  // ---- dirty-line write gather -------------------------------------------
-  // A 32-byte dirty line reaches the bridge as four consecutive full-mask
-  // 64-bit writes. Issued separately they cost four lots of the
-  // per-transaction overhead. Gathering them into one 16-word burst pays it
-  // once.
+  // ---- the write gather --------------------------------------------------
+  // Every store to ordinary memory - of any width - is held here, by byte,
+  // one 32-byte line at a time, and acknowledged as it is absorbed. A line
+  // whose every byte has been stored goes out as one 16-word burst; a line
+  // left with bytes missing goes out in pieces when something else needs the
+  // bus. A dirty line the data cache writes back arrives whole, in one
+  // request, and goes out through the same registers.
+  //
+  // No write burst may leave a byte of any word in it unwritten. The board
+  // ignores DQM - a masked word is written anyway, with whatever is on the
+  // data lines - so a line written with a byte inside its span not stored is
+  // read over that span first and written back whole (SDRAM_WB_RMW_*), while
+  // every simulation model honours DQM and would hide the difference.
   //
   // Writes are acknowledged as soon as they are absorbed, so correctness
   // rests on one rule: every OTHER requester flushes the buffer before it is
   // served, reads included.
 
-  logic   [2:0] wb_count = 3'd0;     // 64-bit chunks held, 0..4
-  logic  [24:0] wb_addr = 25'd0;     // word address of the first chunk
+  logic         wb_held = 1'b0;      // a line is held in wb_*
+  logic  [24:0] wb_addr = 25'd0;     // the held line's word address, 16-word aligned
   logic [255:0] wb_data = 256'd0;
+  // The held line's bytes still to write, bit i for byte i. A store sets its
+  // own; each piece a flush writes clears its own.
   logic  [31:0] wb_be = 32'd0;
-  // Cycles since the last chunk landed. A lone store is not part of a line,
-  // so it must not sit here indefinitely: bit 5 flushes it after 32 cycles,
-  // which is far longer than the gap between a writeback's beats.
+  // Cycles since the last store landed. A line nothing is completing must
+  // not sit here indefinitely: bit 5 flushes it after 32 cycles, far longer
+  // than the gap between the stores of a stream.
   logic   [5:0] wb_idle = 6'd0;
   // A line write with some qwords left out goes out as one full-enable 4-word
   // burst per qword it holds, never as a 16-word burst with words masked off.
-  // The board ignores DQM, so masked words inside a write burst would be
-  // written anyway, while every simulation model honours it.
   logic         wb_split = 1'b0;
-  // The line being written went out from the absorb of its fourth store, so
-  // its data is all in sdram_write_data and wb_* holds the next (THE STORE
-  // STREAM).
+  // The line being written went out from the absorb of the store that
+  // completed it, so its data is all in sdram_write_data and wb_* holds the
+  // next (THE STORE STREAM).
   logic         wb_free = 1'b0;
   logic   [3:0] wb_qmask = 4'd0;     // qwords still to write in split mode
+  // The beat of a flush's read the next arrives as (SDRAM_WB_RMW_WAIT).
+  logic   [2:0] wb_rmw_k = 3'd0;
+
+  // THE BOARD'S WRITE RATE. The R4600 makes every uncached store, whatever
+  // its width, one doubleword write on its system bus: 4 SClocks, which is 8
+  // pipeline clocks and 4 of this clock, behind a 4-entry write buffer. Its
+  // stores therefore go out one per 4 clk however fast they come. wb_debt is
+  // the bus time, in clk, the stores absorbed so far would still owe that
+  // bus; a store is absorbed only while at most three stores' worth is owed,
+  // so a stream of them runs at the board's rate, however fast this bridge
+  // could take them, and a short run is not held back.
+  logic   [3:0] wb_debt = 4'd0;
+  wire    [3:0] wb_debt_dec = wb_debt - {3'd0, (wb_debt != 4'd0)};
+  wire          wb_pace_ok = (wb_debt <= 4'd12);
 
   wire [2:0] active_read_beats =
       (active_size == 3'd0) ? 3'd1 : active_size;
@@ -707,40 +706,115 @@ module ki_memory_bridge (
         (download_count >= DOWNLOAD_FIFO_HIGH_WATER);
   end
 
-  // Absorbable: a full-mask 64-bit write to ordinary memory that either
-  // starts a line (32-byte aligned, so the burst cannot cross a DRAM row) or
-  // continues the one being held. The boot-table window is excluded so the
-  // snoop in SDRAM_WRITE_WAIT still sees every store there.
+  // Absorbable: a store to ordinary memory, of any width.
   wire wb_elig =
       cpu_turn && !active_rnw && !active_line_write &&
-      active_req64 && (active_write_mask == 8'hff) &&
       !io_selected && !cpu_hits_fb &&
       is_memory_address(active_address) &&
-      !is_boot_address(active_address) &&
-      !((active_address >= 32'h087f_f000) &&
-        (active_address <= 32'h087f_ffff));
+      !is_boot_address(active_address);
+
+  // The store asked for, placed in its line: the bytes it writes (st_be, bit
+  // i for byte i of the 32-byte line) and its data repeated so that each of
+  // them is in its own lane (st_rep). A 64-bit store names a qword and its
+  // eight lanes; a narrower one a 32-bit word, by address bit 2, and four.
+  logic  [31:0] st_be;
+  wire  [255:0] st_rep = active_req64 ? {4{active_data_write}}
+                                      : {8{active_data_write[31:0]}};
+  always_comb begin
+    for (int b = 0; b < 32; b++)
+      st_be[b] = active_req64 ?
+          ((active_word_address[3:2] == (b >> 3)) && active_write_mask[b % 8]) :
+          ((active_word_address[3:1] == (b >> 2)) && active_write_mask[b % 4]);
+  end
+
+  // The held line is whole: every byte of it stored.
+  wire wb_full = &wb_be;
+  // One that joins the line held, or starts one when none is.
   wire wb_gather_ok = wb_elig &&
-      ((wb_count == 3'd0)
-           ? (active_word_address[3:0] == 4'd0)
-           : ((wb_count < 3'd4) &&
-              (active_word_address ==
-               (wb_addr + {20'd0, wb_count, 2'b00}))));
+      (!wb_held ||
+       ((active_word_address[24:4] == wb_addr[24:4]) && !wb_full));
   // One that starts a line, whatever is held: on a write's done edge the
   // held line is no longer wb_*'s (THE STORE STREAM).
-  wire wb_start_ok = wb_elig && (active_word_address[3:0] == 4'd0);
+  wire wb_start_ok = wb_elig;
 
-  // THE STORE STREAM. An uncached store stream to SDRAM, four
-  // full-mask stores a line, is held to the length of the lines' writes:
-  //   * the edge that absorbs a line's fourth store issues its burst - no IDLE
-  //     edge to notice the full line, no SDRAM_WB_FLUSH_ISSUE;
+  // Absorbing it: its bytes over the held ones, or a line of its own. Only on
+  // a flush's done edge is a line held that it does not join, and there the
+  // flushed one is no longer wb_*'s.
+  wire          wb_merge = wb_held &&
+                           !((state == SDRAM_WB_FLUSH_WAIT) && !wb_free);
+  wire   [24:0] wb_addr_next = wb_merge ? wb_addr
+                                        : {active_word_address[24:4], 4'd0};
+  wire   [31:0] wb_be_next = (wb_merge ? wb_be : 32'd0) | st_be;
+  logic [255:0] wb_data_next;
+  always_comb begin
+    for (int b = 0; b < 32; b++)
+      wb_data_next[b*8 +: 8] = st_be[b] ? st_rep[b*8 +: 8] : wb_data[b*8 +: 8];
+  end
+
+  // A flush writes the held line as one burst over its span - its 32-bit
+  // words from the lowest with a byte stored to the highest, the whole line
+  // when every byte is. When every word of the span has all its bytes, that
+  // is all; otherwise the span is read first and the bytes not stored are
+  // taken from it (wb_data_fill), so the write still covers every byte of
+  // every word it names. Either way one write, and at most one read.
+  logic   [7:0] wb_unit_any, wb_unit_full;
+  logic   [2:0] wb_lo, wb_hi;   // the span's first and last words
+  logic         wb_span_whole;  // every word of the span has all its bytes
+  always_comb begin
+    for (int u = 0; u < 8; u++) begin
+      wb_unit_any[u]  = |wb_be[u*4 +: 4];
+      wb_unit_full[u] = &wb_be[u*4 +: 4];
+    end
+    casez (wb_unit_any)
+      8'b???????1: wb_lo = 3'd0;
+      8'b??????10: wb_lo = 3'd1;
+      8'b?????100: wb_lo = 3'd2;
+      8'b????1000: wb_lo = 3'd3;
+      8'b???10000: wb_lo = 3'd4;
+      8'b??100000: wb_lo = 3'd5;
+      8'b?1000000: wb_lo = 3'd6;
+      8'b10000000: wb_lo = 3'd7;
+      default:     wb_lo = 3'd0;
+    endcase
+    casez (wb_unit_any)
+      8'b1???????: wb_hi = 3'd7;
+      8'b01??????: wb_hi = 3'd6;
+      8'b001?????: wb_hi = 3'd5;
+      8'b0001????: wb_hi = 3'd4;
+      8'b00001???: wb_hi = 3'd3;
+      8'b000001??: wb_hi = 3'd2;
+      8'b0000001?: wb_hi = 3'd1;
+      default:     wb_hi = 3'd0;
+    endcase
+    wb_span_whole = 1'b1;
+    for (int u = 0; u < 8; u++)
+      if ((u >= wb_lo) && (u <= wb_hi) && !wb_unit_full[u]) wb_span_whole = 1'b0;
+  end
+  wire    [3:0] wb_span = {1'b0, wb_hi} - {1'b0, wb_lo} + 4'd1;   // 32-bit words, 1..8
+  // A beat of the span's read: the 32-bit word it is, its bytes taken where
+  // none was stored.
+  logic [255:0] wb_data_fill;
+  always_comb begin
+    for (int b = 0; b < 32; b++)
+      wb_data_fill[b*8 +: 8] =
+          (((b >> 2) == (wb_lo + wb_rmw_k)) && !wb_be[b]) ?
+              sdram_read_data[(b % 4)*8 +: 8] : wb_data[b*8 +: 8];
+  end
+
+  // THE STORE STREAM. A run of stores that fills line after line is held to
+  // the length of the lines' writes:
+  //   * the edge that absorbs the store completing a line issues its burst -
+  //     no IDLE edge to notice the whole line, no SDRAM_WB_FLUSH_ISSUE;
   //   * that burst carries the whole line in sdram_write_data, so wb_* is
-  //     free (wb_free) and one store, a line's first, is absorbed while it is
-  //     written - one, so the stream runs at the writes' rate and never ahead
-  //     of them;
+  //     free (wb_free) and one store, the next line's first, is absorbed
+  //     while it is written - one, so the stream never runs ahead of the
+  //     writes;
   //   * the store waiting when the write completes is absorbed on that edge.
   // Nothing else changes. The bridge stays serial, everything else that asks
-  // in IDLE flushes the held chunks first (wb_flush_needed), and fast_ok stays
-  // low while anything is held, so no read passes a store.
+  // in IDLE flushes the held line first (wb_flush_needed), and fast_ok stays
+  // low while anything is held, so no read passes a store. wb_debt paces
+  // every absorb the same, so a stream of stores of any width runs at the
+  // board's rate.
 
   // A whole line handed over in one request. Anything held from gathering
   // goes out first - wb_flush_needed below covers that, because a line write
@@ -757,13 +831,12 @@ module ki_memory_bridge (
       cpu_turn && !active_rnw && active_line_write &&
       cpu_hits_fb;
 
-  // Anything else that needs the bus, a full line, or a line left sitting
-  // too long, forces the held chunks out first.
+  // Anything else that needs the bus, a whole line, or a line left sitting
+  // too long, forces the held line out first.
   wire wb_flush_needed =
-      (wb_count == 3'd4) ||
-      ((wb_count != 3'd0) &&
-       ((download_count != 0) || wb_idle[5] ||
-        (cpu_turn && !wb_gather_ok)));
+      wb_held &&
+      (wb_full || (download_count != 0) || wb_idle[5] ||
+       (cpu_turn && !wb_gather_ok));
 
   always_ff @(posedge clk) begin
     boot_cache_read_data <= boot_cache[boot_cache_read_address];
@@ -849,7 +922,10 @@ module ki_memory_bridge (
     sdram_read <= 1'b0;
     sdram_write <= 1'b0;
 
-    if ((wb_count != 3'd0) && !wb_idle[5]) wb_idle <= wb_idle + 1'b1;
+    if (wb_held && !wb_idle[5]) wb_idle <= wb_idle + 1'b1;
+    // The board's bus works off what it owes, a clock at a time; an absorb
+    // adds a store's worth below.
+    wb_debt <= wb_debt_dec;
     if (sdram_done && done_owed) done_owed <= 1'b0;
     fill_tail <= 1'b0;
 
@@ -975,17 +1051,17 @@ module ki_memory_bridge (
       io_write_data <= 32'd0;
       io_byte_enable <= 4'd0;
       memory_word_address <= 25'd0;
-      memory_word_count <= 3'd0;
       read_beats_remaining <= 3'd0;
       read_word_index <= 2'd0;
       read_words_remaining <= 5'd0;
       sdram_burst <= 5'd1;
-      wb_count <= 3'd0;
+      wb_held <= 1'b0;
       wb_idle <= 6'd0;
       // A reset in a split line's writing would otherwise leave it set, and
       // the next gathered line would go out as the split one's pieces.
       wb_split <= 1'b0;
       wb_free <= 1'b0;
+      wb_debt <= 4'd0;
       rom_line_valid <= 1'b0;
       rom_fill_index <= 4'd0;
       boot_rom_return_state <= IDLE;
@@ -1051,7 +1127,7 @@ module ki_memory_bridge (
             state <= SDRAM_WB_FLUSH_ISSUE;
           end else if (line_req) begin
             // Load the holding registers with the whole line and send it as
-            // one 16-word burst. Acknowledged here, like an absorbed chunk:
+            // one 16-word burst. Acknowledged here, like an absorbed store:
             // nothing can read past it, because every other requester
             // flushes first.
             wb_addr <= active_word_address;
@@ -1062,7 +1138,7 @@ module ki_memory_bridge (
             wb_be <= {32{1'b1}};
             wb_split <= (active_write_mask[3:0] != 4'b1111);
             wb_qmask <= active_write_mask[3:0];
-            wb_count <= 3'd4;
+            wb_held <= 1'b1;
             wb_idle <= 6'd0;
             cpu_pending <= 1'b0;
             cpu_done <= 1'b1;
@@ -1091,33 +1167,40 @@ module ki_memory_bridge (
             debug_write_count     <= debug_write_count + 32'd4;
             debug_low_write_count <= debug_low_write_count + 32'd4;
           end else if (wb_gather_ok) begin
-            // Absorb and acknowledge in the same cycle. Nothing can read
-            // past this data because every other requester flushes first.
-            if (wb_count == 3'd0) wb_addr <= active_word_address;
-            wb_data[{wb_count[1:0], 6'd0} +: 64] <= active_data_write;
-            wb_be[{wb_count[1:0], 3'd0} +: 8] <= active_write_mask;
-            wb_count <= wb_count + 1'b1;
-            wb_idle <= 6'd0;
-            cpu_pending <= 1'b0;
-            cpu_done <= 1'b1;
-            // The fourth store's edge issues the line (THE STORE STREAM).
-            if ((wb_count == 3'd3) && !wb_split && sdram_ready) begin
-              sdram_address <= wb_addr;
-              sdram_write_data <= {active_data_write, wb_data[191:0]};
-              sdram_byte_enable <= {active_write_mask, wb_be[23:0]};
-              sdram_burst <= 5'd16;
-              sdram_write <= 1'b1;
-              wb_count <= 3'd0;
-              wb_free <= 1'b1;
-              state <= SDRAM_WB_FLUSH_WAIT;
+            // While the board's bus would still be busy with the stores
+            // before it (wb_debt), the store waits, and nothing else starts.
+            if (wb_pace_ok) begin
+              // Absorb and acknowledge in the same cycle. Nothing can read
+              // past this data because every other requester flushes first.
+              wb_addr <= wb_addr_next;
+              wb_data <= wb_data_next;
+              wb_be <= wb_be_next;
+              wb_held <= 1'b1;
+              wb_idle <= 6'd0;
+              wb_debt <= wb_debt_dec + 4'd4;
+              cpu_pending <= 1'b0;
+              cpu_done <= 1'b1;
+              // The store that completes the line issues it (THE STORE
+              // STREAM): every byte is there, so every enable is set.
+              if ((&wb_be_next) && !wb_split && sdram_ready) begin
+                sdram_address <= wb_addr_next;
+                sdram_write_data <= wb_data_next;
+                sdram_byte_enable <= 32'hFFFF_FFFF;
+                sdram_burst <= 5'd16;
+                sdram_write <= 1'b1;
+                wb_held <= 1'b0;
+                wb_be <= 32'd0;
+                wb_free <= 1'b1;
+                state <= SDRAM_WB_FLUSH_WAIT;
+              end
+              // The write counters must not notice the difference.
+              debug_write_count <= debug_write_count + 1'b1;
+              if ((active_address >= KI_LOW_RAM_BASE) &&
+                  (active_address <= KI_LOW_RAM_LAST))
+                debug_low_write_count <= debug_low_write_count + 1'b1;
+              else
+                debug_main_write_count <= debug_main_write_count + 1'b1;
             end
-            // The write counters must not notice the difference.
-            debug_write_count <= debug_write_count + 1'b1;
-            if ((active_address >= KI_LOW_RAM_BASE) &&
-                (active_address <= KI_LOW_RAM_LAST))
-              debug_low_write_count <= debug_low_write_count + 1'b1;
-            else
-              debug_main_write_count <= debug_main_write_count + 1'b1;
           end else if (download_count != 0) begin
             if (!download_inflight) begin
               if (download_is_boot[download_read_pointer]) begin
@@ -1204,11 +1287,9 @@ module ki_memory_bridge (
               end else if (active_req64) begin
                 memory_word_address <=
                     {active_storage_address[25:3], 2'b00};
-                memory_word_count <= 3'd4;
               end else begin
                 memory_word_address <=
                     {active_storage_address[25:2], 1'b0};
-                memory_word_count <= 3'd2;
               end
 
               rom_line_offset <= active_word_address[3:0];
@@ -1256,7 +1337,17 @@ module ki_memory_bridge (
                 cpu_pending <= 1'b0;
                 cpu_done <= 1'b1;
               end else begin
-                state <= SDRAM_WRITE_ISSUE;
+                // Every other store is the write gather's (wb_elig), which
+                // takes it, or flushes for it, before IDLE gets here. One that
+                // did get here would wait for ever - a stall the assertion
+                // names - rather than be lost.
+                // synthesis translate_off
+                if (!reset) begin
+                  $error("bridge: a store to %08h reached the single-access path",
+                         active_address);
+                  $fatal(1);
+                end
+                // synthesis translate_on
               end
             end else begin
               cpu_pending <= 1'b0;
@@ -1410,23 +1501,21 @@ module ki_memory_bridge (
           end
         end
 
-        // Everything held goes out as one burst - a split line as one 4-word
-        // burst per qword: wb_count chunks is wb_count * 4 words, and the
-        // line is 32-byte aligned so it cannot cross a row.
+        // The held line goes out as one burst over its span (see wb_lo), read
+        // first when a word of it lacks a byte (SDRAM_WB_RMW_*) - a whole line
+        // as one 16-word burst. A split line write goes out as one 4-word
+        // burst per qword. The line is 32-byte aligned, so nothing crosses a
+        // row.
         SDRAM_WB_FLUSH_ISSUE: begin
-          if (wb_split && wb_qmask == 4'd0) begin
-            // A line with no qword to write: nothing goes out.
-            wb_count <= 3'd0;
+          if (wb_split ? (wb_qmask == 4'd0) : (wb_be == 32'd0)) begin
+            // Nothing to write - a line write with no qword in it, or stores
+            // that named no byte: nothing goes out.
+            wb_held <= 1'b0;
             wb_idle <= 6'd0;
             wb_split <= 1'b0;
             state <= IDLE;
           end else if (sdram_ready) begin
-            if (!wb_split) begin
-              sdram_address <= wb_addr;
-              sdram_write_data <= wb_data;
-              sdram_byte_enable <= wb_be;
-              sdram_burst <= {wb_count, 2'b00};
-            end else begin : wb_split_issue
+            if (wb_split) begin : wb_split_issue
               // The lowest qword still to write, as its own full burst.
               logic [1:0] k;
               casez (wb_qmask)
@@ -1439,32 +1528,75 @@ module ki_memory_bridge (
               sdram_write_data <= {192'd0, wb_data[{k, 6'd0} +: 64]};
               sdram_byte_enable <= 32'h0000_00ff;
               sdram_burst <= 5'd4;
+              sdram_write <= 1'b1;
               wb_qmask[k] <= 1'b0;
+              state <= SDRAM_WB_FLUSH_WAIT;
+            end else if (wb_span_whole) begin
+              // Every byte of the span stored: one burst, every enable set.
+              sdram_address <= {wb_addr[24:4], wb_lo, 1'b0};
+              sdram_write_data <= wb_data >> {wb_lo, 5'd0};
+              sdram_byte_enable <= ~(32'hFFFF_FFFF << {wb_span, 2'b00});
+              sdram_burst <= {wb_span, 1'b0};
+              sdram_write <= 1'b1;
+              wb_be <= 32'd0;
+              state <= SDRAM_WB_FLUSH_WAIT;
+            end else begin
+              // A byte of the span not stored: read the span first.
+              sdram_address <= {wb_addr[24:4], wb_lo, 1'b0};
+              sdram_burst <= {wb_span, 1'b0};
+              sdram_read <= 1'b1;
+              wb_rmw_k <= 3'd0;
+              state <= SDRAM_WB_RMW_WAIT;
             end
+          end
+        end
+
+        // The span's read. Its beats - one 32-bit word each - fill in the
+        // bytes not stored, straight into wb_data; this data never reaches the
+        // CPU, so the sdram_data_valid block above, which assembles CPU reads,
+        // does not take it.
+        SDRAM_WB_RMW_WAIT: begin
+          if (sdram_data_valid) begin
+            wb_data <= wb_data_fill;
+            wb_rmw_k <= wb_rmw_k + 3'd1;
+          end
+          if (sdram_done_now) state <= SDRAM_WB_RMW_ISSUE;
+        end
+
+        // The span written back whole, its stored bytes over the ones read,
+        // so nothing depends on a mask reaching the device.
+        SDRAM_WB_RMW_ISSUE: begin
+          if (sdram_ready) begin
+            sdram_address <= {wb_addr[24:4], wb_lo, 1'b0};
+            sdram_write_data <= wb_data >> {wb_lo, 5'd0};
+            sdram_byte_enable <= ~(32'hFFFF_FFFF << {wb_span, 2'b00});
+            sdram_burst <= {wb_span, 1'b0};
             sdram_write <= 1'b1;
+            wb_be <= 32'd0;
             state <= SDRAM_WB_FLUSH_WAIT;
           end
         end
 
         SDRAM_WB_FLUSH_WAIT: begin
           if (sdram_done_now) begin
-            if (wb_split && wb_qmask != 4'd0) begin
+            if (wb_split && (wb_qmask != 4'd0)) begin
               state <= SDRAM_WB_FLUSH_ISSUE;
             end else begin
               // A line the absorb issued left wb_* holding the next one.
-              if (!wb_free) wb_count <= 3'd0;
+              if (!wb_free) wb_held <= 1'b0;
               wb_free <= 1'b0;
               wb_idle <= 6'd0;
               wb_split <= 1'b0;
               state <= IDLE;
               // The store waiting is absorbed on this edge, as IDLE would
-              // absorb it on the next - continuing the held chunks, or
-              // starting a line when nothing of wb_*'s is held.
-              if (wb_free ? wb_gather_ok : wb_start_ok) begin
-                if (!wb_free || (wb_count == 3'd0)) wb_addr <= active_word_address;
-                wb_data[{(wb_free ? wb_count[1:0] : 2'd0), 6'd0} +: 64] <= active_data_write;
-                wb_be[{(wb_free ? wb_count[1:0] : 2'd0), 3'd0} +: 8] <= active_write_mask;
-                wb_count <= (wb_free ? wb_count : 3'd0) + 1'b1;
+              // absorb it on the next - joining the line held, or starting
+              // one when nothing of wb_*'s is held.
+              if ((wb_free ? wb_gather_ok : wb_start_ok) && wb_pace_ok) begin
+                wb_addr <= wb_addr_next;
+                wb_data <= wb_data_next;
+                wb_be <= wb_be_next;
+                wb_held <= 1'b1;
+                wb_debt <= wb_debt_dec + 4'd4;
                 cpu_pending <= 1'b0;
                 cpu_done <= 1'b1;
                 debug_write_count <= debug_write_count + 1'b1;
@@ -1475,13 +1607,15 @@ module ki_memory_bridge (
                   debug_main_write_count <= debug_main_write_count + 1'b1;
               end
             end
-          end else if (wb_free && (wb_count == 3'd0) && wb_gather_ok) begin
-            // One store, a line's first, while the issued line is written.
-            wb_addr <= active_word_address;
-            wb_data[63:0] <= active_data_write;
-            wb_be[7:0] <= active_write_mask;
-            wb_count <= 3'd1;
+          end else if (wb_free && !wb_held && wb_gather_ok && wb_pace_ok) begin
+            // One store, the next line's first, while the issued line is
+            // written.
+            wb_addr <= wb_addr_next;
+            wb_data <= wb_data_next;
+            wb_be <= wb_be_next;
+            wb_held <= 1'b1;
             wb_idle <= 6'd0;
+            wb_debt <= wb_debt_dec + 4'd4;
             cpu_pending <= 1'b0;
             cpu_done <= 1'b1;
             debug_write_count <= debug_write_count + 1'b1;
@@ -1490,77 +1624,6 @@ module ki_memory_bridge (
               debug_low_write_count <= debug_low_write_count + 1'b1;
             else
               debug_main_write_count <= debug_main_write_count + 1'b1;
-          end
-        end
-
-        // One burst per store when it writes every byte it covers. Anything
-        // narrower reads first: see wr_mask_full.
-        SDRAM_WRITE_ISSUE: begin
-          if (sdram_ready) begin
-            if (!wr_mask_full) begin
-              sdram_address <= memory_word_address;
-              sdram_burst <= {2'd0, memory_word_count};
-              sdram_read <= 1'b1;
-              rmw_index <= 2'd0;
-              rmw_read <= 64'd0;
-              state <= SDRAM_WRITE_RMW_WAIT;
-            end else begin
-              sdram_address <= memory_word_address;
-              sdram_write_data <= {192'd0, operation_write_data};
-              // Every byte of every word in the burst, which is what
-              // wr_mask_full just established. Spelled as a constant rather
-              // than passed through so that NO write this bridge issues ever
-              // asks the device to mask a byte - a thing this board does not
-              // do.
-              sdram_byte_enable <= operation_req64 ? 32'h0000_00ff : 32'h0000_000f;
-              sdram_burst <= {2'd0, memory_word_count};
-              sdram_write <= 1'b1;
-              state <= SDRAM_WRITE_WAIT;
-            end
-          end
-        end
-
-        // The read half. Its beats are captured here rather than in the
-        // sdram_data_valid block above, which assembles CPU reads: this data
-        // never reaches the CPU, it only fills in the bytes the store does
-        // not write.
-        SDRAM_WRITE_RMW_WAIT: begin
-          if (sdram_data_valid) begin
-            rmw_read[{rmw_index[1], 5'd0} +: 32] <= sdram_read_data;
-            rmw_index <= rmw_index + 2'd2;
-          end
-          if (sdram_done_now) state <= SDRAM_WRITE_RMW_ISSUE;
-        end
-
-        // The write half: every byte of every word, so nothing depends on the
-        // mask reaching the device.
-        SDRAM_WRITE_RMW_ISSUE: begin
-          if (sdram_ready) begin
-            sdram_address <= memory_word_address;
-            sdram_write_data <= {192'd0, rmw_merged};
-            sdram_byte_enable <= operation_req64 ? 32'h0000_00ff : 32'h0000_000f;
-            sdram_burst <= {2'd0, memory_word_count};
-            sdram_write <= 1'b1;
-            state <= SDRAM_WRITE_WAIT;
-          end
-        end
-
-        SDRAM_WRITE_WAIT: begin
-          if (sdram_done_now) begin
-            cpu_pending <= 1'b0;
-            cpu_done <= 1'b1;
-            debug_write_count <= debug_write_count + 1'b1;
-            if ((operation_address >= KI_LOW_RAM_BASE) &&
-                (operation_address <= KI_LOW_RAM_LAST))
-              debug_low_write_count <=
-                  debug_low_write_count + 1'b1;
-            if (((operation_address >= KI_MAIN_RAM_BASE) &&
-                 (operation_address <= KI_MAIN_RAM_LAST)) ||
-                ((operation_address >= KI_MAIN_RAM_ALIAS_BASE) &&
-                 (operation_address <= KI_MAIN_RAM_ALIAS_LAST)))
-              debug_main_write_count <=
-                  debug_main_write_count + 1'b1;
-            state <= IDLE;
           end
         end
 
@@ -1749,23 +1812,47 @@ module ki_memory_bridge (
   wire fb_line_waiting = cpu_pending && pending_fb_line;
   assign fast_ok = !reset && ((state == IDLE) || (state == FB_LINE_WRITE)) &&
                    (!cpu_pending || fb_line_waiting) &&
-                   (wb_count == 3'd0) && !done_owed && !fill_tail &&
+                   !wb_held && !done_owed && !fill_tail &&
                    (download_count == 5'd0) && !cpu_hold;
 
 `ifndef SYNTHESIS
   // THE STORE STREAM's depth: while a line the absorb issued is written, one
-  // store at most is held.
+  // store at most is taken - none once wb_* holds one. cpu_done shows the
+  // answer the edge before gave, from the state seen then.
+  logic stream_held_q = 1'b0;
   always_ff @(posedge clk) begin
-    if (!reset && (state == SDRAM_WB_FLUSH_WAIT) && wb_free && (wb_count > 3'd1)) begin
-      $error("bridge: %0d chunks gathered while a line is written", wb_count);
+    stream_held_q <= !reset && (state == SDRAM_WB_FLUSH_WAIT) && wb_free &&
+                     wb_held && !sdram_done_now;
+    if (stream_held_q && cpu_done) begin
+      $error("bridge: a second store taken while a line the absorb issued is written");
       $fatal(1);
     end
   end
 
   // fast_ok holds through FB_LINE_WRITE on this.
   always_ff @(posedge clk) begin
-    if (!reset && (state == FB_LINE_WRITE) && (wb_count != 3'd0)) begin
-      $error("bridge: a framebuffer line write with %0d chunks still gathered", wb_count);
+    if (!reset && (state == FB_LINE_WRITE) && wb_held) begin
+      $error("bridge: a framebuffer line write with a line still gathered");
+      $fatal(1);
+    end
+  end
+
+  // The held line's pieces are found from its own address up.
+  always_ff @(posedge clk) begin
+    if (!reset && wb_held && (wb_addr[3:0] != 4'd0)) begin
+      $error("bridge: the held line's address %h is not a line's", wb_addr);
+      $fatal(1);
+    end
+  end
+
+  // No write leans on DQM: every byte of every word a write burst names is
+  // enabled. The board writes a masked word anyway, with whatever is on the
+  // data lines; every simulation model would leave it alone.
+  always_ff @(posedge clk) begin
+    if (!reset && sdram_write &&
+        ((~sdram_byte_enable & ((32'd1 << (2 * sdram_burst)) - 32'd1)) != 32'd0)) begin
+      $error("bridge: a write of %0d words at %h with byte enables %08h - it leans on DQM",
+             sdram_burst, sdram_address, sdram_byte_enable);
       $fatal(1);
     end
   end
